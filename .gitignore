@@ -1,0 +1,24 @@
+# Build output
+bin/
+obj/
+
+# Local reference DLLs (BepInEx / HarmonyX from GitHub releases)
+refs/
+
+# Compiled mod artifact
+dist/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# NuGet
+*.nupkg
+project.assets.json
+project.nuget.cache
+*.props
+*.targets
+!ServerZoneOwnership.csproj
