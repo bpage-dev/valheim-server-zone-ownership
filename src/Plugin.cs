@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Logging;
@@ -13,9 +14,13 @@ namespace ServerZoneOwnership
     {
         public const string PluginGuid = "com.benpage.valheim.serverzoneownership";
         public const string PluginName = "ServerZoneOwnership";
-        public const string PluginVersion = "0.3.1";
+        public const string PluginVersion = "0.4.1";
         private const float StatsLogIntervalSeconds = 20f;
+        private const float PopulationLogIntervalSeconds = 90f;
+        private const float NRESummaryIntervalSeconds = 30f;
         private float _statsTimer;
+        private float _populationTimer;
+        private float _nreTimer;
 
         internal static ManualLogSource Log;
         private Harmony _harmony;
@@ -33,6 +38,8 @@ namespace ServerZoneOwnership
             _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
             Log.LogInfo($"{PluginName} v{PluginVersion} patches applied.");
+            var dirtyMarker = BuildInfo.GitDirty ? " (dirty)" : "";
+            Log.LogInfo($"Build: git {BuildInfo.GitShortSha}{dirtyMarker} · {BuildInfo.BuildTimestamp} UTC");
         }
 
         private void OnDestroy()
@@ -46,10 +53,74 @@ namespace ServerZoneOwnership
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
 
             _statsTimer += Time.deltaTime;
-            if (_statsTimer < StatsLogIntervalSeconds) return;
-            _statsTimer = 0f;
+            _populationTimer += Time.deltaTime;
+            _nreTimer += Time.deltaTime;
 
-            LogCoverageStats();
+            if (_statsTimer >= StatsLogIntervalSeconds)
+            {
+                _statsTimer = 0f;
+                LogCoverageStats();
+            }
+            if (_populationTimer >= PopulationLogIntervalSeconds)
+            {
+                _populationTimer = 0f;
+                LogMobPopulation();
+            }
+            if (_nreTimer >= NRESummaryIntervalSeconds)
+            {
+                _nreTimer = 0f;
+                FlushSuppressedNRECount();
+            }
+        }
+
+        private static void FlushSuppressedNRECount()
+        {
+            int caught = System.Threading.Interlocked.Exchange(
+                ref SpawnSystem_UpdateSpawning_Patch.s_suppressedNRECount, 0);
+            if (caught > 0)
+            {
+                Log.LogWarning($"[SpawnSystem] Suppressed {caught} NRE(s) from vanilla UpdateSpawnList " +
+                    $"in last {NRESummaryIntervalSeconds:F0}s (likely a race we haven't covered yet — investigate if sustained).");
+            }
+        }
+
+        private static void LogMobPopulation()
+        {
+            var characters = Character.GetAllCharacters();
+            if (characters == null || characters.Count == 0)
+            {
+                Log.LogInfo("[Population] No characters active.");
+                return;
+            }
+
+            var counts = new Dictionary<string, int>();
+            int playerCount = 0;
+            foreach (var c in characters)
+            {
+                if (c == null) continue;
+                if (c is Player) { playerCount++; continue; }
+                var name = c.gameObject.name;
+                int i = name.IndexOf("(Clone)");
+                if (i > 0) name = name.Substring(0, i);
+                counts[name] = counts.TryGetValue(name, out var n) ? n + 1 : 1;
+            }
+
+            int mobTotal = counts.Values.Sum();
+            var sb = new System.Text.StringBuilder(
+                $"[Population] {mobTotal} mob(s) across {counts.Count} type(s)");
+            if (playerCount > 0) sb.Append($" (+{playerCount} player(s))");
+            if (mobTotal > 0)
+            {
+                sb.Append(": ");
+                bool first = true;
+                foreach (var kv in counts.OrderByDescending(k => k.Value).ThenBy(k => k.Key))
+                {
+                    if (!first) sb.Append(", ");
+                    first = false;
+                    sb.Append(kv.Key).Append('×').Append(kv.Value);
+                }
+            }
+            Log.LogInfo(sb.ToString());
         }
 
         private static void LogCoverageStats()
@@ -129,6 +200,13 @@ namespace ServerZoneOwnership
 
         public static readonly MethodInfo ZDOMan_FindObjects =
             AccessTools.Method(typeof(ZDOMan), "FindObjects");
+        // Filters the sector's ZDOs to just those marked Distant (large trees,
+        // terrain LOD, ships). Vanilla uses this for the outer ring; the plugin
+        // must too, or Character ZDOs from far sectors flow into the distant
+        // list and get instantiated without terrain gating → mid-air spawns →
+        // ZSyncTransform "Object fell out of world" bounce loop.
+        public static readonly MethodInfo ZDOMan_FindDistantObjects =
+            AccessTools.Method(typeof(ZDOMan), "FindDistantObjects");
         public static readonly FieldInfo ZDOMan_sessionID =
             AccessTools.Field(typeof(ZDOMan), "m_sessionID");
         public static readonly FieldInfo ZDOMan_releaseZDOTimer =
@@ -310,6 +388,17 @@ namespace ServerZoneOwnership
             AccessTools.Field(typeof(SpawnSystem), "m_spawnLists");
         private static readonly FieldInfo TempNearPlayersField =
             AccessTools.Field(typeof(SpawnSystem), "m_tempNearPlayers");
+        // SpawnSystem.Awake caches the Heightmap once; for Client-mode zones
+        // recreated from a persisted ZoneCtrl ZDO, the ZoneCtrl can be
+        // instantiated by ZNetScene BEFORE ZoneSystem.Update pokes the local
+        // zone and instantiates the Heightmap. That leaves m_heightmap null
+        // and every UpdateSpawnList call NREs. We heal it below.
+        private static readonly FieldInfo HeightmapField =
+            AccessTools.Field(typeof(SpawnSystem), "m_heightmap");
+
+        // Drained on a timer by Plugin.FlushSuppressedNRECount so we never
+        // silently bury vanilla NREs — one summary line per interval.
+        internal static int s_suppressedNRECount;
 
         static bool Prefix(SpawnSystem __instance)
         {
@@ -318,6 +407,16 @@ namespace ServerZoneOwnership
 
             var nview = (ZNetView)NViewField.GetValue(__instance);
             if (nview == null || !nview.IsValid() || !nview.IsOwner()) return false;
+
+            // Race-heal: if the Heightmap wasn't found at Awake time, retry now.
+            // Bails cleanly (returns next tick) if it still isn't there.
+            var heightmap = (Heightmap)HeightmapField.GetValue(__instance);
+            if (heightmap == null)
+            {
+                heightmap = Heightmap.FindHeightmap(__instance.transform.position);
+                if (heightmap == null) return false;
+                HeightmapField.SetValue(__instance, heightmap);
+            }
 
             var tempNearPlayers = (List<Player>)TempNearPlayersField.GetValue(null);
             tempNearPlayers.Clear();
@@ -328,15 +427,32 @@ namespace ServerZoneOwnership
             var spawnLists = (List<SpawnSystemList>)SpawnListsField.GetValue(__instance);
             foreach (var spawnList in spawnLists)
             {
-                UpdateSpawnListMethod.Invoke(__instance, new object[] { spawnList.m_spawners, time, false });
+                InvokeUpdateSpawnList(__instance, spawnList.m_spawners, time, eventSpawners: false);
             }
 
-            var currentSpawners = RandEventSystem.instance.GetCurrentSpawners();
+            var currentSpawners = RandEventSystem.instance?.GetCurrentSpawners();
             if (currentSpawners != null)
             {
-                UpdateSpawnListMethod.Invoke(__instance, new object[] { currentSpawners, time, true });
+                InvokeUpdateSpawnList(__instance, currentSpawners, time, eventSpawners: true);
             }
             return false;
+        }
+
+        // Narrowly catches vanilla NREs so one bad iteration doesn't abort
+        // the whole tick. Only TargetInvocationException wrapping NRE — real
+        // errors (arg mismatch, logic bugs) still propagate.
+        private static void InvokeUpdateSpawnList(
+            SpawnSystem instance, List<SpawnSystem.SpawnData> spawners, DateTime time, bool eventSpawners)
+        {
+            try
+            {
+                UpdateSpawnListMethod.Invoke(
+                    instance, new object[] { spawners, time, eventSpawners });
+            }
+            catch (TargetInvocationException ex) when (ex.InnerException is NullReferenceException)
+            {
+                System.Threading.Interlocked.Increment(ref s_suppressedNRECount);
+            }
         }
     }
 
@@ -420,18 +536,25 @@ namespace ServerZoneOwnership
             distantObjects.Clear();
 
             var findObjects = ReflectionCache.ZDOMan_FindObjects;
+            var findDistantObjects = ReflectionCache.ZDOMan_FindDistantObjects;
             var zdoMan = ZDOMan.instance;
 
+            // Active/near ring: all types. Downstream CreateObjectsSorted gates
+            // per-ZDO on IsZoneReadyForType, so mobs wait for terrain.
             foreach (var sector in activeSectors)
             {
                 s_sectorBuffer.Clear();
                 findObjects.Invoke(zdoMan, new object[] { sector, s_sectorBuffer });
                 currentObjects.AddRange(s_sectorBuffer);
             }
+            // Distant ring: only ZDOs explicitly flagged Distant (per-prefab
+            // ZNetView.m_distant — LOD trees, ships, terrain LOD). Mobs don't
+            // have that flag, so they can only appear via the active ring
+            // where terrain gating protects them.
             foreach (var sector in distantSectors)
             {
                 s_sectorBuffer.Clear();
-                findObjects.Invoke(zdoMan, new object[] { sector, s_sectorBuffer });
+                findDistantObjects.Invoke(zdoMan, new object[] { sector, s_sectorBuffer });
                 distantObjects.AddRange(s_sectorBuffer);
             }
 
