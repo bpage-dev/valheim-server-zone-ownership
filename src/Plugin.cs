@@ -14,7 +14,7 @@ namespace ServerZoneOwnership
     {
         public const string PluginGuid = "com.benpage.valheim.serverzoneownership";
         public const string PluginName = "ServerZoneOwnership";
-        public const string PluginVersion = "0.4.1";
+        public const string PluginVersion = "0.4.3";
         private const float StatsLogIntervalSeconds = 20f;
         private const float PopulationLogIntervalSeconds = 90f;
         private const float NRESummaryIntervalSeconds = 30f;
@@ -282,6 +282,25 @@ namespace ServerZoneOwnership
                 }
             }
             return s_distantSectors;
+        }
+
+        /// <summary>
+        /// True if the given session ID belongs to a currently-connected peer.
+        /// The server's own session ID is never in ZNet.GetPeers() and returns
+        /// false here — callers must handle the "owned by us" case separately
+        /// (typically with an early `zdo.GetOwner() == sessionId` filter).
+        /// </summary>
+        public static bool IsLivePeer(long uid)
+        {
+            if (ZNet.instance == null) return false;
+            var peers = ZNet.instance.GetPeers();
+            if (peers == null) return false;
+            foreach (var peer in peers)
+            {
+                if (peer == null) continue;
+                if (peer.m_uid == uid) return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -600,6 +619,25 @@ namespace ServerZoneOwnership
                 {
                     if (!zdo.Persistent) continue;
                     if (zdo.GetOwner() == sessionId) continue;
+                    // Skip ZDOs a peer is actively using (Container/wagon/etc.
+                    // in-use flag). Vanilla hands ownership to the interacting
+                    // player for the duration of an open; reclaiming it mid-use
+                    // breaks the container UI (InventoryGui.UpdateContainer
+                    // hides the grid when IsOwner() flips false) and leaves the
+                    // chest stuck in its "open" animation. Container_RPC_*_Patch
+                    // sets this flag atomically with the ownership grant so this
+                    // check is race-free.
+                    //
+                    // But only respect the flag if the owner is actually a live
+                    // peer — otherwise a crash / hard disconnect / server
+                    // shutdown mid-open leaves s_inUse=1 with an absent owner
+                    // forever, and the container is unopenable. Heal by
+                    // clearing the flag and reclaiming below.
+                    if (zdo.GetInt(ZDOVars.s_inUse, 0) != 0)
+                    {
+                        if (ServerCoverage.IsLivePeer(zdo.GetOwner())) continue;
+                        zdo.Set(ZDOVars.s_inUse, 0);
+                    }
                     // Take ownership. Peers can't steal back because our
                     // IsInPeerActiveArea patch reports the server as in-area
                     // for any sector where any peer is active.
@@ -607,6 +645,55 @@ namespace ServerZoneOwnership
                 }
             }
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Close the open-time race between vanilla's Container.RPC_RequestOpen
+    /// success branch (SetOwner(uid) + OpenRespons(true)) and the client
+    /// eventually setting m_inUse=1 via InventoryGui.UpdateContainer next
+    /// frame. Without this postfix, our ReleaseZDOS reclaim can fire in the
+    /// ~50-200ms window and steal ownership back before the client marks the
+    /// container in-use, which breaks the container UI and leaves the chest
+    /// stuck in its open animation.
+    /// </summary>
+    [HarmonyPatch(typeof(Container), "RPC_RequestOpen")]
+    internal static class Container_RPC_RequestOpen_Patch
+    {
+        static void Postfix(Container __instance, long uid)
+        {
+            ContainerRPCHelper.MarkInUseIfGranted(__instance, uid);
+        }
+    }
+
+    /// <summary>
+    /// Same race exists on the "stack all" RPC — it also does ForceSendZDO +
+    /// SetOwner(uid) in its success branch.
+    /// </summary>
+    [HarmonyPatch(typeof(Container), "RPC_RequestStack")]
+    internal static class Container_RPC_RequestStack_Patch
+    {
+        static void Postfix(Container __instance, long uid)
+        {
+            ContainerRPCHelper.MarkInUseIfGranted(__instance, uid);
+        }
+    }
+
+    internal static class ContainerRPCHelper
+    {
+        // Only marks in-use on the ZDO if the success branch of the RPC ran —
+        // detected by ownership having just been transferred to the requester.
+        // Server-side only.
+        public static void MarkInUseIfGranted(Container container, long uid)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (container == null) return;
+            var nview = container.GetComponent<ZNetView>();
+            if (nview == null || !nview.IsValid()) return;
+            var zdo = nview.GetZDO();
+            if (zdo == null) return;
+            if (zdo.GetOwner() != uid) return;
+            zdo.Set(ZDOVars.s_inUse, 1);
         }
     }
 }
