@@ -14,7 +14,7 @@ namespace ServerZoneOwnership
     {
         public const string PluginGuid = "com.benpage.valheim.serverzoneownership";
         public const string PluginName = "ServerZoneOwnership";
-        public const string PluginVersion = "0.4.3";
+        public const string PluginVersion = "0.5.0";
         private const float StatsLogIntervalSeconds = 20f;
         private const float PopulationLogIntervalSeconds = 90f;
         private const float NRESummaryIntervalSeconds = 30f;
@@ -644,6 +644,33 @@ namespace ServerZoneOwnership
                     zdo.SetOwner(sessionId);
                 }
             }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Vanilla ZNetScene.CreateObjectsSorted early-exits if
+    /// IsActiveAreaLoaded() returns false, which checks the ±m_activeArea box
+    /// around ZNet.GetReferencePosition() — which our plugin makes the
+    /// centroid of connected peers. With peers spread apart, that centroid
+    /// falls in an unloaded sector, the gate fails, and the server never
+    /// instantiates GameObjects for near-list ZDOs. All interaction RPCs
+    /// (damage/pickup/chest/rename) then silently miss their targets on the
+    /// server — from the client the world looks fine, but nothing responds.
+    ///
+    /// Fix: on the server, always report the active area as loaded. The
+    /// per-ZDO IsZoneReadyForType gate at CreateObjectsSorted:215 already
+    /// handles individual "terrain not yet built here" cases correctly, so
+    /// this top-level gate adds no useful safety for us and only ever fires
+    /// as a false positive under our per-peer coverage model.
+    /// </summary>
+    [HarmonyPatch(typeof(ZoneSystem), "IsActiveAreaLoaded")]
+    internal static class ZoneSystem_IsActiveAreaLoaded_Patch
+    {
+        static bool Prefix(ref bool __result)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
+            __result = true;
             return false;
         }
     }
