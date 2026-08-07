@@ -14,13 +14,15 @@ namespace ServerZoneOwnership
     {
         public const string PluginGuid = "com.benpage.valheim.serverzoneownership";
         public const string PluginName = "ServerZoneOwnership";
-        public const string PluginVersion = "0.5.0";
+        public const string PluginVersion = "0.5.1";
         private const float StatsLogIntervalSeconds = 20f;
         private const float PopulationLogIntervalSeconds = 90f;
         private const float NRESummaryIntervalSeconds = 30f;
+        private const float PeerAwareSummaryIntervalSeconds = 60f;
         private float _statsTimer;
         private float _populationTimer;
         private float _nreTimer;
+        private float _peerAwareTimer;
 
         internal static ManualLogSource Log;
         private Harmony _harmony;
@@ -55,6 +57,7 @@ namespace ServerZoneOwnership
             _statsTimer += Time.deltaTime;
             _populationTimer += Time.deltaTime;
             _nreTimer += Time.deltaTime;
+            _peerAwareTimer += Time.deltaTime;
 
             if (_statsTimer >= StatsLogIntervalSeconds)
             {
@@ -71,6 +74,40 @@ namespace ServerZoneOwnership
                 _nreTimer = 0f;
                 FlushSuppressedNRECount();
             }
+            if (_peerAwareTimer >= PeerAwareSummaryIntervalSeconds)
+            {
+                _peerAwareTimer = 0f;
+                FlushPeerAwareCounters();
+            }
+        }
+
+        // Reports how often our per-peer OutsideActiveArea override diverged
+        // from vanilla's centroid-based answer in the last window. Rescued =
+        // we said "inside, keep working" where vanilla would have said
+        // "outside, skip". Suppressed = the reverse (rare; would only happen
+        // if centroid drifted somewhere no peer covers but that no peer covers
+        // itself either — vanilla would then say inside, we'd say outside).
+        //
+        // If this log fires with non-zero rescues while multiple peers are
+        // playing, the multi-peer coverage fix is doing exactly what we
+        // designed it for. Silence means either 1 peer (centroid == that
+        // peer's position, always agrees) or peers are all clustered close
+        // enough that centroid still lands in someone's box.
+        private static void FlushPeerAwareCounters()
+        {
+            int spawnRescue = System.Threading.Interlocked.Exchange(
+                ref ZNetScene_OutsideActiveArea_Instance_Patch.s_rescueCount, 0);
+            int spawnSuppress = System.Threading.Interlocked.Exchange(
+                ref ZNetScene_OutsideActiveArea_Instance_Patch.s_suppressCount, 0);
+            int physRescue = System.Threading.Interlocked.Exchange(
+                ref ZNetScene_OutsideActiveArea_Static_Patch.s_rescueCount, 0);
+            int physSuppress = System.Threading.Interlocked.Exchange(
+                ref ZNetScene_OutsideActiveArea_Static_Patch.s_suppressCount, 0);
+            if (spawnRescue + spawnSuppress + physRescue + physSuppress == 0) return;
+            Log.LogInfo(
+                $"[Peer-Aware] OutsideActiveArea divergences vs vanilla centroid in last {PeerAwareSummaryIntervalSeconds:F0}s: " +
+                $"SpawnArea/WearNTear (1-arg) rescued={spawnRescue} suppressed={spawnSuppress}; " +
+                $"StaticPhysics (3-arg) rescued={physRescue} suppressed={physSuppress}.");
         }
 
         private static void FlushSuppressedNRECount()
@@ -159,7 +196,13 @@ namespace ServerZoneOwnership
                 $"Sector bbox: x[{minX}..{maxX}] z[{minY}..{maxY}]. " +
                 $"World bbox: x[{worldMinX:F0}..{worldMaxX:F0}] z[{worldMinZ:F0}..{worldMaxZ:F0}] meters.");
 
-            // Also log peer positions so it's easy to correlate.
+            // Log each peer's position AND active-area box. Each ±m_activeArea
+            // box is what the server treats as an independent reference for
+            // gameplay control (owning ZDOs, running physics, allowing spawns
+            // near that peer). NOT related to the vanilla centroid — server
+            // does not gate on a single centroid box any more (see
+            // ZoneSystem_IsActiveAreaLoaded_Patch and the two
+            // ZNetScene_OutsideActiveArea_*_Patches).
             var sb = new System.Text.StringBuilder("[Coverage] Peer positions: ");
             bool first = true;
             foreach (var peer in peers)
@@ -169,9 +212,22 @@ namespace ServerZoneOwnership
                 first = false;
                 var p = peer.GetRefPos();
                 var sector = ZoneSystem.GetZone(p);
-                sb.Append($"world({p.x:F0},{p.z:F0}) sector({sector.x},{sector.y})");
+                sb.Append(
+                    $"world({p.x:F0},{p.z:F0}) sector({sector.x},{sector.y}) " +
+                    $"active-box[{sector.x - activeRadius}..{sector.x + activeRadius}, " +
+                    $"{sector.y - activeRadius}..{sector.y + activeRadius}]");
             }
             Log.LogInfo(sb.ToString());
+
+            // Also log where the vanilla centroid falls, for debug clarity.
+            // Not used by us for gameplay gates, but callers of
+            // ZNet.GetReferencePosition() (some cosmetic vanilla systems,
+            // and any 3rd-party mod that doesn't know better) still see it.
+            var centroid = ZNet.instance.GetReferencePosition();
+            var centroidSector = ZoneSystem.GetZone(centroid);
+            Log.LogInfo(
+                $"[Coverage] Vanilla centroid (advisory only, not used for gameplay gates): " +
+                $"world({centroid.x:F0},{centroid.z:F0}) sector({centroidSector.x},{centroidSector.y})");
         }
 
         private static bool IsDedicatedServer()
@@ -282,6 +338,28 @@ namespace ServerZoneOwnership
                 }
             }
             return s_distantSectors;
+        }
+
+        /// <summary>
+        /// True if `point` falls inside any connected peer's active box —
+        /// equivalent to vanilla's `!ZNetScene.OutsideActiveArea(point)` but
+        /// computed against every peer's own reference position instead of
+        /// the centroid. This is the "gameplay control area" for the server:
+        /// wherever any peer is, the server treats itself as being in-area
+        /// for owning ZDOs, running physics, allowing spawns, etc.
+        /// </summary>
+        public static bool IsPointInsideAnyPeerActiveArea(Vector3 point)
+        {
+            if (ZNet.instance == null) return false;
+            var peers = ZNet.instance.GetPeers();
+            if (peers == null || peers.Count == 0) return false;
+            var pointSector = ZoneSystem.GetZone(point);
+            foreach (var peer in peers)
+            {
+                if (peer == null) continue;
+                if (ZNetScene.InActiveArea(pointSector, peer.GetRefPos())) return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -644,6 +722,84 @@ namespace ServerZoneOwnership
                     zdo.SetOwner(sessionId);
                 }
             }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Vanilla's `ZNetScene.OutsideActiveArea(Vector3 point)` calls
+    /// `GetReferencePosition()` = centroid. Used by SpawnArea (spawn-trigger
+    /// gate on nests etc.) and WearNTear (skip structural-wear when outside
+    /// active area). With peers spread apart, the centroid falls outside
+    /// every peer's box, so SpawnArea near an actual peer thinks it's outside
+    /// the active area and suppresses spawns; WearNTear stops running.
+    ///
+    /// Fix: check against every peer's active area independently. Peer-aware
+    /// semantics, not centroid-based.
+    /// </summary>
+    [HarmonyPatch(typeof(ZNetScene), "OutsideActiveArea", new[] { typeof(Vector3) })]
+    internal static class ZNetScene_OutsideActiveArea_Instance_Patch
+    {
+        // Divergence counters — drained every PeerAwareSummaryIntervalSeconds
+        // by Plugin.FlushPeerAwareCounters and logged in one summary line.
+        internal static int s_rescueCount;
+        internal static int s_suppressCount;
+
+        static bool Prefix(Vector3 point, ref bool __result)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
+            bool ourAnswer = !ServerCoverage.IsPointInsideAnyPeerActiveArea(point);
+            // Vanilla would have used the centroid (`GetReferencePosition`).
+            // Compute what it would have said so we can log divergences.
+            bool vanillaAnswer = !ZNetScene.InActiveArea(
+                ZoneSystem.GetZone(point),
+                ZNet.instance.GetReferencePosition());
+            if (ourAnswer != vanillaAnswer)
+            {
+                if (!ourAnswer && vanillaAnswer)
+                    System.Threading.Interlocked.Increment(ref s_rescueCount);
+                else
+                    System.Threading.Interlocked.Increment(ref s_suppressCount);
+            }
+            __result = ourAnswer;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The 3-arg overload of `OutsideActiveArea` is used only by
+    /// `StaticPhysics.SUpdate`, which is driven by `SlowUpdater` and receives
+    /// `ZoneSystem.GetZone(GetReferencePosition())` = centroid zone as its
+    /// `centerZone` argument. Same latent multi-peer bug: falling objects
+    /// near a peer but far from centroid never do their "should I fall?"
+    /// check. Fix by re-interpreting `centerZone` as "the reference zone the
+    /// server would have used" and replacing the check with a per-peer one.
+    /// The caller-supplied `centerZone` / `activeArea` are ignored on server;
+    /// StaticPhysics is the only vanilla caller so this is safe.
+    /// </summary>
+    [HarmonyPatch(typeof(ZNetScene), "OutsideActiveArea",
+                  new[] { typeof(UnityEngine.Vector3), typeof(Vector2i), typeof(int) })]
+    internal static class ZNetScene_OutsideActiveArea_Static_Patch
+    {
+        internal static int s_rescueCount;
+        internal static int s_suppressCount;
+
+        static bool Prefix(Vector3 point, Vector2i centerZone, int activeArea, ref bool __result)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
+            bool ourAnswer = !ServerCoverage.IsPointInsideAnyPeerActiveArea(point);
+            // Vanilla would have used the caller's centerZone/activeArea.
+            // Compute what it would have said for the divergence counter.
+            bool vanillaAnswer = !ZNetScene.InActiveArea(
+                ZoneSystem.GetZone(point), centerZone, activeArea);
+            if (ourAnswer != vanillaAnswer)
+            {
+                if (!ourAnswer && vanillaAnswer)
+                    System.Threading.Interlocked.Increment(ref s_rescueCount);
+                else
+                    System.Threading.Interlocked.Increment(ref s_suppressCount);
+            }
+            __result = ourAnswer;
             return false;
         }
     }
