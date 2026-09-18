@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.6.5";
+        public const string PluginVersion = "0.6.7";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -789,16 +789,22 @@ namespace ServerZoneOwnership
     /// with our ReleaseZDOS claiming everything, the server ended up
     /// simulating ships with players standing on them.
     ///
-    /// That breaks because the server's copy of the player is a stand-in
-    /// positioned from network updates, while the deck under it is simulated
-    /// locally. At sail speeds the gap between the two grows with
-    /// speed × latency, and a sharp speed change teleports the stand-in into
-    /// the deck; depenetration shoves the hull downward and can register as
-    /// impact damage. v0.6.2 diagnostics confirmed water was always found and
-    /// the server always saw the player aboard, while the hull still dropped
-    /// 4–5m (vy ≈ −9 m/s) on Half/Full ↔ Slow transitions. The server's wind
-    /// also ignores Moder's power (that branch in EnvMan.UpdateWind needs a
-    /// local player), so its sail force can disagree with the client's too.
+    /// The visible symptom — the hull lunging 4–5m down and taking damage on
+    /// Half/Full sail-speed changes — turned out to be a crash, not a physics
+    /// mismatch: Ship.UpdateSailSize threw on the server every tick the sail
+    /// moved, aborting buoyancy (see Ship_UpdateSailSize_NoLocalPlayer_Patch).
+    /// That patch fixes the crash; this ownership rule stays because it is
+    /// still the right design:
+    ///  - it's what vanilla does (Ship.UpdateOwner), just unable to run here;
+    ///  - the server's wind ignores Moder's power (that branch in
+    ///    EnvMan.UpdateWind needs a local player), so a server-simulated ship
+    ///    sails on natural wind while the helmsman sees a tailwind;
+    ///  - when the helmsman's client simulates the hull, deck and player share
+    ///    one physics scene, instead of the deck arriving over the network.
+    /// (An earlier version of this comment blamed the player's network
+    /// stand-in colliding with the deck. The v0.6.2 Postfix diagnostic that
+    /// seemed to support that couldn't see the throwing ticks — a Postfix
+    /// doesn't run when the original method throws.)
     ///
     /// Ownership rules, in order:
     ///  1. Sticky: a live peer that already owns the ship and is still within
@@ -972,6 +978,17 @@ namespace ServerZoneOwnership
                         if (ServerCoverage.IsLivePeer(zdo.GetOwner())) continue;
                         zdo.Set(ZDOVars.s_inUse, 0);
                     }
+                    // v0.6.7: a hitched cart is in use too. Carts never set
+                    // s_inUse — the only "busy" signal is s_attachJointHash,
+                    // written by the puller's client, which owns the cart and
+                    // runs the joint. Reclaiming it made that client see "not
+                    // owner" and drop the cart (Vagon.Update's
+                    // `else if (IsAttached()) Detach();`) — confirmed in-game.
+                    // Dead owner → fall through and reclaim; the server's own
+                    // Vagon.Update then sees the stale flag as owner and
+                    // clears it via Detach(), so no manual heal is needed.
+                    if (zdo.GetBool(ZDOVars.s_attachJointHash) &&
+                        ServerCoverage.IsLivePeer(zdo.GetOwner())) continue;
                     // v0.5.22: TerrainComp ZDOs get vanilla peer-ownership
                     // instead of server ownership. Vanilla's own ReleaseZDOS
                     // (server-only, which we otherwise fully replace) does two
@@ -1021,6 +1038,23 @@ namespace ServerZoneOwnership
                     // (ZDOMan.Update calls ReleaseZDOS only when IsServer()),
                     // and this patch replaces that logic wholesale.
                     long prevOwner = zdo.GetOwner();
+
+                    // v0.6.6 diagnostic for cart theory B (see
+                    // Vagon_Detach_Diag_Patch): are we taking a cart away from
+                    // a player while it's still hitched to them? Since the
+                    // v0.6.7 skip above, only live=False (owner disconnected
+                    // mid-pull) should appear; live=True means a regression.
+                    if (zdo.GetBool(ZDOVars.s_attachJointHash))
+                    {
+                        var cartPos = zdo.GetPosition();
+                        var cartPrefab = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
+                        Plugin.Log.LogWarning(
+                            $"[Diag] Cart reclaimed by server from peer {prevOwner} " +
+                            $"(live={ServerCoverage.IsLivePeer(prevOwner)}) while attachJoint=True " +
+                            $"prefab={(cartPrefab != null ? cartPrefab.name : "?")} " +
+                            $"pos=world({cartPos.x:F0},{cartPos.z:F0})");
+                    }
+
                     zdo.SetOwner(sessionId);
 
                     // Diagnostic: classify reclaims by prevOwner and by prefab
@@ -1601,37 +1635,62 @@ namespace ServerZoneOwnership
     }
 
     /// <summary>
-    /// v0.6.2 diagnostic: trace Ship physics state on the server.
+    /// v0.6.6 fix: stop Ship.UpdateSailSize throwing on the server.
     ///
-    /// Symptom: changing boat speed makes the boat lunge downward and take
-    /// damage; steering and wind behave normally.
+    /// Build 25185644 added this to UpdateSailSize, guarded only by
+    /// `!flag && m_sailWasInPosition` (the first tick the sail leaves a rest
+    /// position):
     ///
-    /// Why those split: Ship.CustomFixedUpdate runs UpdateSail/UpdateRudder for
-    /// everyone but returns early before applying any forces unless
-    /// m_nview.IsOwner(). And Forward()/Backward()/Stop() use InvokeRPC (routed
-    /// to the ZDO owner) while Rudder() uses a local Invoke — so under our
-    /// server-owns-everything model, speed changes land on the server and
-    /// steering stays client-local.
+    ///   ZDOID zDOID = Player.m_localPlayer.GetPlayerID() == m_shipControlls.GetUser()
+    ///       ? Player.m_localPlayer.GetZDOID() : ZDOID.None;
+    ///   m_changeSailPosEffect.Create(..., zDOID);
     ///
-    /// Two candidate causes, both measured here:
-    ///  1. Water level. Floating.GetWaterLevel returns -10000 when no
-    ///     WaterVolume collider is found at a point. That makes
-    ///     `heightAboveWater = comY - waterLevel - offset` ≈ +10030, which is
-    ///     greater than m_disableLevel (-0.5), so the ENTIRE buoyancy + sail +
-    ///     damping block is skipped and the hull free-falls under gravity —
-    ///     exactly "lunges downward and takes damage".
-    ///  2. Players aboard. m_players is filled by OnTriggerEnter against
-    ///     replicated player colliders. If the server never registers anyone
-    ///     aboard, it forces m_speed=Stop and rudder=0 every tick and cuts
-    ///     horizontal velocity to 10%.
+    /// With no local player that NREs — and because the throw lands before
+    /// `m_sailWasInPosition = flag` at the end of the method, the flag never
+    /// clears, so it throws on EVERY tick until the sail reaches its target
+    /// (~0.5–1s per speed change). CustomFixedUpdate calls UpdateSail before the
+    /// owner gate and all buoyancy code, so on a server-owned ship each of those
+    /// ticks skipped buoyancy entirely: the hull free-fell, then slammed back up
+    /// — the "boat lunges down and takes damage on sail-speed changes" bug.
+    /// (ShipOwnership moved simulation to the client, where this never throws;
+    /// this patch fixes the remaining server-owned cases and the log spam.)
     ///
-    /// Also logs the ZDO owner, because vanilla's own handoff (Ship.UpdateOwner)
-    /// gives the ship to a player aboard but is gated behind
-    /// `Player.m_localPlayer != null` — so it can never run on a dedicated
-    /// server, leaving our ReleaseZDOS claim permanent. See
-    /// [[valheim-local-player-concept]].
+    /// Fix: when there is no local player, clear m_sailWasInPosition before the
+    /// method runs, so the effect branch never fires. That field is read nowhere
+    /// else. Deliberately NOT a null-safe transpiler (as for Pickable): letting
+    /// the branch run would make the server spawn m_changeSailPosEffect, and
+    /// since 25185644 effect prefabs can be networked (EffectList.Create stamps
+    /// owner ZDO fields on them) — a server copy could replicate as a doubled
+    /// sail sound. The server has no audience for the effect anyway; before this
+    /// patch it never spawned it either, because it crashed first.
+    /// </summary>
+    [HarmonyPatch(typeof(Ship), "UpdateSailSize")]
+    internal static class Ship_UpdateSailSize_NoLocalPlayer_Patch
+    {
+        private static readonly FieldInfo s_sailWasInPositionField =
+            AccessTools.Field(typeof(Ship), "m_sailWasInPosition");
+
+        static void Prefix(Ship __instance)
+        {
+            if (Player.m_localPlayer == null)
+                s_sailWasInPositionField.SetValue(__instance, false);
+        }
+    }
+
+    /// <summary>
+    /// v0.6.2 diagnostic: sample a ship's server-side state every ~2s — owner,
+    /// players aboard, speed, rudder, water level, whether the buoyancy block
+    /// would run, and velocity.
     ///
-    /// Throttled per ship to ~2s. Postfix so vanilla has already updated state.
+    /// CAVEAT: this is a Postfix, and a Postfix does not run when the original
+    /// method throws. While Ship.UpdateSailSize was crashing (fixed in v0.6.6),
+    /// every crashing tick was invisible here — which is exactly why this
+    /// diagnostic reported "water found, physics ran" while the hull was
+    /// free-falling. Check the log for exceptions from CustomFixedUpdate before
+    /// trusting a clean-looking sample.
+    ///
+    /// While a client owns the ship (v0.6.4+), these samples describe the
+    /// server's network-driven copy, not the physics actually running.
     /// </summary>
     [HarmonyPatch(typeof(Ship), nameof(Ship.CustomFixedUpdate))]
     internal static class Ship_CustomFixedUpdate_Diag_Patch
@@ -1686,17 +1745,38 @@ namespace ServerZoneOwnership
     }
 
     /// <summary>
-    /// v0.5.23 diagnostic: trace Vagon (cart) attach/detach on the server.
-    /// Theory: Vagon.FixedUpdate only maintains the ConfigurableJoint (distance
-    /// check via CanAttach, physics via m_breakForce) on whichever machine owns
-    /// the ZDO. Our plugin makes the server own it, so the server computes the
-    /// joint against the puller's network-REPLICATED position (laggy/interpolated)
-    /// instead of their real local rigidbody — unlike vanilla, where ownership
-    /// normally goes to the nearest peer (usually the puller themselves). If the
-    /// replicated position drifts past m_detachDistance even briefly, or a
-    /// correction spikes past m_breakForce, the server calls Detach() even
-    /// though the player never let go. This patch logs every Detach with the
-    /// actual computed distance vs threshold so we can confirm or rule this out.
+    /// Cart (Vagon) diagnostics — v0.5.23, reworked in v0.6.6.
+    ///
+    /// Symptom: a cart disconnects easily while being pulled. Two theories:
+    ///
+    ///  A. (original) The server owns the cart and runs its joint against the
+    ///     puller's network-positioned stand-in, so lag trips the detach-distance
+    ///     check or the joint's break force.
+    ///
+    ///  B. (from reading Vagon in build 25390671) The joint actually lives on
+    ///     the puller's client: Vagon.Interact asks the owner for the cart, and
+    ///     RPC_RequestOwn hands ZDO ownership to the requester, whose client then
+    ///     runs AttachTo. Our ReleaseZDOS then reclaims the cart within ~2s —
+    ///     carts don't set s_inUse, so nothing tells it the cart is busy. The
+    ///     client is no longer the owner, so its own Vagon.Update runs
+    ///     `else if (IsAttached()) Detach();` and drops the cart itself.
+    ///
+    /// Theory B signature, in order:
+    ///   [Diag] Cart RPC_RequestOwn … outcome=GRANT → peer P
+    ///   [Diag] Cart reclaimed by server from peer P … attachJoint=True   (≤2s later)
+    ///   [Diag] Vagon.Detach … serverOwns=True …   (server clearing the stale flag)
+    /// Theory A signature: Vagon.AttachTo on the server, then Vagon.Detach with
+    /// serverOwns=True and reason=DISTANCE_EXCEEDED or joint_broke.
+    ///
+    /// Result (2026-09-18, v0.6.6 in-game test): theory B confirmed — GRANT,
+    /// then reclaim with attachJoint=True every ~2s, then stale_attach_flag
+    /// detaches. Fixed in v0.6.7 by skipping hitched carts with a live owner
+    /// in ZDOMan_ReleaseZDOS_Patch.
+    ///
+    /// Only logs detaches that matter. When a peer owns an attached cart,
+    /// vanilla's non-owner branch calls Detach() on the server's copy EVERY
+    /// FRAME (it just clears local state; only the owner can clear the ZDO
+    /// flag) — logging those would flood the log with non-events.
     /// </summary>
     [HarmonyPatch(typeof(Vagon), "Detach")]
     internal static class Vagon_Detach_Diag_Patch
@@ -1714,14 +1794,21 @@ namespace ServerZoneOwnership
             var joint = (ConfigurableJoint)s_attachJoinField.GetValue(__instance);
             var attachedObj = (GameObject)s_attachedObjectField.GetValue(__instance);
             var nview = (ZNetView)s_nviewField.GetValue(__instance);
+            bool serverOwns = nview != null && nview.IsValid() && nview.IsOwner();
+            if (!serverOwns && joint == null && attachedObj == null) return;
+
+            var zdo = nview?.GetZDO();
+            long owner = zdo?.GetOwner() ?? 0;
+            bool attachFlag = zdo != null && zdo.GetBool(ZDOVars.s_attachJointHash);
             var pos = __instance.transform.position;
-            long owner = nview?.GetZDO()?.GetOwner() ?? 0;
 
             string reason;
             float dist = -1f;
             if (attachedObj == null)
             {
-                reason = "no_attached_object (already detached or never attached)";
+                reason = joint == null && attachFlag
+                    ? "stale_attach_flag (a previous owner attached it; the joint was never on the server)"
+                    : "no_attached_object";
             }
             else
             {
@@ -1729,15 +1816,42 @@ namespace ServerZoneOwnership
                     attachedObj.transform.position + __instance.m_attachOffset,
                     __instance.m_attachPoint.position);
                 reason = dist >= __instance.m_detachDistance
-                    ? $"DISTANCE_EXCEEDED ({dist:F2}m >= {__instance.m_detachDistance:F2}m threshold)"
-                    : "joint_broke_or_owner_changed_or_puller_stopped";
+                    ? $"DISTANCE_EXCEEDED ({dist:F2}m >= {__instance.m_detachDistance:F2}m)"
+                    : joint == null ? "joint_broke" : "requested_or_owner_changed";
             }
 
             Plugin.Log.LogWarning(
-                $"[Diag] Vagon.Detach prefab={__instance.gameObject.name.Replace("(Clone)","")} " +
-                $"pos=world({pos.x:F0},{pos.z:F0}) owner={owner} " +
+                $"[Diag] Vagon.Detach prefab={__instance.gameObject.name.Replace("(Clone)", "")} " +
+                $"pos=world({pos.x:F0},{pos.z:F0}) owner={owner} serverOwns={serverOwns} " +
+                $"ownerLive={ServerCoverage.IsLivePeer(owner)} attachJoint={attachFlag} " +
                 $"attachedObj={(attachedObj != null ? attachedObj.name : "null")} " +
                 $"hadJoint={joint != null} dist={dist:F2} reason={reason}");
+        }
+    }
+
+    /// <summary>
+    /// v0.6.6 diagnostic: the server's answer when a player grabs a cart it
+    /// owns. See Vagon_Detach_Diag_Patch for how this fits theory B.
+    /// </summary>
+    [HarmonyPatch(typeof(Vagon), nameof(Vagon.RPC_RequestOwn))]
+    internal static class Vagon_RPC_RequestOwn_Diag_Patch
+    {
+        private static readonly FieldInfo s_nviewField = AccessTools.Field(typeof(Vagon), "m_nview");
+
+        static void Prefix(Vagon __instance, long sender)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            var nview = (ZNetView)s_nviewField.GetValue(__instance);
+            if (nview == null || !nview.IsValid()) return;
+            bool serverOwns = nview.IsOwner();
+            bool inUse = serverOwns && __instance.InUse();
+            string outcome = !serverOwns
+                ? "IGNORED (server isn't the owner; vanilla only answers on the owner)"
+                : inUse ? "DENY (cart in use)" : $"GRANT → peer {sender}";
+            var pos = __instance.transform.position;
+            Plugin.Log.LogInfo(
+                $"[Diag] Cart RPC_RequestOwn from={sender} prefab={__instance.gameObject.name.Replace("(Clone)", "")} " +
+                $"pos=world({pos.x:F0},{pos.z:F0}) owner={nview.GetZDO().GetOwner()} outcome={outcome}");
         }
     }
 
