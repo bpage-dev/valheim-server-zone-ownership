@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.6.7";
+        public const string PluginVersion = "0.7.14";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -42,14 +42,155 @@ namespace ServerZoneOwnership
         private const float PopulationLogIntervalSeconds = 90f;
         private const float NRESummaryIntervalSeconds = 30f;
         private const float PeerAwareSummaryIntervalSeconds = 60f;
-        private const float TerrainCompSnapshotIntervalSeconds = 20f;
+        // --- createDestroy stride (v0.7.10) -------------------------------
+        // 1 = vanilla behaviour (every tick). >1 skips the object create/destroy
+        // pass on all but every Nth tick, rehearsing how round-robin would feel:
+        // with N peers, round-robin refreshes each peer every Nth tick. Set to 8
+        // with ONE player online to feel an 8-player round-robin. Watch for late
+        // object pop-in while travelling fast (boat, cart). Put back to 1 after.
+        //
+        // BPTODO refactor roundrobin the create/destroy ticks among players
+        // rather than artificially all on every x'th frame (eg 8), flattening spike
+        internal const int DebugCreateDestroyStride = 8;
+
+        // --- Synthetic peer load test (v0.7.3) ----------------------------
+        // Fake extra players so we can measure 8-player load without 8 people.
+        // See SyntheticPeers for the mechanism and its limits (no network load).
+        // OFF unless the anchor is set to a character name; the ring then
+        // follows that player and stops when they log out.
+        // KEEP THIS EMPTY except during a deliberate load test — the fake areas
+        // are fully live: zones load, mobs spawn and wander there. Stay ~800m
+        // clear of bases you care about at a 600m radius.
+        internal const string DebugSyntheticPeerAnchor = "";  // "" = off. Set to a character name only for a deliberate load test
+        internal const int DebugSyntheticPeerCount = 7;   // 7 + the anchor = 8
+        internal const float DebugSyntheticPeerMinRadius = 600f;   // annulus around the anchor
+        internal const float DebugSyntheticPeerMaxRadius = 1400f;
+        internal const float DebugSyntheticPeerDriftSpeed = 3f;    // m/s, roughly a walking player
+
+        // When the daily [Digest] block is written (local time, matching the
+        // AutoHotkey scripts). 05:30 sits before TimedLogCopy.ahk archives the
+        // log at 05:58 and TimedRestart.ahk reboots at 06:00, so the day's
+        // summary lands inside that morning's archive. To test, set these a
+        // couple of minutes ahead and restart.
+        internal const int DigestHour = 5;
+        internal const int DigestMinute = 30;
+
+        // How often the [Nav] navmesh gauge prints. Ours, no vanilla default.
+        // Raise it if the log gets noisy; the numbers are instantaneous
+        // readings plus per-window counters, so the window length only changes
+        // the resolution, never the meaning.
+        private const float NavStatsIntervalSeconds = 20f;
+
+        // --- Navmesh tile pressure knobs (v0.7.0) --------------------------
+        // Mob pathfinding builds 32m navmesh tiles on demand, one layer per
+        // agent size, and stitches neighbouring tiles together with links.
+        // Links come from a single engine-wide pool of 65535; at ~64 links per
+        // tile that is ~1000 live tiles for the whole server. Because we own
+        // every mob for every peer, all of that pressure lands on one machine:
+        // 8 spread-out peers on 2026-09-22 exhausted the pool and logged 6337
+        // "Failed to allocate NavMeshLink" errors in 2.5 minutes, which is what
+        // group-combat lag looked like from the inside.
+        //
+        // How long an unused tile is kept before it can be freed.
+        // VANILLA DEFAULT: 60s (measured live, 2026-09-22).
+        // The decompiled C# initialiser claims 30f, but the Pathfinding prefab
+        // serialises over it — so never trust the decompiled initialiser for
+        // an inspector-exposed field; read the [Nav] startup line instead.
+        // <= 0 means "leave vanilla's value untouched" — the honest baseline,
+        // and immune to Iron Gate re-tuning the prefab in a future build.
+        // Lower = a travelling peer's trail of dead tiles is returned to the
+        // link pool sooner. Too low = tiles expire while mobs still need them
+        // and must be rebuilt, and rebuilds are capped at one per pass, which
+        // stalls mob movement. If the [Nav] gauge shows built and freed both
+        // high in the same window, that's thrashing — back it off.
+        // 2026-09-22 baseline at 30s, 7 peers, nobody fighting: 300-610 tiles,
+        // 40-54k stitches (61-82% of the pool), ~110 stitches/tile. Cost is
+        // ~50-80 tiles per peer, so ~9-10 peers would exhaust the pool while
+        // standing still. Now trying 15f to shrink the idle resident set and
+        // leave headroom for fights. Revert to 30f if it doesn't help, or
+        // <= 0 for true vanilla (60s).
+        // Set to -1 (vanilla 60s) 2026-09-25 to baseline the synthetic load test
+        // against the real 8-player session, which ran on all-vanilla dials.
+        internal const float NavTileTimeoutSeconds = 15f;
+
+        // Max stale tiles our sweep frees in one maintenance pass.
+        // VANILLA DEFAULT: 1 (an artifact of its dictionary loop, not a tuned
+        // budget — see Pathfinding_TimeoutTiles_Patch). Set this to 1 to get
+        // vanilla behaviour back. Passes run at most 10x/sec, so 64 means up
+        // to 640 tiles/sec can be reclaimed. The actual engine-side teardown
+        // is queued and throttled by vanilla regardless of this number, so
+        // raising it adds bookkeeping, not a frame-time spike.
+        // 64 is a safety cap rather than a target: observed peak churn was 173
+        // tiles freed per 20s window (~9/sec) against 10 passes/sec, so ~16
+        // would do. 64 leaves room for a burst (several peers fast-travelling
+        // or logging off at once) at a bounded cost — each freed tile makes
+        // vanilla rescan the tile list, so a pass is O(freed x alive) cheap
+        // field reads, ~35k at 64 x 550.
+        // Set to 1 (vanilla) 2026-09-25 for the same baseline run.
+        internal const int NavTileSweepPerPass = 64;
+
+        // Spacing between the stitches that join a tile to its neighbours
+        // (Pathfinding.m_linkWidth). VANILLA DEFAULT: 1f — verify against the
+        // [Nav] startup line, since the prefab overrode m_tileTimeout.
+        // RebuildLinks stitches 2 of the 4 edges at this spacing, so a 32m tile
+        // costs ~64 stitches at 1m and ~32 at 2m: doubling this halves every
+        // tile's draw on the 65535 pool. That is the biggest lever we have, and
+        // unlike the lifetime dial it does not touch how often tiles are built
+        // or expired (rebuilds already run at ~50% of their ~200/20s ceiling).
+        // The cost is fidelity: crossing points at tile seams are 2m apart, so
+        // a mob could fumble a gap narrower than that — a bridge, gate, doorway
+        // or stairs. If mobs start pacing at an invisible line, set this back
+        // to 1f. <= 0 leaves vanilla's value untouched.
+        // 2026-09-24: 2m measured a 63% cut solo (92 -> 51 stitches per tile,
+        // 23% -> 7% of the pool) with no change in rebuild rate. Briefly set to
+        // vanilla to retest mobs pathing through a swamp-ruin rock (the arrows
+        // passing through it cannot be spacing — projectiles use colliders, not
+        // the navmesh). Retest verdict: the rock bug reproduced at 1m too, so it
+        // is pre-existing and unrelated to spacing — 2m stays.
+        // 2026-09-25: temporarily back to vanilla 1m to validate the synthetic
+        // peers against the REAL 8-player session (which ran at 1m): 300-610
+        // tiles, ~110 stitches/tile, 61-82% of pool, 6337 link failures. If the
+        // fake ring reproduces that, the simulator is trustworthy. Set to 2f
+        // afterwards — that is the setting we actually want to ship.
+        internal const float NavLinkWidth = 2f;
+
         private float _statsTimer;
         private float _populationTimer;
         private float _nreTimer;
         private float _peerAwareTimer;
-        private float _terrainCompSnapshotTimer;
+        private float _navStatsTimer;
+        // Date the digest last fired, so it emits once per day and not once per
+        // frame for the whole minute.
+        private DateTime _lastDigestDate = DateTime.MinValue;
+
+        // --- Server tick health (v0.7.1) -----------------------------------
+        // A headless server still runs Unity's loop; each pass ("frame") is
+        // where mob AI, physics and ZDO sends happen. Tick time is therefore
+        // the most direct measure of server-side lag, and unlike HWMonitor it
+        // sees inside the process: the 2026-09-22 hardware capture showed CPU
+        // never above 43%, which cannot rule out one saturated main thread.
+        // Physics is scheduled 20x/sec, so ticks over 50ms mean the server is
+        // falling behind its own simulation.
+        private const float PerfStatsIntervalSeconds = 20f;
+        private const float PerfHitchMs = 100f;
+        private float _perfTimer;
+        private int _tickCount;
+        private int _hitchCount;
+        private float _tickTotalMs;
+        private float _tickWorstMs;
 
         internal static ManualLogSource Log;
+
+        /// <summary>
+        /// Local wall-clock stamp for our own log lines. BepInEx 5's disk logger
+        /// writes no timestamps, and until v0.7.2 we dated our lines by the
+        /// neighbouring vanilla ZLog messages (which carry their own) — that
+        /// stops working now the per-event diagnostics are gone. Prefixed onto
+        /// the periodic gauges and every immediate warning so a report like
+        /// "it lagged around 9:40" can be lined up with the log and with an
+        /// HWMonitor capture.
+        /// </summary>
+        internal static string Stamp => DateTime.Now.ToString("HH:mm:ss");
         private Harmony _harmony;
 
         private void Awake()
@@ -64,6 +205,10 @@ namespace ServerZoneOwnership
 
             _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
+            // Count engine-side navmesh link-pool exhaustion. The message is
+            // emitted by native Unity code, so there is nothing to patch — we
+            // observe the log stream instead and report a count every 20s.
+            Application.logMessageReceived += NavMeshPressure.OnUnityLog;
             Log.LogInfo($"{PluginName} v{PluginVersion} patches applied.");
             var dirtyMarker = BuildInfo.GitDirty ? " (dirty)" : "";
             Log.LogInfo($"Build: git {BuildInfo.GitShortSha}{dirtyMarker} · {BuildInfo.BuildTimestamp} UTC");
@@ -79,6 +224,10 @@ namespace ServerZoneOwnership
 
         private void OnDestroy()
         {
+            // Flush whatever the day accumulated so a clean shutdown doesn't
+            // silently discard it. A hard kill still loses the counts.
+            if (_harmony != null) DailyDigest.Emit("shutdown");
+            Application.logMessageReceived -= NavMeshPressure.OnUnityLog;
             _harmony?.UnpatchSelf();
         }
 
@@ -91,8 +240,34 @@ namespace ServerZoneOwnership
             _populationTimer += Time.deltaTime;
             _nreTimer += Time.deltaTime;
             _peerAwareTimer += Time.deltaTime;
-            _terrainCompSnapshotTimer += Time.deltaTime;
+            _navStatsTimer += Time.deltaTime;
+            _perfTimer += Time.deltaTime;
 
+            // Sample this tick's duration. unscaledDeltaTime so a timeScale
+            // change (we never set one, but mods/console can) can't skew it.
+            SendPressure.Sample();
+
+            float tickMs = Time.unscaledDeltaTime * 1000f;
+            _tickCount++;
+            _tickTotalMs += tickMs;
+            if (tickMs > _tickWorstMs) _tickWorstMs = tickMs;
+            if (tickMs > PerfHitchMs) _hitchCount++;
+
+            if (_perfTimer >= PerfStatsIntervalSeconds)
+            {
+                _perfTimer = 0f;
+                LogPerfStats();
+                _tickCount = 0;
+                _hitchCount = 0;
+                _tickTotalMs = 0f;
+                _tickWorstMs = 0f;
+            }
+
+            if (_navStatsTimer >= NavStatsIntervalSeconds)
+            {
+                _navStatsTimer = 0f;
+                NavMeshPressure.LogStats();
+            }
             if (_statsTimer >= StatsLogIntervalSeconds)
             {
                 _statsTimer = 0f;
@@ -113,46 +288,69 @@ namespace ServerZoneOwnership
                 _peerAwareTimer = 0f;
                 FlushPeerAwareCounters();
             }
-            if (_terrainCompSnapshotTimer >= TerrainCompSnapshotIntervalSeconds)
+            // Daily digest (v0.7.2). Fires once when local time reaches
+            // DigestHour:DigestMinute; _lastDigestDate stops it repeating for
+            // the rest of that minute.
+            var localNow = DateTime.Now;
+            if (localNow.Date != _lastDigestDate
+                && localNow.Hour == DigestHour && localNow.Minute >= DigestMinute)
             {
-                _terrainCompSnapshotTimer = 0f;
-                LogTerrainCompSnapshot();
+                _lastDigestDate = localNow.Date;
+                DailyDigest.Emit("daily");
             }
         }
 
         /// <summary>
-        /// v0.5.21 diagnostic: every 20s, dump owner + DataRevision for every
-        /// TerrainComp ZDO in the server's active sectors. Purpose: catch owner
-        /// churn (a TerrainComp bouncing between sessionIDs) or a stale owner
-        /// (sessionID that no longer matches any connected peer, which would
-        /// make a client's InvokeRPC silently go nowhere).
+        /// v0.7.1: server tick health + per-peer network backlog, every 20s.
+        ///   [Perf] tick avg=Nms worst=Nms hitches>100ms=N/N | sendQueue max=NKB (name) | peers=N
+        ///
+        /// Written to separate three causes of "the server feels laggy" that
+        /// we have so far only been able to guess between:
+        ///   * tick avg/worst climbing during fights → the server itself is
+        ///     stalling (CPU, or navmesh link exhaustion — see NavMeshPressure)
+        ///   * ticks fine but sendQueue growing → network-bound, which would
+        ///     point at the relayed -crossplay transport
+        ///   * both clean while players still report lag → client-side or
+        ///     latency, and none of our server-side tuning will help
+        /// sendQueue is vanilla's own backpressure signal: ZDOMan throttles ZDO
+        /// sends on it, so a large queue means peers are being starved.
         /// </summary>
-        private static void LogTerrainCompSnapshot()
+        private void LogPerfStats()
         {
-            if (ZoneSystem.instance == null || ZDOMan.instance == null) return;
-            var simDist = ServerCoverage.GetSimulationDistance();
-            var buffer = new List<ZDO>();
-            var seen = new HashSet<ZDO>();
-            int total = 0;
-            var sb = new System.Text.StringBuilder("[Diag] TerrainComp snapshot: ");
-            foreach (var peerPos in ServerCoverage.GetUniquePeerPositions())
+            if (_tickCount == 0) return;
+
+            int peers = 0;
+            if (ZNet.instance != null)
             {
-                buffer.Clear();
-                ZDOMan.instance.FindSectorObjects(ZoneSystem.GetZone(peerPos), simDist, buffer);
-                foreach (var zdo in buffer)
+                foreach (var peer in ZNet.instance.GetPeers())
                 {
-                    if (ZNetScene.instance == null) continue;
-                    if (!seen.Add(zdo)) continue;
-                    var prefab = ZNetScene.instance.GetPrefab(zdo.GetPrefab());
-                    if (prefab == null || prefab.GetComponent<TerrainComp>() == null) continue;
-                    total++;
-                    long owner = zdo.GetOwner();
-                    bool ownerLive = owner != 0 && ServerCoverage.IsLivePeer(owner);
-                    var pos = zdo.GetPosition();
-                    sb.Append($"[{ZoneSystem.GetZone(pos)} owner={owner} live={ownerLive} rev={zdo.DataRevision}] ");
+                    if (peer?.m_socket != null) peers++;
                 }
             }
-            if (total > 0) Plugin.Log.LogInfo(sb.ToString());
+
+            // Queue stats now come from SendPressure, which samples at 4Hz across
+            // the whole window — a single reading at log time missed the spikes
+            // that matter, since a peer is only starved while it is over 10KB.
+            string queueSummary = SendPressure.Drain()
+                                  ?? $"sendQueue max=0KB (-) starved=0/0";
+
+            float avgMs = _tickTotalMs / _tickCount;
+            string line =
+                $"[{Plugin.Stamp}] [Perf] tick avg={avgMs:F1}ms worst={_tickWorstMs:F0}ms " +
+                $"hitches>{PerfHitchMs:F0}ms={_hitchCount}/{_tickCount} | " +
+                $"{queueSummary} | peers={peers}";
+
+            // Physics ticks 20x/sec; a 50ms average means the server is behind.
+            if (avgMs > 50f || _hitchCount > 0) Log.LogWarning(line);
+            else Log.LogInfo(line);
+
+            // Companion line: where that tick time went across our own passes.
+            // Anything unaccounted for is vanilla's (mob AI, physics, saves).
+            var passes = PassTimer.DrainSummary(_tickTotalMs);
+            var reclaims = ReclaimStats.Drain(peers);
+            var sync = SyncVolume.Drain();
+            if (passes != null || reclaims != null || sync != null)
+                Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}");
         }
 
         // Periodic diagnostic flush. Drains counters accumulated by our
@@ -168,22 +366,6 @@ namespace ServerZoneOwnership
                 ref ZDOMan_ReleaseZDOS_Patch.s_itemDropReclaimLivePeer, 0);
             int idAbsent = System.Threading.Interlocked.Exchange(
                 ref ZDOMan_ReleaseZDOS_Patch.s_itemDropReclaimAbsentPeer, 0);
-            if (idLive > 0)
-            {
-                var lastName = ZDOMan_ReleaseZDOS_Patch.s_lastLivePeerReclaimName ?? "?";
-                var lastPrev = ZDOMan_ReleaseZDOS_Patch.s_lastLivePeerReclaimPrevOwner;
-                Log.LogWarning(
-                    $"[Diag] ItemDrop RACE reclaims (livePeer→server) in last {PeerAwareSummaryIntervalSeconds:F0}s: " +
-                    $"{idLive} (last: {lastName}, prevOwner={lastPrev}). " +
-                    $"Also this window: unowned→server={idUnowned}, absentPeer→server={idAbsent}. " +
-                    "Each livePeer reclaim is a candidate 'pickup silently failed' event.");
-            }
-            else if (idUnowned + idAbsent > 0)
-            {
-                Log.LogInfo(
-                    $"[Diag] ItemDrop reclaims (no race in this window): " +
-                    $"unowned→server={idUnowned}, absentPeer→server={idAbsent}.");
-            }
 
             // Drain Container reclaim counters (same three-bucket split).
             int cUnowned = System.Threading.Interlocked.Exchange(
@@ -192,22 +374,11 @@ namespace ServerZoneOwnership
                 ref ZDOMan_ReleaseZDOS_Patch.s_containerReclaimLivePeer, 0);
             int cAbsent = System.Threading.Interlocked.Exchange(
                 ref ZDOMan_ReleaseZDOS_Patch.s_containerReclaimAbsentPeer, 0);
-            if (cLive > 0)
-            {
-                var lastName = ZDOMan_ReleaseZDOS_Patch.s_lastContainerLivePeerReclaimName ?? "?";
-                var lastPrev = ZDOMan_ReleaseZDOS_Patch.s_lastContainerLivePeerReclaimPrevOwner;
-                Log.LogWarning(
-                    $"[Diag] Container RACE reclaims (livePeer→server) in last {PeerAwareSummaryIntervalSeconds:F0}s: " +
-                    $"{cLive} (last: {lastName}, prevOwner={lastPrev}). " +
-                    $"Also this window: unowned→server={cUnowned}, absentPeer→server={cAbsent}. " +
-                    "Each livePeer reclaim is a candidate 'stuck chest' cause.");
-            }
-            else if (cUnowned + cAbsent > 0)
-            {
-                Log.LogInfo(
-                    $"[Diag] Container reclaims (no race in this window): " +
-                    $"unowned→server={cUnowned}, absentPeer→server={cAbsent}.");
-            }
+            // v0.7.2: these used to log every 60s (53 windows in one session).
+            // Roll them into the daily digest instead — the stuck-chest and
+            // failed-pickup bugs are still open, so the counts stay, the noise
+            // doesn't. A livePeer reclaim is the candidate cause for both.
+            DailyDigest.RecordReclaims(cLive, cUnowned, cAbsent, idLive, idUnowned, idAbsent);
 
             // Drain SpawnSystem invocation counters.
             int biomeInv = System.Threading.Interlocked.Exchange(
@@ -223,7 +394,7 @@ namespace ServerZoneOwnership
             if (eventInv > 0)
             {
                 Log.LogInfo(
-                    $"[Diag] SpawnSystem invocations in last {PeerAwareSummaryIntervalSeconds:F0}s: " +
+                    $"[{Plugin.Stamp}] [Diag] SpawnSystem invocations in last {PeerAwareSummaryIntervalSeconds:F0}s: " +
                     $"biome={biomeInv} event={eventInv}.");
             }
         }
@@ -234,7 +405,7 @@ namespace ServerZoneOwnership
                 ref SpawnSystem_UpdateSpawning_Patch.s_suppressedNRECount, 0);
             if (caught > 0)
             {
-                Log.LogWarning($"[SpawnSystem] Suppressed {caught} NRE(s) from vanilla UpdateSpawnList " +
+                Log.LogWarning($"[{Plugin.Stamp}] [SpawnSystem] Suppressed {caught} NRE(s) from vanilla UpdateSpawnList " +
                     $"in last {NRESummaryIntervalSeconds:F0}s (likely a race we haven't covered yet — investigate if sustained).");
             }
         }
@@ -244,7 +415,7 @@ namespace ServerZoneOwnership
             var characters = Character.GetAllCharacters();
             if (characters == null || characters.Count == 0)
             {
-                Log.LogInfo("[Population] No characters active.");
+                Log.LogInfo($"[{Plugin.Stamp}] [Population] No characters active.");
                 return;
             }
 
@@ -262,7 +433,7 @@ namespace ServerZoneOwnership
 
             int mobTotal = counts.Values.Sum();
             var sb = new System.Text.StringBuilder(
-                $"[Population] {mobTotal} mob(s) across {counts.Count} type(s)");
+                $"[{Plugin.Stamp}] [Population] {mobTotal} mob(s) across {counts.Count} type(s)");
             if (playerCount > 0) sb.Append($" (+{playerCount} player(s))");
             if (mobTotal > 0)
             {
@@ -284,7 +455,7 @@ namespace ServerZoneOwnership
             int peerCount = peers?.Count ?? 0;
             if (peerCount == 0)
             {
-                Log.LogInfo("[Coverage] 0 peers connected — no zones active.");
+                Log.LogInfo($"[{Plugin.Stamp}] [Coverage] 0 peers connected — no zones active.");
                 return;
             }
 
@@ -309,7 +480,7 @@ namespace ServerZoneOwnership
             float worldMaxZ = (maxY + 0.5f) * ZoneSize;
 
             Log.LogInfo(
-                $"[Coverage] {sectors.Count} sectors owned by server across {peerCount} peer(s). " +
+                $"[{Plugin.Stamp}] [Coverage] {sectors.Count} sectors owned by server across {peerCount} peer(s). " +
                 $"Sector bbox: x[{minX}..{maxX}] z[{minY}..{maxY}]. " +
                 $"World bbox: x[{worldMinX:F0}..{worldMaxX:F0}] z[{worldMinZ:F0}..{worldMaxZ:F0}] meters.");
 
@@ -320,7 +491,7 @@ namespace ServerZoneOwnership
             // does not gate on a single centroid box any more (see
             // ZoneSystem_IsActiveAreaLoaded_Patch and the two
             // ZNetScene_OutsideActiveArea_*_Patches).
-            var sb = new System.Text.StringBuilder("[Coverage] Peer positions: ");
+            var sb = new System.Text.StringBuilder($"[{Plugin.Stamp}] [Coverage] Peer positions: ");
             int near = ServerCoverage.GetSimulationDistance().NearSimulationDistance;
             bool first = true;
             foreach (var peer in peers)
@@ -430,21 +601,35 @@ namespace ServerZoneOwnership
             foreach (var peer in ZNet.instance.GetPeers())
             {
                 if (peer == null) continue;
-                var center = ZoneSystem.GetZone(peer.GetRefPos());
-                for (int y = -near; y <= near; y++)
+                AddSectorBox(ZoneSystem.GetZone(peer.GetRefPos()), near, simDist);
+            }
+            // Synthetic load-test peers: the FULL ring, including zones that
+            // haven't loaded yet — this is the loop that loads them. Using the
+            // zone-loaded-only list here would deadlock (a zone can't load until
+            // it's loaded), and leaving synthetic peers out entirely is what let
+            // ZNetScene create objects in areas with no terrain on 2026-09-25,
+            // dropping physics objects through the world.
+            foreach (var pos in SyntheticPeers.GetPositionsForZoneLoading())
+            {
+                AddSectorBox(ZoneSystem.GetZone(pos), near, simDist);
+            }
+            return s_activeSectors;
+        }
+
+        private static void AddSectorBox(Vector2s center, int near, SimulationDistance simDist)
+        {
+            for (int y = -near; y <= near; y++)
+            {
+                for (int x = -near; x <= near; x++)
                 {
-                    for (int x = -near; x <= near; x++)
+                    var s = new Vector2s(center.x + x, center.y + y);
+                    if (simDist.IsClassic ||
+                        ZoneSystem.instance.ZonesWithinRadius(center, s, near))
                     {
-                        var s = new Vector2s(center.x + x, center.y + y);
-                        if (simDist.IsClassic ||
-                            ZoneSystem.instance.ZonesWithinRadius(center, s, near))
-                        {
-                            s_activeSectors.Add(s);
-                        }
+                        s_activeSectors.Add(s);
                     }
                 }
             }
-            return s_activeSectors;
         }
 
         // NOTE: there is deliberately no GetDistantSectors here any more.
@@ -471,6 +656,12 @@ namespace ServerZoneOwnership
                 // (Vector3 point, Vector3 centerPosition) overload — vanilla
                 // resolves the center zone and runs the radius test itself.
                 if (ZNetScene.InActiveArea(point, peer.GetRefPos())) return true;
+            }
+            // Synthetic load-test peers count as active areas too, otherwise
+            // their zones would load but spawns and physics would stay gated.
+            foreach (var pos in SyntheticPeers.GetPositions())
+            {
+                if (ZNetScene.InActiveArea(point, pos)) return true;
             }
             return false;
         }
@@ -514,7 +705,347 @@ namespace ServerZoneOwnership
                     s_uniquePeerPositions.Add(pos);
                 }
             }
+            foreach (var pos in SyntheticPeers.GetPositions())
+            {
+                if (s_seenPeerSectors.Add(ZoneSystem.GetZone(pos)))
+                {
+                    s_uniquePeerPositions.Add(pos);
+                }
+            }
             return s_uniquePeerPositions;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.3: synthetic peers — an 8-player load test without 8 players.
+    ///
+    /// Everything expensive about extra players flows from one list of
+    /// positions (ServerCoverage.GetUniquePeerPositions): which zones load,
+    /// which ZDOs the server instantiates and owns, where mobs may spawn, and
+    /// therefore how many navmesh tiles and stitches exist. Adding fake
+    /// positions to that list reproduces the simulation load faithfully.
+    ///
+    /// Shape (v0.7.6): Plugin.DebugSyntheticPeerCount positions, placed once at
+    /// random ON LAND within [MinRadius, MaxRadius] of the character named in
+    /// Plugin.DebugSyntheticPeerAnchor, then each drifting on its own heading at
+    /// DriftSpeed and turning when it meets water.
+    ///
+    /// The first version followed the anchor as a fixed ring, which was wrong in
+    /// two ways the 2026-09-25 validation run exposed: several points sat on
+    /// open water (nearly free — no walkable ground, almost no spawns), and all
+    /// areas jumped in lockstep every 32m the anchor walked, so tiles churned
+    /// far harder than real players cause. The result was 472-843 tiles at only
+    /// 20-30 stitches each, versus 300-610 at ~110 in a real 8-player session:
+    /// tiles created and discarded before navmesh could be built in them.
+    ///
+    /// Placement stays anchored to the tester's region so they can still choose
+    /// somewhere clear of bases; at 600-1400m out, with areas reaching ~160m
+    /// past their centre, stay ~1.6km clear of anything you care about.
+    ///
+    /// Off unless the anchor name is set. It also switches itself off when that
+    /// player logs out, so no restart is needed to stop a test.
+    ///
+    /// What this does NOT reproduce: network load. Fake peers have no socket,
+    /// so per-peer sends, bandwidth and sendQueue stay untested. They also
+    /// never receive ZDO ownership — IsLivePeer only knows real uids — which is
+    /// what we want, since the server owning everything is the case under test.
+    /// </summary>
+    internal static class SyntheticPeers
+    {
+        private static readonly List<Vector3> s_positions = new List<Vector3>();
+        private static bool s_wasArmed;
+
+        // Recompute cache. GetPositions is called from
+        // IsPointInsideAnyPeerActiveArea, which vanilla hits once per object per
+        // frame (WearNTear, StaticPhysics, SpawnArea) — so the land search must
+        // NOT run per call, or the load test would itself become the slowdown we
+        // are trying to measure. Refresh only when the anchor has moved half a
+        // zone or the cache is a couple of seconds old; neither matters for a
+        // 320m area, and it also keeps the ring from jittering.
+        private static readonly List<Vector3> s_cached = new List<Vector3>();
+        private static Vector3 s_cachedAnchor;
+        private static float s_cachedAt = float.NegativeInfinity;
+        private static int s_cachedOnWater;
+        private const float CacheMaxAgeSeconds = 2f;
+        private const float CacheMoveThreshold = 32f;
+
+        // Staged activation. 2026-09-25: arming all 7 at once gave the server 7
+        // cold areas in one frame — it began creating objects there before the
+        // terrain existed (51 "could not find hmap"), physics objects fell
+        // through the missing ground, and one tick stalled 1316ms. Bringing them
+        // up one at a time lets zone loading (one zone per tick per position)
+        // keep pace.
+        private const float PeerRampSeconds = 5f;
+        private static float s_armedAt = float.NegativeInfinity;
+
+        private static readonly List<Vector3> s_loadingPositions = new List<Vector3>();
+        private static readonly List<Vector3> s_cachedEmpty = new List<Vector3>();
+        private static readonly List<Vector3> s_live = new List<Vector3>();
+        private static readonly List<float> s_headings = new List<float>();
+        private static readonly List<float> s_speeds = new List<float>();
+        private static readonly List<bool> s_roaming = new List<bool>();
+        private static readonly List<float> s_stateUntil = new List<float>();
+
+        // Bout lengths, chosen so peers are stationary roughly half the time —
+        // a rough stand-in for time spent in a base, crafting or fighting.
+        private const float RoamSecondsMin = 20f;
+        private const float RoamSecondsMax = 60f;
+        private const float IdleSecondsMin = 30f;
+        private const float IdleSecondsMax = 120f;
+
+        internal static bool Armed => !string.IsNullOrEmpty(Plugin.DebugSyntheticPeerAnchor)
+                                      && Plugin.DebugSyntheticPeerCount > 0;
+
+        internal static int Count => s_positions.Count;
+
+        /// <summary>
+        /// Every ring position, whether or not its zone has loaded yet. Only for
+        /// zone loading (ZoneSystem_Update_Patch) — the zones have to be allowed
+        /// to generate before anything else treats the area as live.
+        /// </summary>
+        internal static List<Vector3> GetPositionsForZoneLoading()
+        {
+            s_loadingPositions.Clear();
+            s_loadingPositions.AddRange(BuildPeerPositions());
+            return s_loadingPositions;
+        }
+
+        /// <summary>
+        /// Ring positions for this tick, or an empty list when disarmed or the
+        /// anchor is offline. Recomputed per call so the ring tracks the anchor.
+        /// </summary>
+        internal static List<Vector3> GetPositions()
+        {
+            s_positions.Clear();
+            var ring = BuildPeerPositions();
+            if (ring.Count == 0) return s_positions;
+
+            // Only hand out positions whose zone has actually loaded. Without
+            // this, ZNetScene creates objects and StaticPhysics runs in an area
+            // with no terrain yet, and physics objects fall through the world
+            // (observed 2026-09-25). Zone loading itself uses
+            // GetPositionsForZoneLoading, so the ground still gets generated —
+            // this only delays everything that treats the area as live.
+            var zs = ZoneSystem.instance;
+            foreach (var pos in ring)
+            {
+                if (zs == null || zs.IsZoneLoaded(ZoneSystem.GetZone(pos)))
+                    s_positions.Add(pos);
+            }
+            return s_positions;
+        }
+
+        /// <summary>
+        /// The fake peers themselves: anchor lookup and guards, one-time random
+        /// placement on land, then independent drift.
+        ///
+        /// v0.7.6 replaced the follow-the-anchor ring. That ring moved all 7
+        /// areas in lockstep every 32m the anchor walked, which churned tiles
+        /// far harder than real players do: the 2026-09-25 validation run showed
+        /// 472-843 tiles at only 20-30 stitches each (real 8-player sessions run
+        /// 300-610 tiles at ~110), because tiles were created and thrown away
+        /// before the game could build navmesh in them. Several ring points also
+        /// landed on open water, which is nearly free.
+        ///
+        /// Now: placed once at random on land within an annulus around the
+        /// anchor (so the tester still chooses the region and can keep it clear
+        /// of bases), then each peer walks its own heading at its own speed and
+        /// turns when it hits water. That is much closer to 8 independent
+        /// players wandering.
+        /// </summary>
+        private static List<Vector3> BuildPeerPositions()
+        {
+            if (!Armed || ZNet.instance == null) return s_cachedEmpty;
+
+            Vector3? anchor = null;
+            foreach (var peer in ZNet.instance.GetPeers())
+            {
+                if (peer == null) continue;
+                if (!string.Equals(peer.m_playerName, Plugin.DebugSyntheticPeerAnchor,
+                                   StringComparison.OrdinalIgnoreCase)) continue;
+                // GUARD (2026-09-25): a freshly connected peer has no position
+                // yet — m_refPos is still Vector3.zero and m_characterID is None.
+                // Taking that at face value planted everything at world(0,0),
+                // the middle of the map, and objects fell out of the world there.
+                if (peer.m_characterID == ZDOID.None) break;
+                anchor = peer.GetRefPos();
+                break;
+            }
+
+            if (!anchor.HasValue)
+            {
+                if (s_wasArmed)
+                {
+                    s_wasArmed = false;
+                    s_armedAt = float.NegativeInfinity;
+                    // Clear all five parallel lists together — they are indexed
+                    // in lockstep, so a partial reset would misalign speeds and
+                    // bout timers against positions on the next placement.
+                    s_cached.Clear();
+                    s_headings.Clear();
+                    s_speeds.Clear();
+                    s_roaming.Clear();
+                    s_stateUntil.Clear();
+                    Plugin.Log.LogWarning(
+                        $"[{Plugin.Stamp}] [SynthPeers] anchor '{Plugin.DebugSyntheticPeerAnchor}' " +
+                        "offline or unpositioned — synthetic load OFF.");
+                }
+                return s_cachedEmpty;
+            }
+
+            int count = Plugin.DebugSyntheticPeerCount;
+            if (s_cached.Count == 0) PlaceOnLand(anchor.Value, count);
+            if (s_cached.Count == 0) return s_cachedEmpty;
+
+            if (!s_wasArmed)
+            {
+                s_wasArmed = true;
+                var where = new System.Text.StringBuilder();
+                foreach (var p in s_cached) where.Append($"({p.x:F0},{p.z:F0}) ");
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [SynthPeers] LOAD TEST ACTIVE: placed {s_cached.Count}/{count} " +
+                    $"synthetic peers on land {Plugin.DebugSyntheticPeerMinRadius:F0}-" +
+                    $"{Plugin.DebugSyntheticPeerMaxRadius:F0}m from '{Plugin.DebugSyntheticPeerAnchor}' " +
+                    $"at world({anchor.Value.x:F0},{anchor.Value.z:F0}), drifting {Plugin.DebugSyntheticPeerDriftSpeed:F0}m/s, " +
+                    $"ramping one every {PeerRampSeconds:F0}s. At: {where}" +
+                    "| [Nav]/[Perf] readings in this state are NOT baseline.");
+            }
+
+            if (s_armedAt == float.NegativeInfinity) s_armedAt = Time.time;
+            // Staged: one more peer every PeerRampSeconds so zone loading keeps up.
+            int live = Mathf.Clamp(
+                (int)((Time.time - s_armedAt) / PeerRampSeconds) + 1, 1, s_cached.Count);
+
+            if (Time.time - s_cachedAt >= CacheMaxAgeSeconds)
+            {
+                Drift(live, Time.time - s_cachedAt);
+                s_cachedAt = Time.time;
+            }
+
+            s_live.Clear();
+            for (int i = 0; i < live; i++) s_live.Add(s_cached[i]);
+            return s_live;
+        }
+
+        /// <summary>
+        /// Pick count positions at random on land, within
+        /// [MinRadius, MaxRadius] of the anchor and at least 320m apart so their
+        /// simulated areas don't overlap. Uses WorldGenerator (procedural), so
+        /// candidate spots don't need to be loaded to be tested.
+        /// </summary>
+        private static void PlaceOnLand(Vector3 anchor, int count)
+        {
+            var world = WorldGenerator.instance;
+            var zs = ZoneSystem.instance;
+            if (world == null || zs == null) return;
+
+            float minHeight = zs.m_waterLevel + 2f;
+            float minR = Plugin.DebugSyntheticPeerMinRadius;
+            float maxR = Plugin.DebugSyntheticPeerMaxRadius;
+            s_cached.Clear();
+            s_headings.Clear();
+            s_speeds.Clear();
+            s_roaming.Clear();
+            s_stateUntil.Clear();
+
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 chosen = Vector3.zero;
+                bool found = false;
+                for (int attempt = 0; attempt < 400 && !found; attempt++)
+                {
+                    float angle = UnityEngine.Random.Range(0f, Mathf.PI * 2f);
+                    float radius = UnityEngine.Random.Range(minR, maxR);
+                    var candidate = new Vector3(
+                        anchor.x + Mathf.Cos(angle) * radius,
+                        anchor.y,
+                        anchor.z + Mathf.Sin(angle) * radius);
+                    if (world.GetHeight(candidate.x, candidate.z) <= minHeight) continue;
+                    // Relax the separation requirement if the region is tight,
+                    // rather than failing to place a peer at all.
+                    float required = attempt < 300 ? 320f : 160f;
+                    bool clear = true;
+                    foreach (var other in s_cached)
+                    {
+                        if (Utils.DistanceXZ(candidate, other) < required) { clear = false; break; }
+                    }
+                    if (!clear) continue;
+                    chosen = candidate;
+                    found = true;
+                }
+                if (!found) continue;
+                s_cached.Add(chosen);
+                s_headings.Add(UnityEngine.Random.Range(0f, Mathf.PI * 2f));
+                s_speeds.Add(UnityEngine.Random.Range(
+                    Plugin.DebugSyntheticPeerDriftSpeed * 0.6f,
+                    Plugin.DebugSyntheticPeerDriftSpeed * 1.6f));
+                // Stagger the first bout so they do not all start and stop together.
+                s_roaming.Add(UnityEngine.Random.value < 0.5f);
+                s_stateUntil.Add(Time.time + UnityEngine.Random.Range(5f, RoamSecondsMax));
+            }
+            s_cachedAt = Time.time;
+        }
+
+        /// <summary>
+        /// Move each live peer the way a player actually moves: alternating
+        /// bouts of roaming and standing still, always on land.
+        ///
+        /// v0.7.7. Constant drift produced the right number of tiles but only
+        /// half the stitches of a real 8-player session (54/tile vs ~110, while
+        /// this world's solo runs average 92) — because tiles were freed three
+        /// times faster than they were built, so the average tile never finished
+        /// being stitched. Real players spend a lot of time stationary: in a
+        /// base, crafting, fighting, or just standing. Idle bouts let an area's
+        /// tiles complete, which is what makes stitch counts realistic.
+        ///
+        /// Water is never entered: a step onto water is refused and the peer
+        /// turns instead, so they behave like walkers, not swimmers or boats.
+        /// </summary>
+        private static void Drift(int live, float dt)
+        {
+            var world = WorldGenerator.instance;
+            var zs = ZoneSystem.instance;
+            if (world == null || zs == null) return;
+            float minHeight = zs.m_waterLevel + 2f;
+
+            for (int i = 0; i < live && i < s_cached.Count; i++)
+            {
+                // Flip between roaming and standing still when this bout expires.
+                if (Time.time >= s_stateUntil[i])
+                {
+                    s_roaming[i] = !s_roaming[i];
+                    s_stateUntil[i] = Time.time + (s_roaming[i]
+                        ? UnityEngine.Random.Range(RoamSecondsMin, RoamSecondsMax)
+                        : UnityEngine.Random.Range(IdleSecondsMin, IdleSecondsMax));
+                    if (s_roaming[i])
+                    {
+                        // New destination-ish heading and pace for this bout.
+                        s_headings[i] = UnityEngine.Random.Range(0f, Mathf.PI * 2f);
+                        s_speeds[i] = UnityEngine.Random.Range(
+                            Plugin.DebugSyntheticPeerDriftSpeed * 0.6f,
+                            Plugin.DebugSyntheticPeerDriftSpeed * 1.6f);
+                    }
+                }
+                if (!s_roaming[i]) continue;
+
+                var pos = s_cached[i];
+                float heading = s_headings[i];
+                var next = new Vector3(
+                    pos.x + Mathf.Cos(heading) * s_speeds[i] * dt,
+                    pos.y,
+                    pos.z + Mathf.Sin(heading) * s_speeds[i] * dt);
+
+                if (world.GetHeight(next.x, next.z) > minHeight)
+                {
+                    s_cached[i] = next;
+                    // Gentle wander so they don't march in perfect straight lines.
+                    s_headings[i] = heading + UnityEngine.Random.Range(-0.2f, 0.2f);
+                }
+                else
+                {
+                    s_headings[i] = heading + UnityEngine.Random.Range(1.5f, 4.7f);  // turn away
+                }
+            }
         }
     }
 
@@ -741,9 +1272,31 @@ namespace ServerZoneOwnership
         private static readonly HashSet<ZDO> s_seenNear = new HashSet<ZDO>();
         private static readonly HashSet<ZDO> s_seenDistant = new HashSet<ZDO>();
 
+        private static int s_frame;
+
         static bool Prefix(ZNetScene __instance)
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
+
+            // v0.7.10: stride is a REHEARSAL for round-robin, not round-robin.
+            // This pass is our most expensive (12.4% of wall clock, single calls
+            // up to 214ms), and the planned fix is to walk one peer's area per
+            // frame instead of every peer's. Before building that, we want to
+            // know how the resulting latency FEELS — with 8 peers, a given
+            // player's surroundings would refresh every 8th frame.
+            //
+            // Setting the stride to 8 with one player online reproduces exactly
+            // that delay (~0.27s at 30 ticks/sec) while keeping the test simple:
+            // skip the whole pass on off-frames. It saves the same work for one
+            // player that round-robin would save with eight, so it also shows
+            // the [Pass] cost drop, but the point is the visible effect: how
+            // late do objects and mobs appear as you travel.
+            s_frame++;
+            if (Plugin.DebugCreateDestroyStride > 1
+                && s_frame % Plugin.DebugCreateDestroyStride != 0)
+            {
+                return false;   // skip this tick entirely, as round-robin would
+            }
 
             var currentObjects = (List<ZDO>)ReflectionCache.ZNetScene_tempCurrentObjects.GetValue(__instance);
             var distantObjects = (List<ZDO>)ReflectionCache.ZNetScene_tempCurrentDistantObjects.GetValue(__instance);
@@ -848,7 +1401,7 @@ namespace ServerZoneOwnership
                 zdo.SetOwner(desired);
                 var pos = zdo.GetPosition();
                 Plugin.Log.LogInfo(
-                    $"[Diag] Ship ownership → peer {desired} (was {prev}) " +
+                    $"[{Plugin.Stamp}] [Diag] Ship ownership → peer {desired} (was {prev}) " +
                     $"prefab={prefab.name} pos=world({pos.x:F0},{pos.z:F0})");
             }
             return true;
@@ -952,6 +1505,7 @@ namespace ServerZoneOwnership
                 foreach (var zdo in s_sectorBuffer)
                 {
                     if (!s_seenZdos.Add(zdo)) continue;
+                    ReclaimStats.CountScanned();
                     if (!zdo.Persistent) continue;
                     // Ships a player is aboard belong to that player, as in
                     // vanilla. Must run before the "server already owns it"
@@ -1046,15 +1600,36 @@ namespace ServerZoneOwnership
                     // mid-pull) should appear; live=True means a regression.
                     if (zdo.GetBool(ZDOVars.s_attachJointHash))
                     {
-                        var cartPos = zdo.GetPosition();
-                        var cartPrefab = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
-                        Plugin.Log.LogWarning(
-                            $"[Diag] Cart reclaimed by server from peer {prevOwner} " +
-                            $"(live={ServerCoverage.IsLivePeer(prevOwner)}) while attachJoint=True " +
-                            $"prefab={(cartPrefab != null ? cartPrefab.name : "?")} " +
-                            $"pos=world({cartPos.x:F0},{cartPos.z:F0})");
+                        // A dead owner here is the expected cleanup path, so it
+                        // only counts toward the digest. A LIVE owner means the
+                        // v0.6.7 in-use skip failed and carts are dropping
+                        // again — that still warns immediately, and should
+                        // never appear.
+                        if (ServerCoverage.IsLivePeer(prevOwner))
+                        {
+                            var cartPos = zdo.GetPosition();
+                            var cartPrefab = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
+                            Plugin.Log.LogWarning(
+                                $"[{Plugin.Stamp}] [Diag] REGRESSION: cart reclaimed by server from LIVE peer {prevOwner} " +
+                                $"while attachJoint=True " +
+                                $"prefab={(cartPrefab != null ? cartPrefab.name : "?")} " +
+                                $"pos=world({cartPos.x:F0},{cartPos.z:F0})");
+                        }
+                        else
+                        {
+                            DailyDigest.RecordCartReclaimedDeadOwner();
+                        }
                     }
 
+                    // v0.7.11: every SetOwner bumps OwnerRevision, and vanilla's
+                    // ZDOPeer.ShouldSend returns true unconditionally when a
+                    // peer's known OwnerRevision is behind — so each reclaim
+                    // forces that ZDO to be re-sent to EVERY nearby peer. With
+                    // a 2s cycle this is a continuous, self-inflicted sync load
+                    // vanilla never generates, and peers were measured pinned at
+                    // vanilla's 10KB send ceiling 25-85% of the time (solo),
+                    // ending in a ZRpc timeout disconnect on 2026-09-25.
+                    ReclaimStats.CountOwnerChange();
                     zdo.SetOwner(sessionId);
 
                     // Diagnostic: classify reclaims by prevOwner and by prefab
@@ -1090,6 +1665,22 @@ namespace ServerZoneOwnership
                                     System.Threading.Interlocked.Increment(ref s_containerReclaimLivePeer);
                                     s_lastContainerLivePeerReclaimName = prefab.name;
                                     s_lastContainerLivePeerReclaimPrevOwner = prevOwner;
+                                    // v0.7.2: stays immediate — this is the prime
+                                    // suspect for the chest that opens and then
+                                    // empties a second later. Taking the ZDO from a
+                                    // peer who has the chest open flips IsOwner()
+                                    // false on their client, and
+                                    // InventoryGui.UpdateContainer then hides the
+                                    // grid. s_inUse SHOULD have made us skip this
+                                    // ZDO, so seeing s_inUse=0 here means the
+                                    // in-use flag never arrived (or was cleared)
+                                    // and points at the ordering, not the skip.
+                                    var chestPos = zdo.GetPosition();
+                                    Plugin.Log.LogWarning(
+                                        $"[{Plugin.Stamp}] [Diag] Container reclaimed from LIVE peer {prevOwner} " +
+                                        $"prefab={prefab.name} pos=world({chestPos.x:F0},{chestPos.z:F0}) " +
+                                        $"s_inUse={zdo.GetInt(ZDOVars.s_inUse, 0)} " +
+                                        $"dataRev={zdo.DataRevision}");
                                 }
                                 else
                                     System.Threading.Interlocked.Increment(ref s_containerReclaimAbsentPeer);
@@ -1098,6 +1689,7 @@ namespace ServerZoneOwnership
                     }
                 }
             }
+            ReclaimStats.EndPass();
             return false;
         }
     }
@@ -1256,13 +1848,20 @@ namespace ServerZoneOwnership
             var zdo = nview.GetZDO();
             if (zdo == null) return;
             long prevOwner = zdo.GetOwner();
+            // Kept immediate at the user's request (2026-09-24): chests still go
+            // stuck, most recently opening fine and then losing their inventory
+            // a second or two later. This line is the "before" half of that
+            // story — pair it with a later "Container reclaimed from LIVE peer"
+            // warning for the same chest to catch the ownership being pulled
+            // out from under an open UI. Daily totals also go to the digest.
             int sInUse = zdo.GetInt(ZDOVars.s_inUse, 0);
             bool imOwner = nview.IsOwner();
             long imUid = ZDOMan.GetSessionID();
             Plugin.Log.LogInfo(
-                $"[Diag] RequestOpen chest={__instance.gameObject.name} " +
+                $"[{Plugin.Stamp}] [Diag] RequestOpen chest={__instance.gameObject.name} " +
                 $"requester={uid} prevOwner={prevOwner} s_inUse={sInUse} " +
                 $"imOwner={imOwner} imUid={imUid}");
+            DailyDigest.RecordContainerOpen(__instance.gameObject.name.Replace("(Clone)", ""));
         }
     }
 
@@ -1280,12 +1879,12 @@ namespace ServerZoneOwnership
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             if (ev == null)
             {
-                Plugin.Log.LogInfo("[Diag] Random event cleared.");
+                Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Diag] Random event cleared.");
                 return;
             }
             int spawnerCount = ev.m_spawn?.Count ?? 0;
             Plugin.Log.LogInfo(
-                $"[Diag] Random event started: name={ev.m_name} target=world({pos.x:F0},{pos.z:F0}) " +
+                $"[{Plugin.Stamp}] [Diag] Random event started: name={ev.m_name} target=world({pos.x:F0},{pos.z:F0}) " +
                 $"targetSector={ZoneSystem.GetZone(pos)} spawnerCount={spawnerCount} " +
                 $"spawnerDelay={ev.m_spawnerDelay}s duration={ev.m_duration}s.");
         }
@@ -1354,7 +1953,7 @@ namespace ServerZoneOwnership
             if (desiredActive == priorActive) return;
             s_setActiveEvent.Invoke(__instance, new object[] { desiredActive, false });
             Plugin.Log.LogInfo(
-                $"[Diag] Server-side active event promoted: " +
+                $"[{Plugin.Stamp}] [Diag] Server-side active event promoted: " +
                 $"{(priorActive?.m_name ?? "null")} → {(desiredActive?.m_name ?? "null")}.");
         }
     }
@@ -1382,7 +1981,7 @@ namespace ServerZoneOwnership
             __instance.m_eventIntervalMin = 2f;
             __instance.m_eventChance = -1f;
             Plugin.Log.LogWarning(
-                "[Debug] Raids DISABLED (eventChance=-1, no roll can pass). " +
+                $"[{Plugin.Stamp}] [Debug] Raids DISABLED (eventChance=-1, no roll can pass). " +
                 "Set Plugin.DebugDisableRaids=false and rebuild to restore the vanilla cadence.");
         }
     }
@@ -1449,11 +2048,9 @@ namespace ServerZoneOwnership
             }
 
             System.Threading.Interlocked.Increment(ref s_healCount);
-            var pos = __instance.transform.position;
-            Plugin.Log.LogInfo(
-                $"[Diag] TerrainComp healed pos=world({pos.x:F0},{pos.z:F0}) " +
-                $"sector={ZoneSystem.GetZone(pos)} totalHeals={s_healCount} " +
-                $"tcDataBytes={tcData?.Length ?? 0} loaded={loaded}");
+            // v0.7.2: counted into the daily digest instead of one line per heal
+            // (~578/session). The sector list there shows where the race bites.
+            DailyDigest.RecordTerrainHeal(__instance.transform.position);
         }
     }
 
@@ -1501,13 +2098,7 @@ namespace ServerZoneOwnership
         {
             if (!__result) return;
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            var pos = __instance.transform.position;
-            var nview = __instance.GetComponent<ZNetView>();
-            uint dataRev = nview?.GetZDO()?.DataRevision ?? 0;
-            long owner = nview?.GetZDO()?.GetOwner() ?? 0;
-            Plugin.Log.LogInfo(
-                $"[Diag] TerrainComp.Load pos=world({pos.x:F0},{pos.z:F0}) " +
-                $"sector={ZoneSystem.GetZone(pos)} owner={owner} newDataRev={dataRev}");
+            DailyDigest.RecordTerrainLoad();
         }
     }
 
@@ -1532,11 +2123,9 @@ namespace ServerZoneOwnership
 
             long prevOwner = __instance.GetOwner();
             if (prevOwner == uid) return; // vanilla SetOwner no-ops in this case anyway
-            var pos = __instance.GetPosition();
-            Plugin.Log.LogWarning(
-                $"[Diag] TerrainComp ZDO ownership change pos=world({pos.x:F0},{pos.z:F0}) " +
-                $"sector={ZoneSystem.GetZone(pos)} {prevOwner} → {uid} " +
-                $"prevLive={ServerCoverage.IsLivePeer(prevOwner)} newLive={ServerCoverage.IsLivePeer(uid)}");
+            // v0.7.2: the noisiest diagnostic we had (1483 lines in one session).
+            // Only the churn total and its direction matter, so count them.
+            DailyDigest.RecordTerrainOwnerChange(prevOwner, uid);
         }
     }
 
@@ -1602,7 +2191,7 @@ namespace ServerZoneOwnership
                 // Loud, because silently failing here means every pickable in
                 // the world stops working with only a stack trace to show for it.
                 Plugin.Log.LogError(
-                    "[Pickable] Transpiler could not find the Player.m_localPlayer.GetZDOID() " +
+                    $"[{Plugin.Stamp}] [Pickable] Transpiler could not find the Player.m_localPlayer.GetZDOID() " +
                     "sequence in RPC_Pick — vanilla IL changed. Pickables will NRE on the " +
                     "server until this patch is updated.");
             }
@@ -1733,14 +2322,13 @@ namespace ServerZoneOwnership
             bool physicsRan = !(heightAboveWater > __instance.m_disableLevel);
             bool waterFound = waterLevel > -9000f;
 
-            Plugin.Log.LogWarning(
-                $"[Diag] Ship prefab={__instance.gameObject.name.Replace("(Clone)", "")} " +
-                $"pos=world({com.x:F0},{com.y:F1},{com.z:F0}) sector={ZoneSystem.GetZone(com)} " +
-                $"owner={owner} isOwner={isOwner} ownerLive={ServerCoverage.IsLivePeer(owner)} " +
-                $"playersAboard={playerCount} speed={speed} rudder={rudder:F2} " +
-                $"waterLevel={waterLevel:F1} waterFound={waterFound} " +
-                $"heightAboveWater={heightAboveWater:F2} disableLevel={__instance.m_disableLevel:F2} " +
-                $"PHYSICS_RAN={physicsRan} vel=({body.linearVelocity.x:F1},{body.linearVelocity.y:F1},{body.linearVelocity.z:F1})");
+            // v0.7.2: the boat investigation is closed (v0.6.4 carve-out +
+            // v0.6.6 sail fix), so we no longer need a line per tick. Two
+            // numbers still guard against regressions: the server owning a
+            // crewed boat (it should hand off within ~2s), and hull depth —
+            // the lunge showed as 3.9-5.4m below water versus 1.37m healthy.
+            if (waterFound)
+                DailyDigest.RecordShipSample(isOwner && playerCount > 0, -heightAboveWater);
         }
     }
 
@@ -1820,12 +2408,9 @@ namespace ServerZoneOwnership
                     : joint == null ? "joint_broke" : "requested_or_owner_changed";
             }
 
-            Plugin.Log.LogWarning(
-                $"[Diag] Vagon.Detach prefab={__instance.gameObject.name.Replace("(Clone)", "")} " +
-                $"pos=world({pos.x:F0},{pos.z:F0}) owner={owner} serverOwns={serverOwns} " +
-                $"ownerLive={ServerCoverage.IsLivePeer(owner)} attachJoint={attachFlag} " +
-                $"attachedObj={(attachedObj != null ? attachedObj.name : "null")} " +
-                $"hadJoint={joint != null} dist={dist:F2} reason={reason}");
+            // v0.7.2: counted by reason. The reason histogram is what told
+            // theory B from theory A, and it still would.
+            DailyDigest.RecordCartDetach(reason);
         }
     }
 
@@ -1845,13 +2430,10 @@ namespace ServerZoneOwnership
             if (nview == null || !nview.IsValid()) return;
             bool serverOwns = nview.IsOwner();
             bool inUse = serverOwns && __instance.InUse();
-            string outcome = !serverOwns
-                ? "IGNORED (server isn't the owner; vanilla only answers on the owner)"
-                : inUse ? "DENY (cart in use)" : $"GRANT → peer {sender}";
-            var pos = __instance.transform.position;
-            Plugin.Log.LogInfo(
-                $"[Diag] Cart RPC_RequestOwn from={sender} prefab={__instance.gameObject.name.Replace("(Clone)", "")} " +
-                $"pos=world({pos.x:F0},{pos.z:F0}) owner={nview.GetZDO().GetOwner()} outcome={outcome}");
+            // GRANT = handed to the grabber (vanilla), DENY = someone else has
+            // it, IGNORED = the server wasn't the owner so vanilla stays quiet.
+            string outcome = !serverOwns ? "IGNORED" : inUse ? "DENY" : "GRANT";
+            DailyDigest.RecordCartRequestOwn(outcome);
         }
     }
 
@@ -1868,12 +2450,10 @@ namespace ServerZoneOwnership
         static void Postfix(Vagon __instance, GameObject go)
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            var pos = __instance.transform.position;
-            var nview = (ZNetView)s_nviewField.GetValue(__instance);
-            long owner = nview?.GetZDO()?.GetOwner() ?? 0;
-            Plugin.Log.LogInfo(
-                $"[Diag] Vagon.AttachTo prefab={__instance.gameObject.name.Replace("(Clone)","")} " +
-                $"pos=world({pos.x:F0},{pos.z:F0}) owner={owner} attachedTo={go.name}");
+            // Server-side attaches should be rare now: vanilla puts the joint on
+            // the puller's client. A high count next to the detach reasons would
+            // mean theory A is back.
+            DailyDigest.RecordCartAttach();
         }
     }
 
@@ -1896,16 +2476,10 @@ namespace ServerZoneOwnership
         static void Postfix(TerrainComp __instance)
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            var pos = __instance.transform.position;
             var hmap = (Heightmap)s_hmapField.GetValue(__instance);
-            bool initialized = (bool)s_initField.GetValue(__instance);
-            var nview = __instance.GetComponent<ZNetView>();
-            long owner = nview?.GetZDO()?.GetOwner() ?? 0;
-            byte[] tcData = nview?.GetZDO()?.GetByteArray(ZDOVars.s_TCData);
-            Plugin.Log.LogInfo(
-                $"[Diag] TerrainComp.Awake pos=world({pos.x:F0},{pos.z:F0}) " +
-                $"sector={ZoneSystem.GetZone(pos)} hmapFound={hmap != null} " +
-                $"initialized={initialized} owner={owner} tcDataBytes={tcData?.Length ?? 0}");
+            // hmapFound=false is the zone-load race; the digest reports how many
+            // of the day's Awakes lost it.
+            DailyDigest.RecordTerrainAwake(hmap != null);
         }
     }
 
@@ -1926,16 +2500,12 @@ namespace ServerZoneOwnership
         static void Prefix(TerrainComp __instance, long sender)
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            var pos = __instance.transform.position;
-            var hmap = (Heightmap)s_hmapField.GetValue(__instance);
             bool initialized = (bool)s_initField.GetValue(__instance);
             var nview = __instance.GetComponent<ZNetView>();
             bool isOwner = nview != null && nview.IsOwner();
-            Plugin.Log.LogWarning(
-                $"[Diag] TerrainComp.RPC_ApplyOperation from sender={sender} " +
-                $"pos=world({pos.x:F0},{pos.z:F0}) sector={ZoneSystem.GetZone(pos)} " +
-                $"isOwner={isOwner} hmapFound={hmap != null} initialized={initialized} " +
-                $"willSave={initialized && isOwner}");
+            // willSave=false means the dig was silently thrown away — the class
+            // of bug v0.5.22 fixed, so the digest tracks it as LOST.
+            DailyDigest.RecordApplyOperation(initialized && isOwner);
         }
     }
 
@@ -1999,7 +2569,7 @@ namespace ServerZoneOwnership
                 if (d < nearestPeerDist) nearestPeerDist = d;
             }
             Plugin.Log.LogWarning(
-                $"[Diag] WearNTear.Destroy prefab={prefab} " +
+                $"[{Plugin.Stamp}] [Diag] WearNTear.Destroy prefab={prefab} " +
                 $"pos=world({pos.x:F0},{pos.y:F1},{pos.z:F0}) biome={biome} " +
                 $"cause={cause}{attacker} support={support} haveRoof={haveRoof} wet={wet} " +
                 $"nearestPeerDist={nearestPeerDist:F0}m");
@@ -2031,7 +2601,7 @@ namespace ServerZoneOwnership
             long ownerId = nview?.GetZDO()?.GetOwner() ?? 0;
             string attachedItem = nview?.GetZDO()?.GetString(ZDOVars.s_item) ?? "";
             Plugin.Log.LogInfo(
-                $"[Diag] ItemStand RPC_DropItem received: sender={sender} " +
+                $"[{Plugin.Stamp}] [Diag] ItemStand RPC_DropItem received: sender={sender} " +
                 $"pos=world({pos.x:F0},{pos.z:F0}) prefab={__instance.gameObject.name.Replace("(Clone)","")} " +
                 $"isOwner={isOwner} owner={ownerId} canBeRemoved={canBeRemoved} " +
                 $"haveAttachment={haveAttachment} attachedItem='{attachedItem}' " +
@@ -2083,33 +2653,823 @@ namespace ServerZoneOwnership
             s_lastLogTime[key] = now;
 
             var pos = character.transform.position;
-            string effect = (nameHash == s_wetHash) ? "Wet" : "Tar";
+            bool isWet = nameHash == s_wetHash;
             string prefab = character.gameObject.name.Replace("(Clone)", "");
             float waterLevel = (float)s_waterLevelField.GetValue(character);
             float tarLevel = (float)s_tarLevelField.GetValue(character);
-            float liquidLevel = (nameHash == s_wetHash) ? waterLevel : tarLevel;
+            float liquidLevel = isWet ? waterLevel : tarLevel;
             float depthBelow = liquidLevel - pos.y;
-            string verdict = depthBelow >= 0.1f
-                ? "GENUINELY_IN_LIQUID"
-                : (depthBelow >= -0.5f ? "AT_SURFACE" : "ABOVE_LIQUID_SUSPICIOUS");
+            // The original question was "why is this mob wet when it shouldn't
+            // be?" — only the mob being ABOVE the liquid answers that, so the
+            // digest counts those separately from ordinary in-water wetness.
+            bool suspicious = depthBelow < -0.5f;
+            DailyDigest.RecordStatusEffect(isWet, prefab, liquidLevel, suspicious);
+        }
+    }
 
-            // Distance to nearest peer so we know if the mob is even visible.
-            float nearestPeerDist = float.PositiveInfinity;
-            foreach (var peer in ZNet.instance.GetPeers())
+    /// <summary>
+    /// v0.7.0 — navmesh tile pressure gauge (group-play lag).
+    ///
+    /// Mob pathfinding works off 32m navmesh tiles, built on demand by any
+    /// moving creature (a path request pokes a 3x3 tile block) and kept per
+    /// agent size, so one patch of ground can hold several tiles. Neighbouring
+    /// tiles are stitched with NavMesh links at ~1m spacing — ~64 links per
+    /// tile — drawn from ONE engine-wide pool of 65535. Exhaust it and
+    /// NavMesh.AddLink silently returns an invalid handle: mobs can no longer
+    /// cross tile boundaries, so they stall and rubber-band. That is what
+    /// group combat felt like on 2026-09-22 (8 peers, 6337 allocation errors
+    /// in 2.5 minutes).
+    ///
+    /// Our design concentrates this: the server owns every mob for every peer
+    /// (deliberately — a laggy client must not own simulation), so all of the
+    /// pathfinding for all peers lands on one machine, where vanilla would
+    /// have spread it across clients.
+    ///
+    /// Emits one line every 20s:
+    ///   [Nav] tiles=N (stale=N) stitches=N/65535 (N%) top: Humanoid×N … |
+    ///         built=N freed=N linkFails=N peers=N
+    /// Warning level once the pool is 80% used or any allocation failed.
+    /// stale = tiles past the timeout still waiting to be swept; a non-trivial
+    /// stale count means the sweep can't keep up and the knobs need revisiting.
+    /// </summary>
+    internal static class NavMeshPressure
+    {
+        internal const int EngineLinkBudget = 65535;
+
+        internal static readonly FieldInfo TilesField =
+            AccessTools.Field(typeof(Pathfinding), "m_tiles");
+        internal static readonly MethodInfo TimeoutTilesMethod =
+            AccessTools.Method(typeof(Pathfinding), "TimeoutTiles");
+
+        private static readonly Type s_tileType =
+            typeof(Pathfinding).GetNestedType("NavMeshTile", BindingFlags.NonPublic);
+        private static readonly FieldInfo s_pokeTimeField =
+            s_tileType != null ? AccessTools.Field(s_tileType, "m_pokeTime") : null;
+        private static readonly FieldInfo s_links1Field =
+            s_tileType != null ? AccessTools.Field(s_tileType, "m_links1") : null;
+        private static readonly FieldInfo s_links2Field =
+            s_tileType != null ? AccessTools.Field(s_tileType, "m_links2") : null;
+
+        internal static int s_linkAllocFailures;
+        internal static int s_tilesBuilt;
+        internal static int s_tilesFreed;
+        private static int s_lastTileCount;
+
+        /// <summary>
+        /// The link-pool-exhausted message comes from native engine code, so
+        /// there is no method to patch. Observe the Unity log stream, count,
+        /// and report per window instead of letting it spam the log.
+        /// </summary>
+        internal static void OnUnityLog(string condition, string stackTrace, LogType type)
+        {
+            if (type != LogType.Error || string.IsNullOrEmpty(condition)) return;
+            if (condition.IndexOf("NavMeshLink", StringComparison.Ordinal) >= 0)
+                System.Threading.Interlocked.Increment(ref s_linkAllocFailures);
+        }
+
+        internal static void LogStats()
+        {
+            var pathfinding = Pathfinding.instance;
+            if (pathfinding == null || TilesField == null || s_pokeTimeField == null) return;
+            if (!(TilesField.GetValue(pathfinding) is System.Collections.IDictionary tiles)) return;
+
+            int tileCount = 0, stale = 0, stitches = 0, unbuilt = 0;
+            float now = Time.time;
+            var perAgentType = new Dictionary<int, int>();
+            foreach (System.Collections.DictionaryEntry entry in tiles)
             {
-                if (peer?.m_refPos == null) continue;
-                var pp = peer.m_refPos;
-                float d = UnityEngine.Vector2.Distance(
-                    new UnityEngine.Vector2(pos.x, pos.z),
-                    new UnityEngine.Vector2(pp.x, pp.z));
-                if (d < nearestPeerDist) nearestPeerDist = d;
+                tileCount++;
+                int agentType = ((Vector3Int)entry.Key).z;
+                perAgentType.TryGetValue(agentType, out int seen);
+                perAgentType[agentType] = seen + 1;
+
+                var tile = entry.Value;
+                // Measure staleness against the timeout actually in force, not
+                // our knob — the knob may be disabled (<= 0 = leave vanilla's).
+                if (now - (float)s_pokeTimeField.GetValue(tile) > pathfinding.m_tileTimeout) stale++;
+                int links = CountLinks(s_links1Field, tile) + CountLinks(s_links2Field, tile);
+                stitches += links;
+                // Zero links = queued but never built. Vanilla builds ONE tile
+                // per maintenance pass (measured ~4.5/sec), so when creation
+                // outruns that the backlog grows and mobs in those tiles have no
+                // navmesh at all. This is the number that says whether the whole
+                // tile set is even worth keeping.
+                if (links == 0) unbuilt++;
             }
 
+            int built = System.Threading.Interlocked.Exchange(ref s_tilesBuilt, 0);
+            int freed = System.Threading.Interlocked.Exchange(ref s_tilesFreed, 0);
+            int fails = System.Threading.Interlocked.Exchange(ref s_linkAllocFailures, 0);
+            int peers = ZNet.instance != null ? ZNet.instance.GetPeers().Count : 0;
+            if (tileCount == 0 && fails == 0 && peers == 0) return;
+
+            var top = string.Join(" ", perAgentType
+                .OrderByDescending(kv => kv.Value)
+                .Take(3)
+                .Select(kv => $"{(Pathfinding.AgentType)kv.Key}×{kv.Value}"));
+
+            // Creation rate for the window: everything freed, plus net growth.
+            // Compare against `built` to see how oversubscribed the pipeline is.
+            int created = Mathf.Max(0, freed + (tileCount - s_lastTileCount));
+            s_lastTileCount = tileCount;
+
+            string line =
+                $"[{Plugin.Stamp}] [Nav] tiles={tileCount} (stale={stale}, " +
+                $"unbuilt={unbuilt} {(tileCount > 0 ? unbuilt * 100 / tileCount : 0)}%) " +
+                $"created={created} " +
+                $"stitches={stitches}/{EngineLinkBudget} ({stitches * 100f / EngineLinkBudget:F0}%) " +
+                $"top: {top} | built={built} freed={freed} linkFails={fails} peers={peers}" +
+                // Mark load-test readings so they can never be mistaken for a
+                // real-world baseline when we compare sessions later.
+                (SyntheticPeers.Count > 0 ? $" +synth={SyntheticPeers.Count} (LOAD TEST)" : "");
+
+            if (fails > 0 || stitches > EngineLinkBudget * 0.8f) Plugin.Log.LogWarning(line);
+            else Plugin.Log.LogInfo(line);
+        }
+
+        private static int CountLinks(FieldInfo field, object tile)
+        {
+            if (field == null) return 0;
+            return (field.GetValue(tile) as System.Collections.ICollection)?.Count ?? 0;
+        }
+    }
+
+    /// <summary>
+    /// Apply our navmesh tuning once the Pathfinding singleton exists.
+    /// Setting vanilla's own field rather than reimplementing its logic keeps
+    /// this migration-proof: fields survive updates, method bodies don't
+    /// (see the 25185644 migration).
+    /// </summary>
+    [HarmonyPatch(typeof(Pathfinding), "Awake")]
+    internal static class Pathfinding_Awake_Patch
+    {
+        static void Postfix(Pathfinding __instance)
+        {
+            float vanillaTimeout = __instance.m_tileTimeout;
+            if (Plugin.NavTileTimeoutSeconds > 0f)
+                __instance.m_tileTimeout = Plugin.NavTileTimeoutSeconds;
+            string timeoutState = Plugin.NavTileTimeoutSeconds > 0f
+                ? $"{vanillaTimeout:F0}s → {__instance.m_tileTimeout:F0}s"
+                : $"{vanillaTimeout:F0}s (vanilla, unchanged)";
+
+            float vanillaLinkWidth = __instance.m_linkWidth;
+            if (Plugin.NavLinkWidth > 0f)
+                __instance.m_linkWidth = Plugin.NavLinkWidth;
+            string linkState = Plugin.NavLinkWidth > 0f
+                ? $"{vanillaLinkWidth:F1}m → {__instance.m_linkWidth:F1}m"
+                : $"{vanillaLinkWidth:F1}m (vanilla, unchanged)";
+
             Plugin.Log.LogInfo(
-                $"[Diag] {effect} applied to {prefab} at world({pos.x:F0},{pos.y:F1},{pos.z:F0}) " +
-                $"{effect.ToLower()}Level={liquidLevel:F2} depthBelow={depthBelow:F2}m " +
-                $"verdict={verdict} nearestPeerDist={nearestPeerDist:F0}m " +
-                $"tolerateWater={character.m_tolerateWater} tolerateTar={character.m_tolerateTar}");
+                $"[{Plugin.Stamp}] [Nav] tile timeout {timeoutState}, " +
+                $"sweep {Plugin.NavTileSweepPerPass} stale tile(s) per pass" +
+                $"{(Plugin.NavTileSweepPerPass <= 1 ? " (vanilla, unchanged)" : " (vanilla frees 1)")}, " +
+                $"stitch spacing {linkState}, tileSize {__instance.m_tileSize:F0}m. " +
+                $"linkBudget={NavMeshPressure.EngineLinkBudget}");
+        }
+    }
+
+    /// <summary>
+    /// Free every expired navmesh tile per maintenance pass, not just one.
+    ///
+    /// Vanilla's TimeoutTiles walks m_tiles, removes the first tile whose last
+    /// use is older than m_tileTimeout, and breaks. The break is a C# necessity
+    /// — you can't keep enumerating a Dictionary you just removed from — rather
+    /// than a work budget: the expensive part (destroying navmesh + link data)
+    /// is already deferred to m_tileRemoveQueue / m_linkRemoveQueue, which
+    /// drain at their own throttled rate. So one-per-pass is a side effect, and
+    /// the pass itself runs at most 10x/sec and is skipped entirely while a
+    /// tile build is in flight.
+    ///
+    /// Effect: a peer who travels leaves a trail of dead tiles behind, and
+    /// vanilla reclaims them slower than 8 peers create new ones — the link
+    /// pool fills with tiles nobody is using.
+    ///
+    /// Rather than reimplement the removal (which would couple us to the
+    /// private NavMeshTile type and its queues), call vanilla's own method
+    /// repeatedly until it stops shrinking the dictionary, capped per pass.
+    /// s_sweeping guards the re-entry, since the re-invoke goes through this
+    /// same patch.
+    /// </summary>
+    [HarmonyPatch(typeof(Pathfinding), "TimeoutTiles")]
+    internal static class Pathfinding_TimeoutTiles_Patch
+    {
+        private static bool s_sweeping;
+
+        static void Prefix(Pathfinding __instance, out int __state)
+        {
+            __state = -1;
+            if (s_sweeping) return;
+            if (NavMeshPressure.TilesField?.GetValue(__instance) is System.Collections.ICollection tiles)
+                __state = tiles.Count;
+        }
+
+        static void Postfix(Pathfinding __instance, int __state)
+        {
+            if (s_sweeping || __state < 0) return;
+            if (NavMeshPressure.TimeoutTilesMethod == null) return;
+            if (!(NavMeshPressure.TilesField.GetValue(__instance) is System.Collections.ICollection tiles)) return;
+
+            s_sweeping = true;
+            try
+            {
+                // Vanilla's own call (the one we're a postfix of) already freed
+                // at most one, and counts toward the budget — so start at 1.
+                // NavTileSweepPerPass=1 therefore means "pure vanilla".
+                for (int i = 1; i < Plugin.NavTileSweepPerPass; i++)
+                {
+                    int before = tiles.Count;
+                    NavMeshPressure.TimeoutTilesMethod.Invoke(__instance, null);
+                    if (tiles.Count >= before) break;
+                }
+            }
+            finally
+            {
+                s_sweeping = false;
+            }
+
+            int removed = __state - tiles.Count;
+            if (removed > 0)
+                System.Threading.Interlocked.Add(ref NavMeshPressure.s_tilesFreed, removed);
+        }
+    }
+
+    /// <summary>
+    /// Counts tile builds for the [Nav] gauge. Builds are the expensive half of
+    /// the pipeline (one per pass, async), so a high built count next to a high
+    /// freed count means tiles are thrashing — i.e. NavTileTimeoutSeconds is
+    /// too aggressive and should go back up.
+    /// </summary>
+    [HarmonyPatch(typeof(Pathfinding), "BuildTile")]
+    internal static class Pathfinding_BuildTile_Diag_Patch
+    {
+        static void Postfix()
+        {
+            System.Threading.Interlocked.Increment(ref NavMeshPressure.s_tilesBuilt);
+        }
+    }
+
+    /// <summary>
+    /// v0.7.5: per-pass timing. The 2026-09-25 synthetic 8-peer test degraded
+    /// the server from 33ms to 93ms per tick over four minutes, with the stitch
+    /// pool never above 14% and zero link failures — so the ceiling is not the
+    /// navmesh pool but something that scales per simulated area. This measures
+    /// the four suspects directly instead of guessing:
+    ///   zoneLoad      ZoneSystem.Update  — pokes every active sector each tick
+    ///   createDestroy ZNetScene.CreateDestroyObjects — per-peer ZDO walk
+    ///   releaseZDOS   ZDOMan.ReleaseZDOS — ownership reclaim, every 2s
+    ///   navSweep      Pathfinding.TimeoutTiles — our stale-tile sweep
+    ///
+    /// Measured by a separate pair of patches per method (Priority.First prefix,
+    /// Priority.Last postfix) so the window covers our own replacement logic as
+    /// well — patching the same method twice is fine, and each patch class gets
+    /// its own __state. Whatever the four don't account for is vanilla's own
+    /// work: mob AI, physics, saves.
+    /// </summary>
+    /// <summary>
+    /// v0.7.9: per-peer send starvation.
+    ///
+    /// Vanilla refuses to send a peer anything while its socket send queue is
+    /// over 10240 bytes (ZDOMan.SendZDOs), and caps each packet at whatever is
+    /// left under that ceiling. It is deliberate backpressure — it would rather
+    /// skip an update than deliver a growing backlog of stale positions.
+    ///
+    /// That ceiling matters much more for us than for vanilla: because the
+    /// server owns every mob, every mob's movement has to be sent from here to
+    /// all peers, whereas vanilla lets the nearest client own and simulate a mob
+    /// locally for free. In a busy fight with several players this is a prime
+    /// suspect for "combat feels laggy" while CPU, ticks and total bandwidth all
+    /// look healthy — which is exactly the state we measured on 2026-09-22.
+    ///
+    /// Sampled at 4Hz rather than patched onto SendZDOs, whose parameter is a
+    /// private nested type: a peer over the ceiling at sample time is a peer
+    /// vanilla is currently refusing, so the share of samples over 10240 is the
+    /// same signal. GetSendQueueSize can reach into the transport, so 4Hz keeps
+    /// it away from the per-frame path.
+    /// </summary>
+    /// <summary>
+    /// v0.7.11: how much work each ownership-reclaim pass does, and therefore
+    /// how much forced network traffic it generates.
+    ///
+    /// Vanilla's ZDOPeer.ShouldSend re-sends a ZDO to a peer whenever its
+    /// OwnerRevision is ahead of what that peer knows — so N ownership changes
+    /// per pass means N forced ZDO sends PER PEER, on top of ordinary data
+    /// updates. Our reclaim runs every 2s over every peer's surroundings, so if
+    /// it is changing hundreds of owners per pass we are manufacturing a sync
+    /// flood that vanilla (which leaves ownership alone) never produces.
+    ///
+    /// Reported on the [Pass] line as reclaims=avg/pass (max), scanned=avg.
+    /// The number that matters is ownerChanges: scanned is just the sweep size.
+    /// </summary>
+    /// <summary>
+    /// v0.7.14: how many ZDOs the server actually offers each peer, so the
+    /// reclaim counters can be read as a SHARE of traffic rather than a bare
+    /// number. Without this, "400 reclaims per window" could be 80% of what we
+    /// send or 5% — and that decides between fixing our ownership churn and
+    /// accepting that server-owned mobs simply cost this much.
+    ///
+    /// Hooked on ZDOMan.CreateSyncList, which vanilla calls once per peer per
+    /// send attempt, and only after the 10KB queue gate has passed — so it
+    /// counts real send opportunities, not refused ones. Its `toSync` parameter
+    /// is a plain List&lt;ZDO&gt;, so we can bind by name and never touch the
+    /// private ZDOPeer type.
+    ///
+    /// Reported as "candidates", deliberately: vanilla stops packing when the
+    /// packet fills, so the number sent is at most this.
+    /// </summary>
+    internal static class SyncVolume
+    {
+        private static int s_calls, s_candidates, s_max;
+
+        internal static void Record(int count)
+        {
+            s_calls++;
+            s_candidates += count;
+            if (count > s_max) s_max = count;
+        }
+
+        internal static string Drain()
+        {
+            if (s_calls == 0) return null;
+            string s = $"syncCandidates={s_candidates} over {s_calls} sends (max {s_max}/send)";
+            s_calls = 0; s_candidates = 0; s_max = 0;
+            return s;
+        }
+    }
+
+    [HarmonyPatch(typeof(ZDOMan), "CreateSyncList")]
+    internal static class ZDOMan_CreateSyncList_Count_Patch
+    {
+        static void Postfix(List<ZDO> toSync)
+        {
+            SyncVolume.Record(toSync?.Count ?? 0);
+        }
+    }
+
+    internal static class ReclaimStats
+    {
+        private static int s_passes, s_scanned, s_ownerChanges, s_maxInPass, s_inCurrentPass;
+
+        internal static void CountScanned() => s_scanned++;
+
+        internal static void CountOwnerChange()
+        {
+            s_ownerChanges++;
+            s_inCurrentPass++;
+        }
+
+        /// <summary>Called at the end of each ReleaseZDOS pass.</summary>
+        internal static void EndPass()
+        {
+            s_passes++;
+            if (s_inCurrentPass > s_maxInPass) s_maxInPass = s_inCurrentPass;
+            s_inCurrentPass = 0;
+        }
+
+        internal static string Drain(int peers)
+        {
+            if (s_passes == 0) return null;
+            // Each owner change is re-sent to every peer, so this is the forced
+            // ZDO volume our reclaim alone put on the wire this window.
+            int forcedSends = s_ownerChanges * Mathf.Max(peers, 1);
+            string s = $"reclaims={s_ownerChanges}/{s_passes}pass (max {s_maxInPass}/pass) " +
+                       $"scanned={s_scanned} forcedZdoSends~{forcedSends}";
+            s_passes = 0; s_scanned = 0; s_ownerChanges = 0; s_maxInPass = 0;
+            return s;
+        }
+    }
+
+    internal static class SendPressure
+    {
+        internal const int VanillaCeilingBytes = 10240;
+        private const float SampleIntervalSeconds = 0.25f;
+
+        private static float s_nextSampleAt;
+        private static int s_samples, s_overCeiling;
+        private static int s_maxQueue;
+        private static string s_maxQueuePeer = "-";
+
+        // Per-peer detail (v0.7.12). "Everyone is starved" and "one person has a
+        // bad connection" need completely different fixes — the first points at
+        // the server sending too much, the second at that player's link — and the
+        // old worst-peer-only summary could not tell them apart.
+        private sealed class PeerStat
+        {
+            public int Samples;
+            public int Over;
+            public int MaxQueue;
+
+            // Unbroken runs over the ceiling (v0.7.13). The percentage alone
+            // cannot tell 20 quarter-second blips from one five-second stall,
+            // and only the latter is something a player would feel — the 24%
+            // measured solo on 2026-09-25 came with no perceptible lag at all.
+            // Running totals only: no lists, no allocation, a few ints per
+            // sample, so this costs nothing next to the queue read itself.
+            public int CurrentRun;      // samples, 4 per second
+            public int RunsOverOneSec;  // runs that lasted >= 1s
+            public int LongestRun;      // samples
+        }
+        private const int SamplesPerSecond = 4;
+        private static readonly Dictionary<string, PeerStat> s_byPeer =
+            new Dictionary<string, PeerStat>();
+
+        internal static void Sample()
+        {
+            if (Time.time < s_nextSampleAt || ZNet.instance == null) return;
+            s_nextSampleAt = Time.time + SampleIntervalSeconds;
+
+            foreach (var peer in ZNet.instance.GetPeers())
+            {
+                if (peer?.m_socket == null) continue;
+                int queued = peer.m_socket.GetSendQueueSize();
+                string name = string.IsNullOrEmpty(peer.m_playerName) ? "?" : peer.m_playerName;
+
+                s_samples++;
+                if (queued > s_maxQueue)
+                {
+                    s_maxQueue = queued;
+                    s_maxQueuePeer = name;
+                }
+
+                if (!s_byPeer.TryGetValue(name, out var stat))
+                {
+                    stat = new PeerStat();
+                    s_byPeer[name] = stat;
+                }
+                stat.Samples++;
+                if (queued > stat.MaxQueue) stat.MaxQueue = queued;
+                if (queued <= VanillaCeilingBytes)
+                {
+                    // Under the ceiling: bank any run that was in progress.
+                    if (stat.CurrentRun > 0)
+                    {
+                        if (stat.CurrentRun >= SamplesPerSecond) stat.RunsOverOneSec++;
+                        stat.CurrentRun = 0;
+                    }
+                    continue;
+                }
+
+                s_overCeiling++;
+                stat.Over++;
+                stat.CurrentRun++;
+                // Track the longest as it grows, so a run still in progress when
+                // the window ends is still reflected.
+                if (stat.CurrentRun > stat.LongestRun) stat.LongestRun = stat.CurrentRun;
+            }
+        }
+
+        /// <summary>Summary for the [Perf] line, then reset. Null when idle.</summary>
+        internal static string Drain()
+        {
+            if (s_samples == 0) return null;
+
+            // Per-peer: "name starved% (maxKB)", worst first. With several peers
+            // this is the line that separates a server-side flood (everyone high)
+            // from one bad connection (one name high, the rest near zero).
+            var perPeer = new List<string>();
+            foreach (var kv in s_byPeer.OrderByDescending(kv => kv.Value.Samples == 0
+                                                                ? 0f
+                                                                : (float)kv.Value.Over / kv.Value.Samples))
+            {
+                var st = kv.Value;
+                if (st.Samples == 0) continue;
+                // Sustained runs are the part that should track felt lag, so
+                // only mention them when there was one worth a second of stall.
+                string runs = st.LongestRun >= SamplesPerSecond
+                    ? $" runs≥1s={st.RunsOverOneSec} longest={(float)st.LongestRun / SamplesPerSecond:F1}s"
+                    : "";
+                perPeer.Add(
+                    $"{kv.Key} {st.Over * 100 / st.Samples}% ({st.MaxQueue / 1024f:F0}KB){runs}");
+            }
+
+            string summary =
+                $"sendQueue max={s_maxQueue / 1024f:F0}KB ({s_maxQueuePeer}) " +
+                $"starved={s_overCeiling}/{s_samples} " +
+                $"[{string.Join(", ", perPeer)}]";
+
+            s_samples = 0; s_overCeiling = 0; s_maxQueue = 0; s_maxQueuePeer = "-";
+            s_byPeer.Clear();
+            return summary;
+        }
+    }
+
+    internal static class PassTimer
+    {
+        internal const int ZoneLoad = 0;
+        internal const int CreateDestroy = 1;
+        internal const int ReleaseZDOS = 2;
+        internal const int NavSweep = 3;
+        private static readonly string[] s_names = { "zoneLoad", "createDestroy", "releaseZDOS", "navSweep" };
+
+        private static readonly double[] s_totalMs = new double[4];
+        private static readonly double[] s_maxMs = new double[4];
+        private static readonly int[] s_calls = new int[4];
+
+        private static readonly double s_msPerTick = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+        internal static long Now => System.Diagnostics.Stopwatch.GetTimestamp();
+
+        internal static void Record(int pass, long startTicks)
+        {
+            double ms = (Now - startTicks) * s_msPerTick;
+            s_totalMs[pass] += ms;
+            s_calls[pass]++;
+            if (ms > s_maxMs[pass]) s_maxMs[pass] = ms;
+        }
+
+        /// <summary>One line, then reset. windowMs lets us show the share of
+        /// wall-clock time our passes actually consumed.</summary>
+        internal static string DrainSummary(double windowMs)
+        {
+            var sb = new System.Text.StringBuilder();
+            double grand = 0;
+            for (int i = 0; i < s_names.Length; i++)
+            {
+                if (s_calls[i] == 0) continue;
+                sb.Append($"{s_names[i]}={s_totalMs[i]:F0}ms/{s_calls[i]} (max {s_maxMs[i]:F0}ms) ");
+                grand += s_totalMs[i];
+                s_totalMs[i] = 0; s_maxMs[i] = 0; s_calls[i] = 0;
+            }
+            if (sb.Length == 0) return null;
+            sb.Append($"| ours {grand:F0}ms of {windowMs:F0}ms ({grand * 100.0 / windowMs:F0}%)");
+            return sb.ToString();
+        }
+    }
+
+    [HarmonyPatch(typeof(ZoneSystem), "Update")]
+    internal static class ZoneSystem_Update_Timing_Patch
+    {
+        [HarmonyPriority(Priority.First)]
+        static void Prefix(out long __state) { __state = PassTimer.Now; }
+        [HarmonyPriority(Priority.Last)]
+        static void Postfix(long __state) { PassTimer.Record(PassTimer.ZoneLoad, __state); }
+    }
+
+    [HarmonyPatch(typeof(ZNetScene), "CreateDestroyObjects")]
+    internal static class ZNetScene_CreateDestroyObjects_Timing_Patch
+    {
+        [HarmonyPriority(Priority.First)]
+        static void Prefix(out long __state) { __state = PassTimer.Now; }
+        [HarmonyPriority(Priority.Last)]
+        static void Postfix(long __state) { PassTimer.Record(PassTimer.CreateDestroy, __state); }
+    }
+
+    [HarmonyPatch(typeof(ZDOMan), "ReleaseZDOS")]
+    internal static class ZDOMan_ReleaseZDOS_Timing_Patch
+    {
+        [HarmonyPriority(Priority.First)]
+        static void Prefix(out long __state) { __state = PassTimer.Now; }
+        [HarmonyPriority(Priority.Last)]
+        static void Postfix(long __state) { PassTimer.Record(PassTimer.ReleaseZDOS, __state); }
+    }
+
+    [HarmonyPatch(typeof(Pathfinding), "TimeoutTiles")]
+    internal static class Pathfinding_TimeoutTiles_Timing_Patch
+    {
+        [HarmonyPriority(Priority.First)]
+        static void Prefix(out long __state) { __state = PassTimer.Now; }
+        [HarmonyPriority(Priority.Last)]
+        static void Postfix(long __state) { PassTimer.Record(PassTimer.NavSweep, __state); }
+    }
+
+    /// <summary>
+    /// v0.7.2: daily digest. The per-event diagnostics were drowning the log —
+    /// the 8-peer session on 2026-09-22 wrote ~4000 lines in under an hour
+    /// (1483 terrain ownership changes, 789 terrain loads, 578 heals, 578
+    /// Awakes, ~440 status effects, 358 ship ticks) and LogOutput.log reached
+    /// 106 MB. Deleting them would lose the trail on bugs that are still open
+    /// (stuck chests, unpickupable drops) and on the terrain zone-load race,
+    /// so instead every event is counted here and summarised once a day at
+    /// Plugin.DigestHour:DigestMinute — just before TimedLogCopy.ahk archives
+    /// the log at 05:58 and the box reboots at 06:00.
+    ///
+    /// All callers run on Unity's main thread (Harmony patches on Update /
+    /// FixedUpdate / RPC handlers), so the dictionaries need no locking —
+    /// matching the unsynchronised throttle dictionaries the diagnostics
+    /// already use. Counters use Interlocked anyway since it costs nothing.
+    ///
+    /// Sample dictionaries are capped at SampleCap keys so a pathological day
+    /// can't grow memory; overflow is lumped into "+N more".
+    /// </summary>
+    internal static class DailyDigest
+    {
+        private const int SampleCap = 16;
+        private static DateTime s_windowStart = DateTime.Now;
+
+        // Terrain (zone-load race + dig propagation).
+        private static int s_heals, s_loads, s_awakes, s_awakesNoHmap;
+        private static int s_applyOps, s_applyOpsLost;
+        private static int s_ownerToServer, s_ownerToPeer, s_ownerFromUnowned;
+        private static readonly Dictionary<string, int> s_healSectors = new Dictionary<string, int>();
+
+        // Wet / Tar status effects on mobs.
+        private static int s_wet, s_tar, s_liquidSuspicious;
+        private static float s_maxLiquidLevel;
+        private static readonly Dictionary<string, int> s_statusPrefabs = new Dictionary<string, int>();
+
+        // Boats.
+        private static int s_shipSamples, s_shipServerOwnedWithPlayers;
+        private static float s_shipMaxDepthBelowWater;
+
+        // Carts.
+        private static int s_cartGrants, s_cartDenies, s_cartIgnored, s_cartAttaches;
+        private static int s_cartReclaimedDeadOwner;
+        private static readonly Dictionary<string, int> s_cartDetachReasons = new Dictionary<string, int>();
+
+        // Containers / item drops (stuck chest + pickup race, both still open).
+        private static readonly Dictionary<string, int> s_containerOpens = new Dictionary<string, int>();
+        private static int s_containerRace, s_containerUnowned, s_containerAbsent;
+        private static int s_itemDropRace, s_itemDropUnowned, s_itemDropAbsent;
+
+        internal static void RecordTerrainHeal(Vector3 pos)
+        {
+            System.Threading.Interlocked.Increment(ref s_heals);
+            Bump(s_healSectors, ZoneSystem.GetZone(pos).ToString());
+        }
+
+        internal static void RecordTerrainLoad()
+        {
+            System.Threading.Interlocked.Increment(ref s_loads);
+        }
+
+        internal static void RecordTerrainAwake(bool hmapFound)
+        {
+            System.Threading.Interlocked.Increment(ref s_awakes);
+            if (!hmapFound) System.Threading.Interlocked.Increment(ref s_awakesNoHmap);
+        }
+
+        internal static void RecordApplyOperation(bool willSave)
+        {
+            System.Threading.Interlocked.Increment(ref s_applyOps);
+            // willSave=false is a dig silently thrown away — the bug v0.5.22 fixed.
+            if (!willSave) System.Threading.Interlocked.Increment(ref s_applyOpsLost);
+        }
+
+        internal static void RecordTerrainOwnerChange(long prevOwner, long newOwner)
+        {
+            long sessionId = ZDOMan.GetSessionID();
+            if (newOwner == sessionId) System.Threading.Interlocked.Increment(ref s_ownerToServer);
+            else System.Threading.Interlocked.Increment(ref s_ownerToPeer);
+            if (prevOwner == 0) System.Threading.Interlocked.Increment(ref s_ownerFromUnowned);
+        }
+
+        internal static void RecordStatusEffect(bool isWet, string prefab, float liquidLevel, bool suspicious)
+        {
+            if (isWet) System.Threading.Interlocked.Increment(ref s_wet);
+            else System.Threading.Interlocked.Increment(ref s_tar);
+            if (suspicious) System.Threading.Interlocked.Increment(ref s_liquidSuspicious);
+            if (liquidLevel > s_maxLiquidLevel) s_maxLiquidLevel = liquidLevel;
+            Bump(s_statusPrefabs, prefab);
+        }
+
+        internal static void RecordShipSample(bool serverOwnedWithPlayers, float depthBelowWater)
+        {
+            System.Threading.Interlocked.Increment(ref s_shipSamples);
+            if (serverOwnedWithPlayers)
+                System.Threading.Interlocked.Increment(ref s_shipServerOwnedWithPlayers);
+            // Hull depth is the old lunge symptom: >2m means it sank again.
+            if (depthBelowWater > s_shipMaxDepthBelowWater) s_shipMaxDepthBelowWater = depthBelowWater;
+        }
+
+        internal static void RecordCartRequestOwn(string outcome)
+        {
+            if (outcome == "GRANT") System.Threading.Interlocked.Increment(ref s_cartGrants);
+            else if (outcome == "DENY") System.Threading.Interlocked.Increment(ref s_cartDenies);
+            else System.Threading.Interlocked.Increment(ref s_cartIgnored);
+        }
+
+        internal static void RecordCartAttach()
+        {
+            System.Threading.Interlocked.Increment(ref s_cartAttaches);
+        }
+
+        internal static void RecordCartDetach(string reason)
+        {
+            Bump(s_cartDetachReasons, reason);
+        }
+
+        internal static void RecordCartReclaimedDeadOwner()
+        {
+            // The expected path: puller disconnected mid-pull, server cleans up.
+            // A LIVE owner being reclaimed still warns immediately (regression).
+            System.Threading.Interlocked.Increment(ref s_cartReclaimedDeadOwner);
+        }
+
+        internal static void RecordContainerOpen(string prefab)
+        {
+            Bump(s_containerOpens, prefab);
+        }
+
+        internal static void RecordReclaims(
+            int containerRace, int containerUnowned, int containerAbsent,
+            int itemRace, int itemUnowned, int itemAbsent)
+        {
+            System.Threading.Interlocked.Add(ref s_containerRace, containerRace);
+            System.Threading.Interlocked.Add(ref s_containerUnowned, containerUnowned);
+            System.Threading.Interlocked.Add(ref s_containerAbsent, containerAbsent);
+            System.Threading.Interlocked.Add(ref s_itemDropRace, itemRace);
+            System.Threading.Interlocked.Add(ref s_itemDropUnowned, itemUnowned);
+            System.Threading.Interlocked.Add(ref s_itemDropAbsent, itemAbsent);
+        }
+
+        /// <summary>
+        /// Write the block and reset. `trigger` records why it fired (the daily
+        /// schedule, or a clean shutdown) so a short window is self-explaining.
+        /// </summary>
+        internal static void Emit(string trigger)
+        {
+            var now = DateTime.Now;
+            var span = now - s_windowStart;
+
+            var lines = new List<string>();
+            if (s_heals + s_loads + s_awakes + s_applyOps + s_ownerToServer + s_ownerToPeer > 0)
+            {
+                lines.Add(
+                    $"terrain: heals={s_heals} loads={s_loads} awake={s_awakes} (noHmap={s_awakesNoHmap}) " +
+                    $"applyOps={s_applyOps} (LOST={s_applyOpsLost}) " +
+                    $"ownerChanges={s_ownerToServer + s_ownerToPeer} " +
+                    $"(toServer={s_ownerToServer} toPeer={s_ownerToPeer} fromUnowned={s_ownerFromUnowned})");
+                if (s_healSectors.Count > 0)
+                    lines.Add($"terrain heal sectors: {Top(s_healSectors, 6)}");
+            }
+            if (s_wet + s_tar > 0)
+            {
+                lines.Add(
+                    $"status: wet={s_wet} tar={s_tar} suspicious={s_liquidSuspicious} " +
+                    $"maxLevel={s_maxLiquidLevel:F1} | {Top(s_statusPrefabs, 6)}");
+            }
+            if (s_shipSamples > 0)
+            {
+                lines.Add(
+                    $"boats: samples={s_shipSamples} serverOwnedWithPlayers={s_shipServerOwnedWithPlayers} " +
+                    $"maxDepthBelowWater={s_shipMaxDepthBelowWater:F2}m");
+            }
+            if (s_cartGrants + s_cartDenies + s_cartIgnored + s_cartAttaches + s_cartDetachReasons.Count > 0)
+            {
+                lines.Add(
+                    $"carts: grants={s_cartGrants} denies={s_cartDenies} ignored={s_cartIgnored} " +
+                    $"attaches={s_cartAttaches} reclaimedFromDeadOwner={s_cartReclaimedDeadOwner} | " +
+                    $"detach: {Top(s_cartDetachReasons, 6)}");
+            }
+            if (s_containerRace + s_containerUnowned + s_containerAbsent + s_containerOpens.Count > 0)
+            {
+                lines.Add(
+                    $"containers: opens={Top(s_containerOpens, 4)} | " +
+                    $"reclaims livePeer(RACE)={s_containerRace} unowned={s_containerUnowned} " +
+                    $"absentPeer={s_containerAbsent}");
+            }
+            if (s_itemDropRace + s_itemDropUnowned + s_itemDropAbsent > 0)
+            {
+                lines.Add(
+                    $"itemDrops: reclaims livePeer(RACE)={s_itemDropRace} " +
+                    $"unowned={s_itemDropUnowned} absentPeer={s_itemDropAbsent}");
+            }
+
+            Plugin.Log.LogMessage(
+                $"===[DIGEST {trigger}]=== {now:yyyy-MM-dd HH:mm} · window {span.TotalHours:F1}h " +
+                $"since {s_windowStart:yyyy-MM-dd HH:mm}" + (lines.Count == 0 ? " · nothing recorded" : ""));
+            foreach (var line in lines) Plugin.Log.LogMessage($"[Digest] {line}");
+
+            Reset(now);
+        }
+
+        private static void Reset(DateTime now)
+        {
+            s_windowStart = now;
+            s_heals = s_loads = s_awakes = s_awakesNoHmap = s_applyOps = s_applyOpsLost = 0;
+            s_ownerToServer = s_ownerToPeer = s_ownerFromUnowned = 0;
+            s_wet = s_tar = s_liquidSuspicious = 0;
+            s_maxLiquidLevel = 0f;
+            s_shipSamples = s_shipServerOwnedWithPlayers = 0;
+            s_shipMaxDepthBelowWater = 0f;
+            s_cartGrants = s_cartDenies = s_cartIgnored = s_cartAttaches = s_cartReclaimedDeadOwner = 0;
+            s_containerRace = s_containerUnowned = s_containerAbsent = 0;
+            s_itemDropRace = s_itemDropUnowned = s_itemDropAbsent = 0;
+            s_healSectors.Clear();
+            s_statusPrefabs.Clear();
+            s_cartDetachReasons.Clear();
+            s_containerOpens.Clear();
+        }
+
+        /// <summary>Count a key, ignoring new keys once SampleCap is reached.</summary>
+        private static void Bump(Dictionary<string, int> counts, string key)
+        {
+            if (counts.TryGetValue(key, out int seen)) counts[key] = seen + 1;
+            else if (counts.Count < SampleCap) counts[key] = 1;
+            else
+            {
+                counts.TryGetValue("(other)", out int other);
+                counts["(other)"] = other + 1;
+            }
+        }
+
+        /// <summary>"key×count key×count …", busiest first, plus an overflow note.</summary>
+        private static string Top(Dictionary<string, int> counts, int take)
+        {
+            if (counts.Count == 0) return "none";
+            var ordered = counts.OrderByDescending(kv => kv.Value).ToList();
+            var shown = string.Join(" ", ordered.Take(take).Select(kv => $"{kv.Key}×{kv.Value}"));
+            int rest = ordered.Count - take;
+            return rest > 0 ? $"{shown} (+{rest} more)" : shown;
         }
     }
 }
