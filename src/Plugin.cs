@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.14";
+        public const string PluginVersion = "0.7.22";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -52,6 +52,16 @@ namespace ServerZoneOwnership
         // BPTODO refactor roundrobin the create/destroy ticks among players
         // rather than artificially all on every x'th frame (eg 8), flattening spike
         internal const int DebugCreateDestroyStride = 8;
+
+        // --- Per-peer send rate (v0.7.17) ---------------------------------
+        // Sends per second EACH peer should receive, independent of how many
+        // players are online. 0 = leave vanilla's scheduler alone, where the
+        // rate divides by player count (~12/sec at 1 player, ~3/sec at 8) and
+        // server-owned mobs visibly stutter for everyone in a group.
+        // 20 matches vanilla's own 0.05s cap, i.e. what a lone player already
+        // gets. Watch PassTimer's peerSend cost and the [Perf] starvation
+        // figures when raising it; back off if the server stops holding 33ms.
+        internal const float DebugPeerSendHz = 20f;   // THE FIX: vanilla's own per-peer cap, applied per peer instead of per round
 
         // --- Synthetic peer load test (v0.7.3) ----------------------------
         // Fake extra players so we can measure 8-player load without 8 people.
@@ -348,7 +358,7 @@ namespace ServerZoneOwnership
             // Anything unaccounted for is vanilla's (mob AI, physics, saves).
             var passes = PassTimer.DrainSummary(_tickTotalMs);
             var reclaims = ReclaimStats.Drain(peers);
-            var sync = SyncVolume.Drain();
+            var sync = SyncVolume.Drain(peers, PerfStatsIntervalSeconds);
             if (passes != null || reclaims != null || sync != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}");
         }
@@ -2980,6 +2990,18 @@ namespace ServerZoneOwnership
     {
         private static int s_calls, s_candidates, s_max;
 
+        // v0.7.15: what the server keeps offering. Knowing the volume (~19k
+        // candidates per window to ONE starved client) does not say whether it
+        // is thousands of static building pieces, mobs in motion, or dropped
+        // items — and those need completely different fixes. Sampled every
+        // SampleEveryNth call and capped, so the prefab lookup stays off the
+        // hot path.
+        private const int SampleEveryNth = 30;
+        private const int BurstThreshold = 500;   // always sample lists this big
+        private const int MaxPrefabsTracked = 24;
+        private static readonly Dictionary<string, int> s_byPrefab = new Dictionary<string, int>();
+        private static int s_sampledLists;
+
         internal static void Record(int count)
         {
             s_calls++;
@@ -2987,12 +3009,138 @@ namespace ServerZoneOwnership
             if (count > s_max) s_max = count;
         }
 
-        internal static string Drain()
+        /// <summary>Count what kinds of objects a sampled sync list contains.</summary>
+        internal static void SampleContents(List<ZDO> toSync)
+        {
+            if (toSync == null || toSync.Count == 0) return;
+            // Always sample a burst. The 2026-09-28 disconnect produced a single
+            // 3776-object list in a window with only ONE send — every other send
+            // was refused because the queue was over the ceiling — and the
+            // every-30th rule sampled none of it, losing exactly the list we
+            // most wanted to see.
+            if (toSync.Count < BurstThreshold && s_calls % SampleEveryNth != 0) return;
+            var scene = ZNetScene.instance;
+            if (scene == null) return;
+
+            s_sampledLists++;
+            foreach (var zdo in toSync)
+            {
+                var prefab = scene.GetPrefab(zdo.GetPrefab());
+                string name = prefab != null ? prefab.name : "?";
+                if (s_byPrefab.TryGetValue(name, out int seen)) s_byPrefab[name] = seen + 1;
+                else if (s_byPrefab.Count < MaxPrefabsTracked) s_byPrefab[name] = 1;
+                else
+                {
+                    s_byPrefab.TryGetValue("(other)", out int other);
+                    s_byPrefab["(other)"] = other + 1;
+                }
+            }
+        }
+
+        internal static string Drain(int peersForRate, float windowSeconds)
         {
             if (s_calls == 0) return null;
-            string s = $"syncCandidates={s_candidates} over {s_calls} sends (max {s_max}/send)";
-            s_calls = 0; s_candidates = 0; s_max = 0;
+
+            string top = "none";
+            if (s_byPrefab.Count > 0)
+            {
+                top = string.Join(" ", s_byPrefab
+                    .OrderByDescending(kv => kv.Value)
+                    .Take(6)
+                    .Select(kv => $"{kv.Key}×{kv.Value}"));
+            }
+
+            // Sends per peer per second is the number the fix targets: vanilla
+            // gives ~12 at one player and ~3 at eight, because it divides one
+            // round between them. Computed here so before/after is readable
+            // straight off the line.
+            float perPeerHz = peersForRate > 0
+                ? s_calls / (float)peersForRate / windowSeconds
+                : 0f;
+
+            string s = $"syncCandidates={s_candidates} over {s_calls} sends " +
+                       $"({perPeerHz:F1}/s per peer, max {s_max}/send) " +
+                       $"| contents (from {s_sampledLists} sampled lists): {top}";
+            s_calls = 0; s_candidates = 0; s_max = 0; s_sampledLists = 0;
+            s_byPrefab.Clear();
             return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.17: give every peer vanilla's send rate instead of dividing it
+    /// among them.
+    ///
+    /// Vanilla's ZDOMan.SendZDOToPeers2 services ONE peer per frame, with a
+    /// 0.05s pause between full rounds. A round therefore costs
+    /// 0.05s + peers x frameTime, and each peer gets exactly one send per
+    /// round, so the rate each player hears from the server DIVIDES by player
+    /// count — measured on this server: ~12/sec at 1 peer (matching our logged
+    /// ~300 sends per 20s window), ~5/sec at 4, ~3/sec at 8. It is a schedule
+    /// limit, not a load or bandwidth limit: 8 players on an idle server get
+    /// the same 3/sec as 8 on a hammered one.
+    ///
+    /// Vanilla tolerates it because the player nearest a mob OWNS that mob and
+    /// simulates it locally at full rate — the trickle only carries things you
+    /// are not simulating yourself. Our design owns every mob on the server, so
+    /// every creature's motion depends on this rate, and at 3 updates/sec mobs
+    /// visibly step and teleport while the player's own movement stays smooth.
+    /// That is exactly the symptom reported from the 8-player session.
+    ///
+    /// The 0.05s pause says vanilla considers 20Hz per peer acceptable (that is
+    /// what a lone player gets), so targeting that rate for everyone is not
+    /// exceeding vanilla's intent — it applies the cap per peer instead of per
+    /// round. Cost is more CreateSyncList work per second, which is why
+    /// PassTimer.PeerSend measures this path.
+    ///
+    /// Plugin.DebugPeerSendHz = 0 keeps vanilla's scheduler untouched.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDOMan), "SendZDOToPeers2")]
+    internal static class ZDOMan_SendZDOToPeers2_Rate_Patch
+    {
+        private static readonly FieldInfo s_peersField = AccessTools.Field(typeof(ZDOMan), "m_peers");
+        private static readonly MethodInfo s_sendZdos = AccessTools.Method(typeof(ZDOMan), "SendZDOs");
+
+        private static float s_budget;
+        private static int s_cursor;
+
+        static bool Prefix(ZDOMan __instance, float dt)
+        {
+            if (Plugin.DebugPeerSendHz <= 0f) return true;      // vanilla scheduler
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
+            if (s_peersField == null || s_sendZdos == null) return true;
+            if (!(s_peersField.GetValue(__instance) is System.Collections.IList peers)
+                || peers.Count == 0)
+            {
+                s_budget = 0f;
+                return false;
+            }
+
+            long started = PassTimer.Now;
+
+            // Sends owed this frame so that EACH peer gets DebugPeerSendHz per
+            // second: rate x peers, accumulated so fractional sends aren't lost.
+            s_budget += dt * Plugin.DebugPeerSendHz * peers.Count;
+            int sends = (int)s_budget;
+            if (sends > 0)
+            {
+                s_budget -= sends;
+                // Cap per frame so a server hitch can't turn into a burst that
+                // fills every peer's queue at once.
+                int cap = Mathf.Max(1, peers.Count * 2);
+                if (sends > cap) { sends = cap; s_budget = 0f; }
+
+                for (int i = 0; i < sends; i++)
+                {
+                    if (peers.Count == 0) break;
+                    s_cursor = (s_cursor + 1) % peers.Count;
+                    // The 10KB gate inside SendZDOs still applies, so a peer
+                    // that is already backed up costs almost nothing here.
+                    s_sendZdos.Invoke(__instance, new object[] { peers[s_cursor], false });
+                }
+                PassTimer.Record(PassTimer.PeerSend, started);
+            }
+            return false;
         }
     }
 
@@ -3002,6 +3150,7 @@ namespace ServerZoneOwnership
         static void Postfix(List<ZDO> toSync)
         {
             SyncVolume.Record(toSync?.Count ?? 0);
+            SyncVolume.SampleContents(toSync);
         }
     }
 
@@ -3158,11 +3307,13 @@ namespace ServerZoneOwnership
         internal const int CreateDestroy = 1;
         internal const int ReleaseZDOS = 2;
         internal const int NavSweep = 3;
-        private static readonly string[] s_names = { "zoneLoad", "createDestroy", "releaseZDOS", "navSweep" };
+        internal const int PeerSend = 4;
+        private static readonly string[] s_names =
+            { "zoneLoad", "createDestroy", "releaseZDOS", "navSweep", "peerSend" };
 
-        private static readonly double[] s_totalMs = new double[4];
-        private static readonly double[] s_maxMs = new double[4];
-        private static readonly int[] s_calls = new int[4];
+        private static readonly double[] s_totalMs = new double[5];
+        private static readonly double[] s_maxMs = new double[5];
+        private static readonly int[] s_calls = new int[5];
 
         private static readonly double s_msPerTick = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
