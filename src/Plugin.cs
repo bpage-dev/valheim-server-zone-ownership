@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.22";
+        public const string PluginVersion = "0.7.23";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -341,7 +341,7 @@ namespace ServerZoneOwnership
             // Queue stats now come from SendPressure, which samples at 4Hz across
             // the whole window — a single reading at log time missed the spikes
             // that matter, since a peer is only starved while it is over 10KB.
-            string queueSummary = SendPressure.Drain()
+            string queueSummary = SendPressure.Drain(PerfStatsIntervalSeconds)
                                   ?? $"sendQueue max=0KB (-) starved=0/0";
 
             float avgMs = _tickTotalMs / _tickCount;
@@ -3104,6 +3104,24 @@ namespace ServerZoneOwnership
         private static float s_budget;
         private static int s_cursor;
 
+        // ZDOPeer is a private nested type, so resolve its m_peer (ZNetPeer)
+        // field off the live object rather than naming the type. Cached on first
+        // use — this runs several times per frame.
+        private static FieldInfo s_zdoPeerInnerField;
+        private static FieldInfo s_playerNameField;
+
+        private static string GetPeerName(object zdoPeer)
+        {
+            if (zdoPeer == null) return "?";
+            if (s_zdoPeerInnerField == null)
+                s_zdoPeerInnerField = AccessTools.Field(zdoPeer.GetType(), "m_peer");
+            var netPeer = s_zdoPeerInnerField?.GetValue(zdoPeer);
+            if (netPeer == null) return "?";
+            if (s_playerNameField == null)
+                s_playerNameField = AccessTools.Field(netPeer.GetType(), "m_playerName");
+            return s_playerNameField?.GetValue(netPeer) as string ?? "?";
+        }
+
         static bool Prefix(ZDOMan __instance, float dt)
         {
             if (Plugin.DebugPeerSendHz <= 0f) return true;      // vanilla scheduler
@@ -3134,9 +3152,11 @@ namespace ServerZoneOwnership
                 {
                     if (peers.Count == 0) break;
                     s_cursor = (s_cursor + 1) % peers.Count;
+                    var zdoPeer = peers[s_cursor];
                     // The 10KB gate inside SendZDOs still applies, so a peer
                     // that is already backed up costs almost nothing here.
-                    s_sendZdos.Invoke(__instance, new object[] { peers[s_cursor], false });
+                    s_sendZdos.Invoke(__instance, new object[] { zdoPeer, false });
+                    SendPressure.RecordSend(GetPeerName(zdoPeer));
                 }
                 PassTimer.Record(PassTimer.PeerSend, started);
             }
@@ -3216,10 +3236,33 @@ namespace ServerZoneOwnership
             public int CurrentRun;      // samples, 4 per second
             public int RunsOverOneSec;  // runs that lasted >= 1s
             public int LongestRun;      // samples
+
+            // Sends actually DELIVERED to this peer (v0.7.23). The averaged
+            // "sends/s per peer" hides the distribution: at 8 players a mean of
+            // 14/s is consistent with one player on 6/s and another on 18/s, and
+            // the player on 6/s is the one still reporting stutter. Only counted
+            // while DebugPeerSendHz > 0, since vanilla's scheduler bypasses our
+            // patch.
+            public int Sends;
         }
         private const int SamplesPerSecond = 4;
         private static readonly Dictionary<string, PeerStat> s_byPeer =
             new Dictionary<string, PeerStat>();
+
+        /// <summary>
+        /// Called by the send-rate patch for each peer it actually services, so
+        /// we can report delivered rate per player rather than an average.
+        /// </summary>
+        internal static void RecordSend(string peerName)
+        {
+            if (string.IsNullOrEmpty(peerName)) peerName = "?";
+            if (!s_byPeer.TryGetValue(peerName, out var stat))
+            {
+                stat = new PeerStat();
+                s_byPeer[peerName] = stat;
+            }
+            stat.Sends++;
+        }
 
         internal static void Sample()
         {
@@ -3267,7 +3310,7 @@ namespace ServerZoneOwnership
         }
 
         /// <summary>Summary for the [Perf] line, then reset. Null when idle.</summary>
-        internal static string Drain()
+        internal static string Drain(float windowSeconds)
         {
             if (s_samples == 0) return null;
 
@@ -3286,8 +3329,14 @@ namespace ServerZoneOwnership
                 string runs = st.LongestRun >= SamplesPerSecond
                     ? $" runs≥1s={st.RunsOverOneSec} longest={(float)st.LongestRun / SamplesPerSecond:F1}s"
                     : "";
+                // Delivered rate for THIS peer. A player well below the others is
+                // one whose link cannot drain what we send, and that is a fix on
+                // their side (Wi-Fi, simulation distance) not another dial here.
+                string rate = windowSeconds > 0f && st.Sends > 0
+                    ? $" {st.Sends / windowSeconds:F1}/s"
+                    : "";
                 perPeer.Add(
-                    $"{kv.Key} {st.Over * 100 / st.Samples}% ({st.MaxQueue / 1024f:F0}KB){runs}");
+                    $"{kv.Key} {st.Over * 100 / st.Samples}% ({st.MaxQueue / 1024f:F0}KB){rate}{runs}");
             }
 
             string summary =
