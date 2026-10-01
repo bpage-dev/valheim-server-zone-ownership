@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.23";
+        public const string PluginVersion = "0.7.25";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -203,6 +203,12 @@ namespace ServerZoneOwnership
         internal static string Stamp => DateTime.Now.ToString("HH:mm:ss");
         private Harmony _harmony;
 
+        // One-shot guard for the resolved-simulation-distance line. ZNet does
+        // not exist yet in Awake (FejdStartup applies the setting via
+        // ZNet.s_onZNetStart), so the authoritative value can only be read once
+        // the server is up.
+        private bool _loggedSimDistance;
+
         private void Awake()
         {
             Log = Logger;
@@ -230,6 +236,60 @@ namespace ServerZoneOwnership
             Log.LogMessage(
                 $"===[SESSION START]=== {sessionStamp} · v{PluginVersion} · " +
                 $"git {BuildInfo.GitShortSha}{dirtyMarker}");
+
+            // The options this server was actually launched with. Recorded so a
+            // log can be tied to its launch config after the fact — above all
+            // -simulationdistance, which sizes every peer's simulated box and
+            // therefore how many mobs tick and how many ZDOs become sync
+            // candidates. Absent that flag, vanilla applies
+            // SimulationDistance.OriginalDistance (near 2, far 2, classic).
+            Log.LogMessage($"[Launch] args: {RedactedCommandLine()}");
+        }
+
+        /// <summary>
+        /// This process's command line with secrets blanked.
+        ///
+        /// Redaction matters here: these logs are archived every morning and
+        /// pasted around while diagnosing, and -password would otherwise sit in
+        /// plaintext in every archive. Valheim takes each option's value as the
+        /// NEXT argv entry, so flag the following entry rather than trying to
+        /// split on '='.
+        /// </summary>
+        private static string RedactedCommandLine()
+        {
+            string[] args;
+            try
+            {
+                args = Environment.GetCommandLineArgs();
+            }
+            catch (Exception e)
+            {
+                return $"<unavailable: {e.GetType().Name}>";
+            }
+            if (args == null || args.Length == 0) return "<empty>";
+
+            var sb = new System.Text.StringBuilder();
+            bool redactNext = false;
+            foreach (var raw in args)
+            {
+                string a = raw ?? "";
+                if (sb.Length > 0) sb.Append(' ');
+                if (redactNext)
+                {
+                    sb.Append("***");
+                    redactNext = false;
+                    continue;
+                }
+                sb.Append(a);
+                switch (a.ToLowerInvariant())
+                {
+                    case "-password":
+                    case "-joincode":
+                        redactNext = true;
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         private void OnDestroy()
@@ -245,6 +305,16 @@ namespace ServerZoneOwnership
         {
             if (_harmony == null) return;
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+            // Resolved simulation distance, once per session. The launch args
+            // above show what was REQUESTED; this shows what vanilla actually
+            // applied, which is the number that sizes the per-peer box. Logged
+            // separately because an unset flag silently means near 2.
+            if (!_loggedSimDistance)
+            {
+                _loggedSimDistance = true;
+                LogSimulationDistance();
+            }
 
             _statsTimer += Time.deltaTime;
             _populationTimer += Time.deltaTime;
@@ -308,6 +378,49 @@ namespace ServerZoneOwnership
                 _lastDigestDate = localNow.Date;
                 DailyDigest.Emit("daily");
             }
+        }
+
+        /// <summary>
+        /// The simulation distance vanilla actually applied, plus what it means
+        /// geometrically. Zones are 64m, and a peer's simulated box spans
+        /// +/-near zones around their own zone — so the count of zones (the
+        /// AREA) scales as the square of `near`, while the reach (a LINEAR
+        /// measure) scales with it directly. Both are printed because they are
+        /// easy to conflate: near 2 -> 1 cuts reach by 40% but zones by 64%.
+        ///
+        /// Non-classic trims the box corners with a radius test, so the zone
+        /// count is computed rather than assumed to be span^2.
+        /// </summary>
+        private void LogSimulationDistance()
+        {
+            var sd = ServerCoverage.GetSimulationDistance();
+            int near = sd.NearSimulationDistance;
+            int span = 2 * near + 1;
+
+            int zones = span * span;
+            if (!sd.IsClassic && ZoneSystem.instance != null)
+            {
+                zones = 0;
+                var origin = new Vector2s(0, 0);
+                for (int y = -near; y <= near; y++)
+                {
+                    for (int x = -near; x <= near; x++)
+                    {
+                        if (ZoneSystem.instance.ZonesWithinRadius(origin, new Vector2s(x, y), near))
+                            zones++;
+                    }
+                }
+            }
+
+            float zoneSize = ZoneSystem.instance != null ? ZoneSystem.instance.m_zoneSize : 64f;
+            float axisReach = near * zoneSize + zoneSize * 0.5f;
+
+            Log.LogMessage(
+                $"[Launch] simulation distance: near={near} far={sd.FarSimulationDistance} " +
+                $"classic={sd.IsClassic} → {zones} zones per peer " +
+                $"({span}x{span} box, {span * zoneSize:F0}m across, " +
+                $"{axisReach:F0}m axis reach from zone centre). " +
+                $"Caps every client at min(client, server).");
         }
 
         /// <summary>
@@ -3104,22 +3217,18 @@ namespace ServerZoneOwnership
         private static float s_budget;
         private static int s_cursor;
 
-        // ZDOPeer is a private nested type, so resolve its m_peer (ZNetPeer)
-        // field off the live object rather than naming the type. Cached on first
-        // use — this runs several times per frame.
+        // ZDOPeer is a private nested type, so resolve its m_peer field off the
+        // live object rather than naming the type. ZNetPeer itself is public, so
+        // once we hold it no further reflection is needed. Cached on first use —
+        // this runs several times per frame.
         private static FieldInfo s_zdoPeerInnerField;
-        private static FieldInfo s_playerNameField;
 
-        private static string GetPeerName(object zdoPeer)
+        private static ZNetPeer GetNetPeer(object zdoPeer)
         {
-            if (zdoPeer == null) return "?";
+            if (zdoPeer == null) return null;
             if (s_zdoPeerInnerField == null)
                 s_zdoPeerInnerField = AccessTools.Field(zdoPeer.GetType(), "m_peer");
-            var netPeer = s_zdoPeerInnerField?.GetValue(zdoPeer);
-            if (netPeer == null) return "?";
-            if (s_playerNameField == null)
-                s_playerNameField = AccessTools.Field(netPeer.GetType(), "m_playerName");
-            return s_playerNameField?.GetValue(netPeer) as string ?? "?";
+            return s_zdoPeerInnerField?.GetValue(zdoPeer) as ZNetPeer;
         }
 
         static bool Prefix(ZDOMan __instance, float dt)
@@ -3153,10 +3262,33 @@ namespace ServerZoneOwnership
                     if (peers.Count == 0) break;
                     s_cursor = (s_cursor + 1) % peers.Count;
                     var zdoPeer = peers[s_cursor];
+                    var netPeer = GetNetPeer(zdoPeer);
+                    string name = netPeer == null || string.IsNullOrEmpty(netPeer.m_playerName)
+                        ? "?"
+                        : netPeer.m_playerName;
+
+                    // Read the queue BEFORE the call so a refusal can be
+                    // attributed. SendZDOs bails on a backed-up queue, but it
+                    // ALSO bails when CreateSyncList found nothing to send, and
+                    // those two mean opposite things — the first is starvation,
+                    // the second is a healthy idle peer. Vanilla reads the same
+                    // value as its own first line, so this doubles one cheap
+                    // call rather than adding a new kind of work.
+                    int preQueue = netPeer?.m_socket != null
+                        ? netPeer.m_socket.GetSendQueueSize()
+                        : 0;
+
                     // The 10KB gate inside SendZDOs still applies, so a peer
                     // that is already backed up costs almost nothing here.
-                    s_sendZdos.Invoke(__instance, new object[] { zdoPeer, false });
-                    SendPressure.RecordSend(GetPeerName(zdoPeer));
+                    //
+                    // SendZDOs returns true only when it actually invoked the
+                    // ZDOData RPC (vanilla ends `return flag2 || flag`), so this
+                    // is the real delivered signal. v0.7.23 discarded it and
+                    // counted every attempt as a send, which reported the rate
+                    // we TRIED at rather than the rate players received.
+                    object ret = s_sendZdos.Invoke(__instance, new object[] { zdoPeer, false });
+                    bool sent = ret is bool b && b;
+                    SendPressure.RecordAttempt(name, sent, preQueue);
                 }
                 PassTimer.Record(PassTimer.PeerSend, started);
             }
@@ -3210,12 +3342,19 @@ namespace ServerZoneOwnership
     internal static class SendPressure
     {
         internal const int VanillaCeilingBytes = 10240;
+
+        // Vanilla refuses a send whenever the queue leaves it under 2048 bytes
+        // of payload room (`num = 10240 - queue; if (num < 2048)`), so the
+        // effective backpressure threshold is 8192, not the 10240 ceiling.
+        internal const int PayloadFloorBytes = VanillaCeilingBytes - 2048;
+
         private const float SampleIntervalSeconds = 0.25f;
 
         private static float s_nextSampleAt;
         private static int s_samples, s_overCeiling;
         private static int s_maxQueue;
         private static string s_maxQueuePeer = "-";
+        private static int s_totalAttempts, s_totalDelivered;
 
         // Per-peer detail (v0.7.12). "Everyone is starved" and "one person has a
         // bad connection" need completely different fixes — the first points at
@@ -3237,23 +3376,38 @@ namespace ServerZoneOwnership
             public int RunsOverOneSec;  // runs that lasted >= 1s
             public int LongestRun;      // samples
 
-            // Sends actually DELIVERED to this peer (v0.7.23). The averaged
-            // "sends/s per peer" hides the distribution: at 8 players a mean of
-            // 14/s is consistent with one player on 6/s and another on 18/s, and
-            // the player on 6/s is the one still reporting stutter. Only counted
-            // while DebugPeerSendHz > 0, since vanilla's scheduler bypasses our
-            // patch.
-            public int Sends;
+            // Attempted vs DELIVERED (v0.7.24). The averaged "sends/s per peer"
+            // hides the distribution: at 8 players a mean of 14/s is consistent
+            // with one player on 6/s and another on 18/s, and the player on 6/s
+            // is the one still reporting stutter. Only counted while
+            // DebugPeerSendHz > 0, since vanilla's scheduler bypasses our patch.
+            //
+            // Delivered is the number that matters: it is the update rate of
+            // every mob that player is watching — their mob "framerate". v0.7.23
+            // counted attempts and called them deliveries, overstating it by
+            // roughly 3x once the gate started refusing.
+            public int Attempts;
+            public int Delivered;
+            public int Gated;   // refused because the queue was backed up
+            public int Idle;    // refused because nothing had changed to send
+
+            // Payload headroom (10240 - queue) summed over delivered sends.
+            // Vanilla truncates a send at that many bytes, so a small average
+            // means sends are landing but squeezed, carrying only the nearest
+            // few mobs rather than everything that moved.
+            public long BudgetSum;
         }
         private const int SamplesPerSecond = 4;
         private static readonly Dictionary<string, PeerStat> s_byPeer =
             new Dictionary<string, PeerStat>();
 
         /// <summary>
-        /// Called by the send-rate patch for each peer it actually services, so
-        /// we can report delivered rate per player rather than an average.
+        /// Called by the send-rate patch for every peer it services, with
+        /// whether vanilla actually sent and what the peer's queue looked like
+        /// beforehand, so we can report delivered rate — and the reason for any
+        /// shortfall — per player rather than an average of attempts.
         /// </summary>
-        internal static void RecordSend(string peerName)
+        internal static void RecordAttempt(string peerName, bool sent, int preQueue)
         {
             if (string.IsNullOrEmpty(peerName)) peerName = "?";
             if (!s_byPeer.TryGetValue(peerName, out var stat))
@@ -3261,7 +3415,21 @@ namespace ServerZoneOwnership
                 stat = new PeerStat();
                 s_byPeer[peerName] = stat;
             }
-            stat.Sends++;
+
+            stat.Attempts++;
+            s_totalAttempts++;
+            if (sent)
+            {
+                stat.Delivered++;
+                s_totalDelivered++;
+                stat.BudgetSum += Mathf.Max(0, VanillaCeilingBytes - preQueue);
+            }
+            // Both of vanilla's backpressure gates bail above 8192: the outright
+            // `queue > 10240` check, and then `num = 10240 - queue; if (num <
+            // 2048) return false`. Below that floor a refusal means the sync
+            // list was empty, which is a quiet peer, not a starved one.
+            else if (preQueue > PayloadFloorBytes) stat.Gated++;
+            else stat.Idle++;
         }
 
         internal static void Sample()
@@ -3317,10 +3485,16 @@ namespace ServerZoneOwnership
             // Per-peer: "name starved% (maxKB)", worst first. With several peers
             // this is the line that separates a server-side flood (everyone high)
             // from one bad connection (one name high, the rest near zero).
+            // Worst first. Once the rate patch is active the refusal fraction is
+            // the sharper signal, so rank on that and fall back to starvation
+            // when vanilla's scheduler is running and we recorded no attempts.
             var perPeer = new List<string>();
-            foreach (var kv in s_byPeer.OrderByDescending(kv => kv.Value.Samples == 0
-                                                                ? 0f
-                                                                : (float)kv.Value.Over / kv.Value.Samples))
+            foreach (var kv in s_byPeer.OrderByDescending(kv =>
+                         kv.Value.Attempts > 0
+                             ? 1f - (float)kv.Value.Delivered / kv.Value.Attempts
+                             : (kv.Value.Samples == 0
+                                 ? 0f
+                                 : (float)kv.Value.Over / kv.Value.Samples)))
             {
                 var st = kv.Value;
                 if (st.Samples == 0) continue;
@@ -3329,22 +3503,40 @@ namespace ServerZoneOwnership
                 string runs = st.LongestRun >= SamplesPerSecond
                     ? $" runs≥1s={st.RunsOverOneSec} longest={(float)st.LongestRun / SamplesPerSecond:F1}s"
                     : "";
-                // Delivered rate for THIS peer. A player well below the others is
-                // one whose link cannot drain what we send, and that is a fix on
-                // their side (Wi-Fi, simulation distance) not another dial here.
-                string rate = windowSeconds > 0f && st.Sends > 0
-                    ? $" {st.Sends / windowSeconds:F1}/s"
-                    : "";
+                // Delivered rate for THIS peer, with the attempted rate beside it
+                // so the gap is visible: "5.2/s of 14.5" says the gate ate two
+                // thirds of what we scheduled. gate% vs idle% splits the reason
+                // — gate is backpressure, idle just means nothing changed — and
+                // the KB figure is the average payload room a delivered send
+                // had, so a low number means sends land but carry few mobs.
+                string rate = "";
+                if (windowSeconds > 0f && st.Attempts > 0)
+                {
+                    float budgetKB = st.Delivered > 0
+                        ? (float)st.BudgetSum / st.Delivered / 1024f
+                        : 0f;
+                    rate = $" {st.Delivered / windowSeconds:F1}/s of {st.Attempts / windowSeconds:F1}"
+                         + $" (gate {st.Gated * 100 / st.Attempts}%"
+                         + $" idle {st.Idle * 100 / st.Attempts}%"
+                         + $" {budgetKB:F1}KB)";
+                }
                 perPeer.Add(
                     $"{kv.Key} {st.Over * 100 / st.Samples}% ({st.MaxQueue / 1024f:F0}KB){rate}{runs}");
             }
 
+            // Headline delivered/attempted across all peers, so the [Perf] line
+            // answers "is the gate eating our sends" without reading the list.
+            string sends = s_totalAttempts > 0
+                ? $"sent={s_totalDelivered}/{s_totalAttempts} "
+                : "";
+
             string summary =
                 $"sendQueue max={s_maxQueue / 1024f:F0}KB ({s_maxQueuePeer}) " +
-                $"starved={s_overCeiling}/{s_samples} " +
+                $"starved={s_overCeiling}/{s_samples} " + sends +
                 $"[{string.Join(", ", perPeer)}]";
 
             s_samples = 0; s_overCeiling = 0; s_maxQueue = 0; s_maxQueuePeer = "-";
+            s_totalAttempts = 0; s_totalDelivered = 0;
             s_byPeer.Clear();
             return summary;
         }
