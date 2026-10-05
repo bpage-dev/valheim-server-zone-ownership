@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.25";
+        public const string PluginVersion = "0.7.31";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -84,6 +84,55 @@ namespace ServerZoneOwnership
         // couple of minutes ahead and restart.
         internal const int DigestHour = 5;
         internal const int DigestMinute = 30;
+
+        // --- Send census (v0.7.28) -----------------------------------------
+        // Seconds between [Census] blocks, or 0 to disable. VERBOSE: one header
+        // plus a line per prefab, so this is a deliberate diagnostic, not
+        // something to leave running. Set back to 0 once a capture is in hand.
+        //
+        // Unlike SyncVolume (which samples CANDIDATE lists) this counts what was
+        // actually written into an outgoing packet, by hooking ZDO.Serialize —
+        // the call vanilla makes once per ZDO that fits inside the byte budget.
+        // So these are real sends, with real byte counts, not offers.
+        internal const float DebugSendCensusSeconds = 5f;
+
+        // --- Distance-tiered send rate (v0.7.30) ---------------------------
+        // THE PROBLEM: because the server owns every mob, every mob's motion
+        // has to be sent from here to every player. Vanilla refuses to send to
+        // a peer whose queue is over 8192 bytes and caps each packet at
+        // 10240-queue, so past a certain volume sends are refused and packets
+        // truncated — which is the mob stutter reported in group play.
+        // Measured 2026-10-01/04: gating averages 2-7% solo but ~22% with just
+        // TWO players, because a second player enlarges the union of loaded
+        // zones, so more mobs tick and more ZDOs change.
+        //
+        // THE FIX: cap how often each peer is told about a given ZDO, by that
+        // ZDO's distance to THAT peer. Vanilla has no such concept — distance
+        // appears only in the sort order, which is never consulted unless the
+        // packet overflows. Near things stay fluid; distant things still update,
+        // just less often.
+        //
+        // Deliberately NOT type-aware. A projectile that matters is near, so
+        // distance already keeps it at full rate, and anything genuinely static
+        // never enters the list at all (ShouldSend is revision-based — measured
+        // walls at ~1.4 sends each, i.e. once).
+        internal const bool DebugSendTiers = true;      // false = vanilla, one bool
+
+        // Upper bound of each tier in metres, ascending, last must be huge.
+        internal static readonly float[] SendTierEdges = { 30f, 100f, float.MaxValue };
+
+        // Max sends/sec per ZDO per peer for each tier. <= 0 means unlimited.
+        // Tier 0 at DebugPeerSendHz is effectively unlimited, which is intended:
+        // inside 30m nothing should ever be held back.
+        //
+        // NOTE achievable rates are quantised to DebugPeerSendHz/k — 20, 10,
+        // 6.7, 5, 4, 3.3 — so a "3/s" cap will measure 2.9 or 3.3, never 3.0.
+        internal static readonly float[] SendTierHz = { 20f, 10f, 3f };
+
+        // Seconds between [Tier] accounting blocks (0 = silent, but the cap and
+        // its pruning still run). Four lines per window, so this is cheap enough
+        // to leave on through a group session.
+        internal const float DebugSendTierSeconds = 20f;
 
         // How often the [Nav] navmesh gauge prints. Ours, no vanilla default.
         // Raise it if the log gets noisy; the numbers are instantaneous
@@ -208,6 +257,8 @@ namespace ServerZoneOwnership
         // ZNet.s_onZNetStart), so the authoritative value can only be read once
         // the server is up.
         private bool _loggedSimDistance;
+        private float _censusTimer;
+        private float _tierTimer;
 
         private void Awake()
         {
@@ -244,6 +295,9 @@ namespace ServerZoneOwnership
             // candidates. Absent that flag, vanilla applies
             // SimulationDistance.OriginalDistance (near 2, far 2, classic).
             Log.LogMessage($"[Launch] args: {RedactedCommandLine()}");
+            Log.LogMessage(DebugSendTiers
+                ? $"[Launch] send tiers: {SendTiers.Describe()}"
+                : "[Launch] send tiers: DISABLED (vanilla send behaviour)");
         }
 
         /// <summary>
@@ -341,6 +395,32 @@ namespace ServerZoneOwnership
                 _hitchCount = 0;
                 _tickTotalMs = 0f;
                 _tickWorstMs = 0f;
+            }
+
+            if (DebugSendCensusSeconds > 0f)
+            {
+                _censusTimer += Time.deltaTime;
+                if (_censusTimer >= DebugSendCensusSeconds)
+                {
+                    SendCensus.Emit(_censusTimer);
+                    _censusTimer = 0f;
+                }
+            }
+
+            // Tier accounting AND pruning. Runs even when printing is off,
+            // capped at 30s, because the prune is what bounds the per-peer map;
+            // leaving it to a disabled log would let the map grow unbounded.
+            if (DebugSendTiers)
+            {
+                _tierTimer += Time.deltaTime;
+                float due = DebugSendTierSeconds > 0f
+                    ? DebugSendTierSeconds
+                    : 30f;
+                if (_tierTimer >= due)
+                {
+                    SendTiers.EmitAndPrune(_tierTimer, DebugSendTierSeconds > 0f);
+                    _tierTimer = 0f;
+                }
             }
 
             if (_navStatsTimer >= NavStatsIntervalSeconds)
@@ -471,7 +551,7 @@ namespace ServerZoneOwnership
             // Anything unaccounted for is vanilla's (mob AI, physics, saves).
             var passes = PassTimer.DrainSummary(_tickTotalMs);
             var reclaims = ReclaimStats.Drain(peers);
-            var sync = SyncVolume.Drain(peers, PerfStatsIntervalSeconds);
+            var sync = SyncVolume.DrainStats(peers, PerfStatsIntervalSeconds);
             if (passes != null || reclaims != null || sync != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}");
         }
@@ -3111,9 +3191,39 @@ namespace ServerZoneOwnership
         // hot path.
         private const int SampleEveryNth = 30;
         private const int BurstThreshold = 500;   // always sample lists this big
-        private const int MaxPrefabsTracked = 24;
+        // Raised from 24 (v0.7.27): anything past the cap lands in "(other)",
+        // which hides exactly the long tail we are trying to identify. 48 buckets
+        // of (string,int) costs nothing next to the per-send list walk.
+        private const int MaxPrefabsTracked = 48;
+
+        // How many of those buckets reach the log line. Kept below the tracking
+        // cap on purpose — "shown N of M" reports the shortfall rather than the
+        // line growing without limit.
+        private const int PrefabsPrinted = 24;
         private static readonly Dictionary<string, int> s_byPrefab = new Dictionary<string, int>();
         private static int s_sampledLists;
+
+        // v0.7.26: ZDO.ObjectType distribution, and the same for the HEAD of the
+        // sorted list.
+        //
+        // ObjectType decides send order before distance does — ServerSendCompare
+        // puts Prioritized-and-owned-by-someone-else first, then everything else
+        // by Type DESCENDING (Terrain, Solid, Prioritized, Default). Which type a
+        // creature or a chest carries is set per prefab in ZNetView.m_type, which
+        // lives in the prefab assets and so is NOT visible in the decompile — it
+        // can only be read at runtime, which is the point of this histogram.
+        //
+        // HeadByType is a proxy for what actually LANDS: vanilla packs the sorted
+        // list from the front until the packet is full, so the head is what gets
+        // through and the tail is what waits. It is positional, not byte-exact —
+        // a true measure needs a hook inside the packing loop. 32 is a guess at a
+        // typical packet's worth; treat the ratio, not the absolute number, as
+        // the signal.
+        private const int HeadSample = 32;
+        private static readonly int[] s_byType = new int[4];
+        private static readonly int[] s_headByType = new int[4];
+        private static readonly string[] s_typeNames = { "Default", "Prioritized", "Solid", "Terrain" };
+        private static readonly string[] s_typeShort = { "D", "P", "S", "T" };
 
         internal static void Record(int count)
         {
@@ -3136,10 +3246,27 @@ namespace ServerZoneOwnership
             if (scene == null) return;
 
             s_sampledLists++;
-            foreach (var zdo in toSync)
+            // Indexed rather than foreach: position in the sorted list is the
+            // whole point of the head/tail split.
+            for (int i = 0; i < toSync.Count; i++)
             {
+                var zdo = toSync[i];
+
+                int t = (int)zdo.Type;
+                if (t >= 0 && t < s_byType.Length)
+                {
+                    s_byType[t]++;
+                    if (i < HeadSample) s_headByType[t]++;
+                }
+
                 var prefab = scene.GetPrefab(zdo.GetPrefab());
-                string name = prefab != null ? prefab.name : "?";
+                string baseName = prefab != null ? prefab.name : "?";
+                // Tag the prefab with its type, so one line answers both "what
+                // are we offering" and "what type is it". A prefab carries a
+                // single m_type, so this does not fragment the histogram.
+                string name = t >= 0 && t < s_typeShort.Length
+                    ? baseName + "/" + s_typeShort[t]
+                    : baseName;
                 if (s_byPrefab.TryGetValue(name, out int seen)) s_byPrefab[name] = seen + 1;
                 else if (s_byPrefab.Count < MaxPrefabsTracked) s_byPrefab[name] = 1;
                 else
@@ -3150,17 +3277,23 @@ namespace ServerZoneOwnership
             }
         }
 
-        internal static string Drain(int peersForRate, float windowSeconds)
+        internal static string DrainStats(int peersForRate, float windowSeconds)
         {
             if (s_calls == 0) return null;
 
+            // v0.7.27: print enough prefabs to ACCOUNT for the list, and say so.
+            // The old Take(6) showed 290 of 438 objects on 2026-10-01 and silently
+            // dropped the remaining third, which led to the list being described
+            // as "basically all mobs" when a third of it had never been looked at.
+            // The "shown N of M" suffix makes any remaining blind spot visible
+            // instead of inviting the same mistake again.
             string top = "none";
+            int shown = 0;
             if (s_byPrefab.Count > 0)
             {
-                top = string.Join(" ", s_byPrefab
-                    .OrderByDescending(kv => kv.Value)
-                    .Take(6)
-                    .Select(kv => $"{kv.Key}×{kv.Value}"));
+                var ordered = s_byPrefab.OrderByDescending(kv => kv.Value).Take(PrefabsPrinted).ToList();
+                foreach (var kv in ordered) shown += kv.Value;
+                top = string.Join(" ", ordered.Select(kv => $"{kv.Key}×{kv.Value}"));
             }
 
             // Sends per peer per second is the number the fix targets: vanilla
@@ -3171,11 +3304,34 @@ namespace ServerZoneOwnership
                 ? s_calls / (float)peersForRate / windowSeconds
                 : 0f;
 
+            // Types offered vs types in the head of the sorted list. A type that
+            // is a large share of `offered` but a small share of `head` is one
+            // being starved by the sort; the reverse is one crowding others out.
+            string types = "none";
+            int typeTotal = 0;
+            foreach (int n in s_byType) typeTotal += n;
+            if (typeTotal > 0)
+            {
+                var offered = new List<string>();
+                var head = new List<string>();
+                for (int i = 0; i < s_byType.Length; i++)
+                {
+                    if (s_byType[i] > 0) offered.Add($"{s_typeNames[i]}×{s_byType[i]}");
+                    if (s_headByType[i] > 0) head.Add($"{s_typeShort[i]}×{s_headByType[i]}");
+                }
+                types = string.Join(" ", offered)
+                      + $" | head{HeadSample}: " + (head.Count > 0 ? string.Join(" ", head) : "none");
+            }
+
             string s = $"syncCandidates={s_candidates} over {s_calls} sends " +
                        $"({perPeerHz:F1}/s per peer, max {s_max}/send) " +
-                       $"| contents (from {s_sampledLists} sampled lists): {top}";
+                       $"| types: {types}" +
+                       $" | contents ({s_sampledLists} lists, shown {shown} of {typeTotal}" +
+                       $"{(s_byPrefab.Count > PrefabsPrinted ? $", {s_byPrefab.Count} prefabs" : "")}): {top}";
             s_calls = 0; s_candidates = 0; s_max = 0; s_sampledLists = 0;
             s_byPrefab.Clear();
+            Array.Clear(s_byType, 0, s_byType.Length);
+            Array.Clear(s_headByType, 0, s_headByType.Length);
             return s;
         }
     }
@@ -3286,7 +3442,39 @@ namespace ServerZoneOwnership
                     // is the real delivered signal. v0.7.23 discarded it and
                     // counted every attempt as a send, which reported the rate
                     // we TRIED at rather than the rate players received.
-                    object ret = s_sendZdos.Invoke(__instance, new object[] { zdoPeer, false });
+                    // Bracket the call so the ZDO.Serialize census only counts
+                    // serialisation done for this send, not for a world save.
+                    // The peer's position goes with it: Serialize cannot see who
+                    // the packet is for, and distance-to-receiver is what makes
+                    // the census interpretable.
+                    var refPos = netPeer != null ? netPeer.GetRefPos() : Vector3.zero;
+                    SendCensus.CurrentPeerPos = refPos;
+                    SendCensus.Capturing = true;
+
+                    // Park the peer identity for the duration of the call: the
+                    // tier filter runs inside ServerSortSendZDOS and the pack
+                    // recorder inside ZDO.Serialize, and neither can bind the
+                    // ZDOPeer parameter (private nested type). Resolve the map
+                    // once here rather than per ZDO — ZDOID.GetHashCode indexes
+                    // a static list, so it is not a free field hash.
+                    SendTarget.RefPos = refPos;
+                    SendTarget.Uid = netPeer != null ? netPeer.m_uid : 0L;
+                    SendTarget.Map = Plugin.DebugSendTiers && netPeer != null
+                        ? SendTiers.MapFor(netPeer.m_uid)
+                        : null;
+                    SendTarget.Active = true;
+
+                    object ret;
+                    try
+                    {
+                        ret = s_sendZdos.Invoke(__instance, new object[] { zdoPeer, false });
+                    }
+                    finally
+                    {
+                        SendCensus.Capturing = false;
+                        SendTarget.Active = false;
+                        SendTarget.Map = null;
+                    }
                     bool sent = ret is bool b && b;
                     SendPressure.RecordAttempt(name, sent, preQueue);
                 }
@@ -3539,6 +3727,533 @@ namespace ServerZoneOwnership
             s_totalAttempts = 0; s_totalDelivered = 0;
             s_byPeer.Clear();
             return summary;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.28: what the server ACTUALLY sends, per prefab, with byte counts.
+    ///
+    /// Everything before this measured CANDIDATES — the list CreateSyncList
+    /// offers. But vanilla packs that sorted list only until the packet is full
+    /// (`if (zPackage.Size() &gt; num) break;`), so offers and sends are different
+    /// things, and on 2026-10-01 a third of a candidate list went unexamined
+    /// because only the top 6 prefabs were printed.
+    ///
+    /// This hooks ZDO.Serialize, which vanilla calls exactly once per ZDO that
+    /// made the cut, and which hands us the serialized ZPackage so the byte cost
+    /// is measured rather than estimated. Serialize is also used by world saves,
+    /// so it only counts while the send path has set Capturing.
+    ///
+    /// Distinct ZDOs are tracked alongside send counts: 1,644 sends of
+    /// "Greydwarf" could be 22 greydwarves updating 75 times each or 800
+    /// updating twice, and those imply completely different fixes.
+    /// </summary>
+    internal static class SendCensus
+    {
+        /// <summary>Set by the send path so saves aren't counted as sends.</summary>
+        internal static bool Capturing;
+
+        /// <summary>
+        /// Reference position of the peer currently being served, stashed by the
+        /// send path because ZDO.Serialize has no idea who the packet is for.
+        /// Distance to the RECEIVER is the right axis here: it is the same one
+        /// vanilla sorts on (ServerSortSendZDOS uses peer.m_peer.GetRefPos()),
+        /// so it answers "are we spending this player's byte budget on things
+        /// far away from them".
+        /// </summary>
+        internal static Vector3 CurrentPeerPos;
+
+        private sealed class Entry
+        {
+            public string Name;
+            public string Kind;          // mob / player / projectile / other
+            public int Sends;
+            public long Bytes;
+            public double DistSum;       // for a mean; mean-of-sqrt needs the sqrt
+            public readonly HashSet<ZDOID> Distinct = new HashSet<ZDOID>();
+
+            // ZDO.Distant, copied from the prefab's ZNetView.m_distant — so it
+            // is a property of the KIND of object, not of how far away this one
+            // happens to be. It decides eligibility for the outer-ring distant
+            // tier (~160-288m), which is gated behind `toSync.Count < 10`.
+            // Inside the near box the flag is irrelevant: FindObjects AddRanges
+            // the whole sector without consulting it. Prefab-serialised, so the
+            // decompile cannot tell us — only runtime can.
+            public bool Distant;
+        }
+
+        // Distance bands, in metres. 20 = melee/visual, 50 = BaseAI.m_viewRange,
+        // 160 = the near-box axis reach at near=2, beyond = distant-tier objects.
+        // Per band we keep sends, bytes AND distinct, because sends/distinct per
+        // band is the number that settles whether FAR things are getting a high
+        // update rate (pathological) or just many far things updating once each
+        // (expected).
+        private static readonly float[] s_bandEdges = { 20f, 50f, 100f, 160f, float.MaxValue };
+        private static readonly string[] s_bandNames = { "0-20m", "20-50m", "50-100m", "100-160m", "160m+" };
+        private static readonly int[] s_bandSends = new int[5];
+        private static readonly long[] s_bandBytes = new long[5];
+        private static readonly HashSet<ZDOID>[] s_bandDistinct =
+        {
+            new HashSet<ZDOID>(), new HashSet<ZDOID>(), new HashSet<ZDOID>(),
+            new HashSet<ZDOID>(), new HashSet<ZDOID>()
+        };
+
+        private static readonly Dictionary<int, Entry> s_byPrefab = new Dictionary<int, Entry>();
+        private static int s_totalSends;
+        private static long s_totalBytes;
+
+        // Component lookups are reflection-free but still a GetComponent per
+        // prefab, so classify once per prefab hash and reuse.
+        private static readonly Dictionary<int, string> s_kindCache = new Dictionary<int, string>();
+        private static readonly Dictionary<int, string> s_nameCache = new Dictionary<int, string>();
+
+        private static void Classify(int prefabHash, out string name, out string kind)
+        {
+            if (s_kindCache.TryGetValue(prefabHash, out kind)
+                && s_nameCache.TryGetValue(prefabHash, out name)) return;
+
+            name = prefabHash.ToString();
+            kind = "other";
+            var scene = ZNetScene.instance;
+            if (scene != null)
+            {
+                var prefab = scene.GetPrefab(prefabHash);
+                if (prefab != null)
+                {
+                    name = prefab.name;
+                    // Player before Character: Player derives from Character, and
+                    // "all the mobs" must not silently include the players.
+                    if (prefab.GetComponent<Player>() != null) kind = "player";
+                    else if (prefab.GetComponent<Character>() != null) kind = "mob";
+                    else if (prefab.GetComponent<Projectile>() != null) kind = "projectile";
+                }
+            }
+            s_kindCache[prefabHash] = kind;
+            s_nameCache[prefabHash] = name;
+        }
+
+        internal static void Record(ZDO zdo, int bytes)
+        {
+            if (zdo == null) return;
+            int hash = zdo.GetPrefab();
+            if (!s_byPrefab.TryGetValue(hash, out var e))
+            {
+                Classify(hash, out string name, out string kind);
+                e = new Entry { Name = name, Kind = kind, Distant = zdo.Distant };
+                s_byPrefab[hash] = e;
+            }
+            e.Sends++;
+            e.Bytes += bytes;
+            e.Distinct.Add(zdo.m_uid);
+            s_totalSends++;
+            s_totalBytes += bytes;
+
+            float dist = Utils.DistanceXZ(zdo.GetPosition(), CurrentPeerPos);
+            e.DistSum += dist;
+            for (int i = 0; i < s_bandEdges.Length; i++)
+            {
+                if (dist < s_bandEdges[i])
+                {
+                    s_bandSends[i]++;
+                    s_bandBytes[i] += bytes;
+                    s_bandDistinct[i].Add(zdo.m_uid);
+                    break;
+                }
+            }
+        }
+
+        internal static void Emit(float windowSeconds)
+        {
+            if (s_totalSends == 0) { Reset(); return; }
+
+            int distinctAll = 0, distinctMobs = 0, distinctPlayers = 0,
+                distinctProjectiles = 0, distinctOther = 0;
+            foreach (var e in s_byPrefab.Values)
+            {
+                int d = e.Distinct.Count;
+                distinctAll += d;
+                switch (e.Kind)
+                {
+                    case "mob":        distinctMobs += d; break;
+                    case "player":     distinctPlayers += d; break;
+                    case "projectile": distinctProjectiles += d; break;
+                    default:           distinctOther += d; break;
+                }
+            }
+
+            int mobSends = 0;
+            foreach (var e in s_byPrefab.Values) if (e.Kind == "mob") mobSends += e.Sends;
+
+            Plugin.Log.LogMessage(
+                $"===[CENSUS {windowSeconds:F1}s]=== sends={s_totalSends} " +
+                $"({s_totalSends / windowSeconds:F0}/s) bytes={s_totalBytes / 1024f:F0}KB " +
+                $"| distinct ZDOs={distinctAll} (mobs {distinctMobs}, players {distinctPlayers}, " +
+                $"projectiles {distinctProjectiles}, other {distinctOther}) " +
+                $"| mob share of sends {(s_totalSends > 0 ? 100f * mobSends / s_totalSends : 0f):F1}% " +
+                $"| prefabs={s_byPrefab.Count}");
+
+            // Distance bands first: this is the line that says whether the byte
+            // budget is going to things near the player or far from them.
+            var bands = new List<string>();
+            for (int i = 0; i < s_bandSends.Length; i++)
+            {
+                if (s_bandSends[i] == 0) continue;
+                int d = s_bandDistinct[i].Count;
+                bands.Add(
+                    $"{s_bandNames[i]} {100f * s_bandSends[i] / s_totalSends:F0}% " +
+                    $"({s_bandSends[i]} sends/{d} distinct = {(d > 0 ? s_bandSends[i] / (float)d : 0f):F1}x, " +
+                    $"{s_bandBytes[i] / 1024f:F0}KB)");
+            }
+            Plugin.Log.LogMessage($"[Census bands] {string.Join("  ", bands)}");
+
+            foreach (var e in s_byPrefab.Values.OrderByDescending(x => x.Sends))
+            {
+                Plugin.Log.LogMessage(
+                    $"[Census] {100f * e.Sends / s_totalSends,5:F1}% {e.Sends,6} sends " +
+                    $"{e.Bytes / 1024f,7:F1}KB {e.Bytes / (float)e.Sends,5:F0}B/send " +
+                    $"{e.Distinct.Count,4} distinct {e.Sends / (float)e.Distinct.Count,5:F1}x " +
+                    $"{e.DistSum / e.Sends,5:F0}m {(e.Distant ? "DIST" : "near"),-5} " +
+                    $"{e.Kind,-10} {e.Name}");
+            }
+            Reset();
+        }
+
+        private static void Reset()
+        {
+            s_byPrefab.Clear();
+            s_totalSends = 0;
+            s_totalBytes = 0;
+            Array.Clear(s_bandSends, 0, s_bandSends.Length);
+            Array.Clear(s_bandBytes, 0, s_bandBytes.Length);
+            foreach (var set in s_bandDistinct) set.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Fires once per ZDO vanilla writes into an outgoing packet, so this is
+    /// the authoritative "it really was sent" signal. World saves serialize
+    /// too, hence the SendTarget.Active gate.
+    ///
+    /// Order matters: the tier bookkeeping is UNCONDITIONAL while the verbose
+    /// census stays behind its own knob. Hanging the throttle's state on
+    /// DebugSendCensusSeconds would mean switching the census off silently
+    /// turned the throttle into a no-op.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDO), nameof(ZDO.Serialize))]
+    internal static class ZDO_Serialize_Census_Patch
+    {
+        static void Postfix(ZDO __instance, ZPackage pkg)
+        {
+            if (!SendTarget.Active) return;
+            if (Plugin.DebugSendTiers) SendTiers.RecordPacked(__instance);
+            if (Plugin.DebugSendCensusSeconds > 0f)
+                SendCensus.Record(__instance, pkg != null ? pkg.Size() : 0);
+        }
+    }
+
+    /// <summary>
+    /// Which peer the server is mid-send to. ZDOMan.ServerSortSendZDOS and
+    /// ZDO.Serialize both run inside one SendZDOs call but neither can see the
+    /// peer — ZDOPeer is a private nested type, so it cannot be bound as a
+    /// patch parameter. The send-rate replacement already holds the ZNetPeer,
+    /// so it parks the identity here for the duration of the call.
+    ///
+    /// Deliberately separate from SendCensus.Capturing: that flag is gated on
+    /// DebugSendCensusSeconds, which is documented to be switched off after a
+    /// capture. Riding the throttle on it would silently turn the throttle into
+    /// a no-op (every ZDO would look never-sent, so everything would be exempt)
+    /// with nothing in the log saying so.
+    /// </summary>
+    internal static class SendTarget
+    {
+        internal static bool Active;
+        internal static long Uid;
+        internal static Vector3 RefPos;
+        internal static Dictionary<ZDOID, SendTiers.Sent> Map;   // resolved once per send
+    }
+
+    /// <summary>
+    /// v0.7.30: cap how often each peer hears about a given ZDO, by distance.
+    ///
+    /// Vanilla sends every changed ZDO in range on every send opportunity. It
+    /// has no per-object rate concept at all: distance enters only through
+    /// ServerSortSendZDOS's sort value, which decides ORDER, and order is
+    /// irrelevant whenever the whole list fits in the packet. So a creature
+    /// 150m away is refreshed exactly as often as one swinging at your face.
+    ///
+    /// Filtering happens in a Prefix on ServerSortSendZDOS, which is before
+    /// vanilla's `if (toSync.Count < 10)` distant-append and before
+    /// AddForceSendZdos. Two consequences, both wanted: force-sends bypass the
+    /// cap (they are urgent by construction), and a shortened list makes the
+    /// distant-append fire more often, which should help the late tree/structure
+    /// pop-in. The cost is that far-tier `packed` can exceed `offered`, so `cut`
+    /// is printed signed — a negative far-tier cut IS that pop-in relief.
+    /// </summary>
+    internal static class SendTiers
+    {
+        internal struct Sent
+        {
+            public float At;          // Time.time when it was last packed
+            public ushort OwnerRev;   // to spot ownership changes, which must not wait
+            public byte Tier;         // tier that governed the last send
+            public ushort InWindow;   // packs this accounting window
+        }
+
+        // Per peer, per ZDO. Our own map rather than reflecting into
+        // ZDOPeer.m_zdos[uid].m_syncTime: that is authoritative but it is a
+        // private nested struct inside a private nested class, so every read
+        // would box twice, up to ~600k times/sec. And drift is asymmetric in our
+        // favour — this filter runs AFTER ShouldSend, so it can only ever delay
+        // something vanilla already chose to send, never cause a send. Thinking
+        // an entry is older than it is just means less throttling.
+        private static readonly Dictionary<long, Dictionary<ZDOID, Sent>> s_byPeer =
+            new Dictionary<long, Dictionary<ZDOID, Sent>>();
+
+        private static readonly float[] s_edgeSq;
+        private static readonly float[] s_period;
+
+        // Per-tier accounting for the window.
+        private static readonly int[] s_cand, s_exempt, s_thr, s_packed, s_pairs, s_maxIn, s_sat;
+        private static int s_served, s_emptied, s_tiers;
+
+        static SendTiers()
+        {
+            s_tiers = Plugin.SendTierEdges.Length;
+            s_edgeSq = new float[s_tiers];
+            s_period = new float[s_tiers];
+            for (int i = 0; i < s_tiers; i++)
+            {
+                float e = Plugin.SendTierEdges[i];
+                s_edgeSq[i] = e >= float.MaxValue * 0.5f ? float.MaxValue : e * e;
+
+                // Due slightly early on purpose. Sends arrive on a jittery
+                // ~50ms cadence (DebugPeerSendHz over a ~30Hz loop), so an exact
+                // 1/N deadline gets missed by a few ms and slips a whole
+                // interval — a 10/s cap would measure 6.7/s.
+                float hz = i < Plugin.SendTierHz.Length ? Plugin.SendTierHz[i] : 0f;
+                s_period[i] = hz <= 0f ? 0f : Mathf.Max(0f, 1f / hz - 0.5f / Mathf.Max(1f, Plugin.DebugPeerSendHz));
+            }
+            s_cand = new int[s_tiers]; s_exempt = new int[s_tiers]; s_thr = new int[s_tiers];
+            s_packed = new int[s_tiers]; s_pairs = new int[s_tiers];
+            s_maxIn = new int[s_tiers]; s_sat = new int[s_tiers];
+        }
+
+        internal static string Describe()
+        {
+            var parts = new List<string>();
+            for (int i = 0; i < s_tiers; i++)
+            {
+                float hz = i < Plugin.SendTierHz.Length ? Plugin.SendTierHz[i] : 0f;
+                string edge = Plugin.SendTierEdges[i] >= float.MaxValue * 0.5f
+                    ? "inf" : $"{Plugin.SendTierEdges[i]:F0}m";
+                parts.Add(hz <= 0f ? $"<{edge} unlimited" : $"<{edge} {hz:F0}/s (every {s_period[i] * 1000f:F0}ms)");
+            }
+            return string.Join(", ", parts);
+        }
+
+        /// <summary>Called once per send, so the two-level lookup stays off the per-ZDO path.</summary>
+        internal static Dictionary<ZDOID, Sent> MapFor(long uid)
+        {
+            if (!s_byPeer.TryGetValue(uid, out var m))
+            {
+                m = new Dictionary<ZDOID, Sent>();
+                s_byPeer[uid] = m;
+            }
+            return m;
+        }
+
+        private static int TierOf(float sqrDist)
+        {
+            for (int i = 0; i < s_tiers; i++) if (sqrDist < s_edgeSq[i]) return i;
+            return s_tiers - 1;
+        }
+
+        /// <summary>
+        /// Drop not-yet-due entries from the already-gathered candidate list.
+        /// Compacts in place with two pointers — RemoveAt would be O(n^2) with a
+        /// memmove per removal, and lists reached 3,776 entries in the
+        /// 2026-09-29 session.
+        /// </summary>
+        internal static void Filter(List<ZDO> objects, Vector3 refPos)
+        {
+            if (objects == null || objects.Count == 0) return;
+            var map = SendTarget.Map;
+            if (map == null) return;
+
+            float now = Time.time;
+            int w = 0;
+            for (int r = 0; r < objects.Count; r++)
+            {
+                var zdo = objects[r];
+                bool keep = true;
+                if (zdo != null)
+                {
+                    Vector3 d = zdo.GetPosition() - refPos;
+                    // XZ only, squared: matches the census, and avoids a sqrt
+                    // per candidate on a path that can see 600k/sec.
+                    float sq = d.x * d.x + d.z * d.z;
+                    int t = TierOf(sq);
+                    s_cand[t]++;
+
+                    if (s_period[t] <= 0f) s_exempt[t]++;                 // tier unlimited
+                    else if (!map.TryGetValue(zdo.m_uid, out var s)) s_exempt[t]++;   // first delivery
+                    else if (zdo.OwnerRevision != s.OwnerRev) s_exempt[t]++;          // ownership must not wait
+                    else if (now - s.At < s_period[t]) { keep = false; s_thr[t]++; }
+                }
+                if (keep) objects[w++] = objects[r];
+            }
+            if (w < objects.Count) objects.RemoveRange(w, objects.Count - w);
+            s_served++;
+            if (w == 0) s_emptied++;
+        }
+
+        /// <summary>Called from the ZDO.Serialize postfix: this ZDO really was packed.</summary>
+        internal static void RecordPacked(ZDO zdo)
+        {
+            var map = SendTarget.Map;
+            if (map == null || zdo == null) return;
+
+            Vector3 d = zdo.GetPosition() - SendTarget.RefPos;
+            int t = TierOf(d.x * d.x + d.z * d.z);
+            s_packed[t]++;
+
+            map.TryGetValue(zdo.m_uid, out var s);
+            s.At = Time.time;
+            s.OwnerRev = zdo.OwnerRevision;
+            s.Tier = (byte)t;
+            if (s.InWindow < ushort.MaxValue) s.InWindow++;
+            map[zdo.m_uid] = s;
+        }
+
+        internal static void DropZdo(ZDOID id)
+        {
+            foreach (var m in s_byPeer.Values) m.Remove(id);
+        }
+
+        internal static void DropPeer(long uid) => s_byPeer.Remove(uid);
+
+        private static readonly List<ZDOID> s_scratch = new List<ZDOID>();
+
+        /// <summary>
+        /// Roll up the window and prune in one pass. Pruning is harmless: a
+        /// dropped entry looks never-sent and goes out immediately, which the
+        /// cap would have permitted anyway.
+        /// </summary>
+        internal static void EmitAndPrune(float window, bool print)
+        {
+            for (int i = 0; i < s_tiers; i++) { s_pairs[i] = 0; s_maxIn[i] = 0; s_sat[i] = 0; }
+
+            foreach (var kv in s_byPeer)
+            {
+                var map = kv.Value;
+
+                // Snapshot the keys: the pass both removes stale entries and
+                // rewrites surviving ones, and a Dictionary cannot be mutated
+                // while being enumerated.
+                s_scratch.Clear();
+                foreach (var id in map.Keys) s_scratch.Add(id);
+
+                foreach (var id in s_scratch)
+                {
+                    var s = map[id];
+                    if (s.InWindow == 0)
+                    {
+                        // Untouched this window. Dropping it is harmless — it
+                        // then looks never-sent and goes out immediately, which
+                        // the cap would have allowed anyway.
+                        map.Remove(id);
+                        continue;
+                    }
+
+                    int t = s.Tier < s_tiers ? s.Tier : s_tiers - 1;
+                    s_pairs[t]++;
+                    if (s.InWindow > s_maxIn[t]) s_maxIn[t] = s.InWindow;
+                    float hz = t < Plugin.SendTierHz.Length ? Plugin.SendTierHz[t] : 0f;
+                    if (hz > 0f && s.InWindow / window >= 0.8f * hz) s_sat[t]++;
+
+                    s.InWindow = 0;
+                    map[id] = s;
+                }
+            }
+
+            if (print && s_served > 0)
+            {
+                Plugin.Log.LogMessage(
+                    $"===[TIERS {window:F1}s]=== sends={s_served} emptied={s_emptied} " +
+                    $"| caps: {Describe()}");
+                for (int t = 0; t < s_tiers; t++)
+                {
+                    int offered = s_cand[t] - s_thr[t];
+                    int cut = offered - s_packed[t];
+                    float hz = t < Plugin.SendTierHz.Length ? Plugin.SendTierHz[t] : 0f;
+                    string edge = Plugin.SendTierEdges[t] >= float.MaxValue * 0.5f
+                        ? "inf" : $"{Plugin.SendTierEdges[t]:F0}m";
+                    Plugin.Log.LogMessage(
+                        $"[Tier <{edge,-5} cap={(hz <= 0f ? "none" : hz.ToString("F0") + "/s"),-6}] " +
+                        $"cand={s_cand[t],-7} ex={s_exempt[t],-6} thr={s_thr[t],-7} " +
+                        $"off={offered,-7} pk={s_packed[t],-7} cut={cut,-7} " +
+                        $"pairs={s_pairs[t],-6} max={s_maxIn[t] / window,5:F1}/s sat={(s_pairs[t] > 0 ? 100 * s_sat[t] / s_pairs[t] : 0),3}%");
+                }
+            }
+
+            Array.Clear(s_cand, 0, s_tiers); Array.Clear(s_exempt, 0, s_tiers);
+            Array.Clear(s_thr, 0, s_tiers); Array.Clear(s_packed, 0, s_tiers);
+            s_served = 0; s_emptied = 0;
+        }
+    }
+
+    /// <summary>
+    /// Applies the distance cap to the candidate list. A Prefix, not a Postfix:
+    /// removing entries then sorting gives the same result as sorting then
+    /// removing, and this way vanilla never computes a sort value for anything
+    /// we were going to drop.
+    ///
+    /// Bound positionally (__0/__1) rather than by name. This plugin has been
+    /// disabled outright once before by a vanilla parameter rename breaking a
+    /// name-bound patch and throwing out of PatchAll.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDOMan), "ServerSortSendZDOS")]
+    internal static class ZDOMan_ServerSortSendZDOS_Tier_Patch
+    {
+        static void Prefix(List<ZDO> __0, Vector3 __1)
+        {
+            if (!Plugin.DebugSendTiers || !SendTarget.Active) return;
+            SendTiers.Filter(__0, __1);
+        }
+    }
+
+    /// <summary>
+    /// A peer forgets a ZDO when its sector leaves that peer's active area, so
+    /// re-entry is a genuine first delivery. Without this our map would still
+    /// claim we had sent it and would delay it by up to one tier period.
+    /// Public method, public parameter, explicit type array — rename-proof.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.ZDOSectorInvalidated), new[] { typeof(ZDO) })]
+    internal static class ZDOMan_ZDOSectorInvalidated_Tier_Patch
+    {
+        static void Postfix(ZDO zdo)
+        {
+            if (!Plugin.DebugSendTiers || zdo == null) return;
+            SendTiers.DropZdo(zdo.m_uid);
+        }
+    }
+
+    /// <summary>Forget a peer's history on connect and disconnect alike — a
+    /// reconnecting player's ZDOPeer.m_zdos starts empty, so everything is a
+    /// first delivery for them.</summary>
+    [HarmonyPatch(typeof(ZDOMan))]
+    internal static class ZDOMan_PeerLifecycle_Tier_Patch
+    {
+        [HarmonyPostfix, HarmonyPatch(nameof(ZDOMan.AddPeer), new[] { typeof(ZNetPeer) })]
+        static void OnAdd(ZNetPeer peer)
+        {
+            if (Plugin.DebugSendTiers && peer != null) SendTiers.DropPeer(peer.m_uid);
+        }
+
+        [HarmonyPostfix, HarmonyPatch(nameof(ZDOMan.RemovePeer), new[] { typeof(ZNetPeer) })]
+        static void OnRemove(ZNetPeer peer)
+        {
+            if (Plugin.DebugSendTiers && peer != null) SendTiers.DropPeer(peer.m_uid);
         }
     }
 
