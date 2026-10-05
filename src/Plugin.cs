@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.31";
+        public const string PluginVersion = "0.7.32";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -271,7 +271,7 @@ namespace ServerZoneOwnership
             }
 
             _harmony = new Harmony(PluginGuid);
-            _harmony.PatchAll();
+            ApplyPatches();
             // Count engine-side navmesh link-pool exhaustion. The message is
             // emitted by native Unity code, so there is nothing to patch — we
             // observe the log stream instead and report a count every 20s.
@@ -344,6 +344,52 @@ namespace ServerZoneOwnership
                 }
             }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Apply each patch class on its own instead of calling PatchAll().
+        ///
+        /// PatchAll aborts every REMAINING patch the moment one fails, so a
+        /// single vanilla parameter rename leaves the server running
+        /// half-patched with no obvious sign beyond a missing session banner.
+        /// That has now happened twice: IsInPeerActiveArea in build 25185644,
+        /// and ZDOMan.AddPeer on 2026-10-05 (the parameter is `netPeer`, and a
+        /// patch bound it as `peer`). Isolating each class means a future
+        /// rename costs exactly one feature, and the log names it.
+        /// </summary>
+        private void ApplyPatches()
+        {
+            int applied = 0;
+            var broken = new List<string>();
+
+            foreach (var type in AccessTools.GetTypesFromAssembly(Assembly.GetExecutingAssembly()))
+            {
+                try
+                {
+                    var patched = _harmony.CreateClassProcessor(type)?.Patch();
+                    // Returns null/empty for the many types that carry no
+                    // Harmony attributes at all, which is not a failure.
+                    if (patched != null && patched.Count > 0) applied++;
+                }
+                catch (Exception e)
+                {
+                    broken.Add(type.Name);
+                    Log.LogError($"PATCH FAILED — {type.Name}: {e.Message}");
+                }
+            }
+
+            if (broken.Count > 0)
+            {
+                // Loud and specific: the feature that class implements is
+                // inactive, but everything else is still running.
+                Log.LogError(
+                    $"{broken.Count} patch class(es) FAILED and their features are INACTIVE: " +
+                    string.Join(", ", broken) + $". {applied} applied successfully.");
+            }
+            else
+            {
+                Log.LogInfo($"{applied} patch classes applied, none failed.");
+            }
         }
 
         private void OnDestroy()
@@ -4231,10 +4277,10 @@ namespace ServerZoneOwnership
     [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.ZDOSectorInvalidated), new[] { typeof(ZDO) })]
     internal static class ZDOMan_ZDOSectorInvalidated_Tier_Patch
     {
-        static void Postfix(ZDO zdo)
+        static void Postfix(ZDO __0)
         {
-            if (!Plugin.DebugSendTiers || zdo == null) return;
-            SendTiers.DropZdo(zdo.m_uid);
+            if (!Plugin.DebugSendTiers || __0 == null) return;
+            SendTiers.DropZdo(__0.m_uid);
         }
     }
 
@@ -4244,16 +4290,20 @@ namespace ServerZoneOwnership
     [HarmonyPatch(typeof(ZDOMan))]
     internal static class ZDOMan_PeerLifecycle_Tier_Patch
     {
+        // __0 rather than the parameter name. Vanilla calls it `netPeer`, not
+        // `peer`, and binding by name failed on 2026-10-05 — which aborted
+        // PatchAll and left the server half-patched. Positional injection
+        // survives renames; only a signature reorder breaks it.
         [HarmonyPostfix, HarmonyPatch(nameof(ZDOMan.AddPeer), new[] { typeof(ZNetPeer) })]
-        static void OnAdd(ZNetPeer peer)
+        static void OnAdd(ZNetPeer __0)
         {
-            if (Plugin.DebugSendTiers && peer != null) SendTiers.DropPeer(peer.m_uid);
+            if (Plugin.DebugSendTiers && __0 != null) SendTiers.DropPeer(__0.m_uid);
         }
 
         [HarmonyPostfix, HarmonyPatch(nameof(ZDOMan.RemovePeer), new[] { typeof(ZNetPeer) })]
-        static void OnRemove(ZNetPeer peer)
+        static void OnRemove(ZNetPeer __0)
         {
-            if (Plugin.DebugSendTiers && peer != null) SendTiers.DropPeer(peer.m_uid);
+            if (Plugin.DebugSendTiers && __0 != null) SendTiers.DropPeer(__0.m_uid);
         }
     }
 
