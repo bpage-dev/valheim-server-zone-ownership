@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.42";
+        public const string PluginVersion = "0.7.43";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -620,10 +620,12 @@ namespace ServerZoneOwnership
             var sync = SyncVolume.DrainStats(peers, PerfStatsIntervalSeconds);
             var terrain = TerrainComp_DoOperation_Census_Patch.Drain();
             var proj = ZDOMan_ServerSortSendZDOS_ProjectilePriority_Patch.Drain();
-            if (passes != null || reclaims != null || sync != null || terrain != null || proj != null)
+            var rpcd = ZNetView_HandleRoutedRPC_Diag_Patch.Drain();
+            if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
                             (terrain != null ? $" | {terrain}" : "") +
-                            (proj != null ? $" | {proj}" : ""));
+                            (proj != null ? $" | {proj}" : "") +
+                            (rpcd != null ? $" | {rpcd}" : ""));
         }
 
         // Periodic diagnostic flush. Drains counters accumulated by our
@@ -4682,6 +4684,91 @@ namespace ServerZoneOwnership
                        $"({(Ops > 0 ? 100 * NoOps / Ops : 0)}%) sectors={Sectors.Count} " +
                        $"wastedPerPeer={bytesWasted / 1024}KB";
             Ops = 0; NoOps = 0; Changed = 0; Sectors.Clear();
+            return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.43: find out WHY routed RPCs are being dropped.
+    ///
+    /// ZNetView.HandleRoutedRPC logs "Failed to find rpc method &lt;hash&gt;" when a
+    /// client sends a routed RPC to a ZDO whose view has no handler for it.
+    /// Measured 2026-10-06: ~1.8/sec sustained, every one of them hash
+    /// 1077891207 = RPC_ApplyOperation (brute-forced against every string in
+    /// the decompile; single match). That is terrain modification.
+    ///
+    /// TerrainComp.Awake returns BEFORE m_nview.Register("RPC_ApplyOperation")
+    /// when Heightmap.FindHeightmap comes back null, so a comp that lost that
+    /// race is alive but deaf. The open question is whether the drops matter:
+    /// these ZDOs are deliberately peer-owned (see the ReleaseZDOS patch), and
+    /// ZNetView.InvokeRPC routes to m_zdo.GetOwner(), so a dig should land on
+    /// the owning CLIENT, not here. If so these are noise.
+    ///
+    /// The discriminator is the handler count on the receiving view:
+    ///   0 handlers  -> Awake bailed entirely, the comp is deaf (our problem)
+    ///   &gt;0 handlers -> registered fine, some other method is missing
+    /// plus whether the target ZDO is owned by us or by a peer.
+    ///
+    /// Aggregated, not per-event: at 1.8/sec a line each would be 108/minute.
+    /// </summary>
+    [HarmonyPatch(typeof(ZNetView), nameof(ZNetView.HandleRoutedRPC))]
+    internal static class ZNetView_HandleRoutedRPC_Diag_Patch
+    {
+        private static readonly FieldInfo s_functions =
+            AccessTools.Field(typeof(ZNetView), "m_functions");
+
+        private static int s_drops, s_noHandlers, s_hasHandlers, s_serverOwned, s_peerOwned, s_unowned;
+        private static readonly Dictionary<string, int> s_byPrefab = new Dictionary<string, int>();
+        private static readonly Dictionary<int, int> s_byHash = new Dictionary<int, int>();
+
+        static void Prefix(ZNetView __instance, ZRoutedRpc.RoutedRPCData __0)
+        {
+            if (__instance == null || __0 == null) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+            // Only interested in the ones vanilla is about to drop.
+            var fns = s_functions?.GetValue(__instance) as System.Collections.IDictionary;
+            if (fns == null || fns.Contains(__0.m_methodHash)) return;
+
+            s_drops++;
+            if (fns.Count == 0) s_noHandlers++; else s_hasHandlers++;
+
+            if (s_byHash.TryGetValue(__0.m_methodHash, out int hc)) s_byHash[__0.m_methodHash] = hc + 1;
+            else s_byHash[__0.m_methodHash] = 1;
+
+            var zdo = __instance.GetZDO();
+            string name = "?";
+            if (zdo != null)
+            {
+                long owner = zdo.GetOwner();
+                if (owner == 0L) s_unowned++;
+                else if (ZNet.GetUID() == owner) s_serverOwned++;
+                else s_peerOwned++;
+
+                var scene = ZNetScene.instance;
+                if (scene != null)
+                {
+                    var prefab = scene.GetPrefab(zdo.GetPrefab());
+                    if (prefab != null) name = prefab.name;
+                }
+            }
+            if (s_byPrefab.TryGetValue(name, out int pc)) s_byPrefab[name] = pc + 1;
+            else if (s_byPrefab.Count < 24) s_byPrefab[name] = 1;
+        }
+
+        internal static string Drain()
+        {
+            if (s_drops == 0) return null;
+            string top = string.Join(" ", s_byPrefab.OrderByDescending(kv => kv.Value)
+                .Take(5).Select(kv => $"{kv.Key}×{kv.Value}"));
+            string hashes = string.Join(" ", s_byHash.OrderByDescending(kv => kv.Value)
+                .Take(3).Select(kv => $"{kv.Key}×{kv.Value}"));
+            string s = $"rpcDrops={s_drops} (noHandlers={s_noHandlers} hasHandlers={s_hasHandlers}) " +
+                       $"owner[server={s_serverOwned} peer={s_peerOwned} none={s_unowned}] " +
+                       $"| {top} | hash {hashes}";
+            s_drops = 0; s_noHandlers = 0; s_hasHandlers = 0;
+            s_serverOwned = 0; s_peerOwned = 0; s_unowned = 0;
+            s_byPrefab.Clear(); s_byHash.Clear();
             return s;
         }
     }
