@@ -9,6 +9,9 @@
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <NoWarn>CS0436;CS0618;CS0649</NoWarn>
+    <!-- Where to deploy the plugin after a Release build. Override at the
+         command line with -p:ValheimServerPath="D:\SomeOtherPath". -->
+    <ValheimServerPath Condition="'$(ValheimServerPath)' == ''">C:\Users\thega\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\DontStartup\steamcmd\steamapps\common\Valheim dedicated server</ValheimServerPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -41,5 +44,65 @@
       <Private>false</Private>
     </Reference>
   </ItemGroup>
+
+  <!-- Regenerate BuildInfo.g.cs on every build so the DLL carries its git SHA,
+       dirty flag, and UTC build timestamp. Compiled in via ItemGroup below. -->
+  <Target Name="GenerateBuildInfo" BeforeTargets="CoreCompile">
+    <Exec Command="git rev-parse --short HEAD" ConsoleToMSBuild="true" IgnoreExitCode="true"
+          WorkingDirectory="$(MSBuildProjectDirectory)" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitShaOutput" />
+      <Output TaskParameter="ExitCode" PropertyName="_GitShaExit" />
+    </Exec>
+    <Exec Command="git status --porcelain" ConsoleToMSBuild="true" IgnoreExitCode="true"
+          WorkingDirectory="$(MSBuildProjectDirectory)" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitStatusOutput" />
+    </Exec>
+    <PropertyGroup>
+      <GitShortSha Condition="'$(_GitShaExit)' == '0'">$(_GitShaOutput)</GitShortSha>
+      <GitShortSha Condition="'$(_GitShaExit)' != '0'">unknown</GitShortSha>
+      <GitDirty Condition="'$(_GitStatusOutput)' == ''">false</GitDirty>
+      <GitDirty Condition="'$(_GitStatusOutput)' != ''">true</GitDirty>
+      <BuildTimestamp>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss"))</BuildTimestamp>
+      <BuildInfoFile>$(IntermediateOutputPath)BuildInfo.g.cs</BuildInfoFile>
+    </PropertyGroup>
+    <ItemGroup>
+      <_BuildInfoLine Include="// &lt;auto-generated /&gt; regenerated on every build — do not edit or commit" />
+      <_BuildInfoLine Include="namespace ServerZoneOwnership {" />
+      <_BuildInfoLine Include="    internal static class BuildInfo {" />
+      <_BuildInfoLine Include="        public const string GitShortSha = &quot;$(GitShortSha)&quot;%3B" />
+      <_BuildInfoLine Include="        public const bool GitDirty = $(GitDirty)%3B" />
+      <_BuildInfoLine Include="        public const string BuildTimestamp = &quot;$(BuildTimestamp)&quot;%3B" />
+      <_BuildInfoLine Include="    }" />
+      <_BuildInfoLine Include="}" />
+    </ItemGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <WriteLinesToFile File="$(BuildInfoFile)" Lines="@(_BuildInfoLine)" Overwrite="true" />
+    <ItemGroup>
+      <Compile Include="$(BuildInfoFile)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Post-build: archive the currently-deployed DLL with a timestamp, then
+       drop the freshly built one into BepInEx/plugins. Release only, so Debug
+       builds stay side-effect-free for compile-check iteration. -->
+  <Target Name="DeployToServer" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <PropertyGroup>
+      <_PluginsDir>$(ValheimServerPath)\BepInEx\plugins</_PluginsDir>
+      <_DeployedDll>$(_PluginsDir)\$(AssemblyName).dll</_DeployedDll>
+      <_ArchiveDir>$(MSBuildProjectDirectory)\bin\deploy_archive</_ArchiveDir>
+      <_ArchiveTimestamp>$([System.DateTime]::Now.ToString("yyyyMMdd_HHmmss"))</_ArchiveTimestamp>
+      <_ArchivedDll>$(_ArchiveDir)\$(AssemblyName)_$(_ArchiveTimestamp).dll</_ArchivedDll>
+    </PropertyGroup>
+    <Error Text="Plugins dir not found: $(_PluginsDir). Set ValheimServerPath in the csproj or pass -p:ValheimServerPath=..."
+           Condition="!Exists('$(_PluginsDir)')" />
+    <MakeDir Directories="$(_ArchiveDir)" />
+    <Copy SourceFiles="$(_DeployedDll)" DestinationFiles="$(_ArchivedDll)"
+          Condition="Exists('$(_DeployedDll)')" />
+    <Message Importance="high" Text="Archived previous → $(_ArchivedDll)"
+             Condition="Exists('$(_ArchivedDll)')" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll"
+          DestinationFiles="$(_DeployedDll)" />
+    <Message Importance="high" Text="Deployed → $(_DeployedDll)" />
+  </Target>
 
 </Project>
