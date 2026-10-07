@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.32";
+        public const string PluginVersion = "0.7.42";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -121,18 +121,38 @@ namespace ServerZoneOwnership
         // Upper bound of each tier in metres, ascending, last must be huge.
         internal static readonly float[] SendTierEdges = { 30f, 100f, float.MaxValue };
 
-        // Max sends/sec per ZDO per peer for each tier. <= 0 means unlimited.
-        // Tier 0 at DebugPeerSendHz is effectively unlimited, which is intended:
-        // inside 30m nothing should ever be held back.
+        // How many send opportunities a ZDO in each tier must skip: 1 = may ride
+        // every send, 2 = every other, 7 = every seventh. 1 means uncapped.
         //
-        // NOTE achievable rates are quantised to DebugPeerSendHz/k — 20, 10,
-        // 6.7, 5, 4, 3.3 — so a "3/s" cap will measure 2.9 or 3.3, never 3.0.
-        internal static readonly float[] SendTierHz = { 20f, 10f, 3f };
+        // Counted in OPPORTUNITIES, not seconds, and that is the whole point.
+        // v0.7.30-0.7.37 compared wall-clock timestamps against a 1/Hz deadline,
+        // but opportunities arrive on frame boundaries ~33ms and ~67ms apart
+        // around a 50ms mean, so a deadline lands between them and whether it
+        // passes is luck. That needed a tolerance fudge, the fudge needed its own
+        // correction, and the correction silently halved the near tier (300 of
+        // 649 near candidates throttled, 10.0/s against a 20/s cap). Counting
+        // opportunities is exact: frame timing cannot affect "has this skipped
+        // one send yet".
+        //
+        // The resulting rate is DebugPeerSendHz / stride, so at 20/s:
+        //   1 -> 20/s    2 -> 10/s    3 -> 6.7/s    4 -> 5/s    7 -> 2.9/s
+        // Rates between those steps are not reachable — you cannot send on a
+        // fraction of an opportunity. What IS exact is the share: a stride-2
+        // object gets precisely half the sends.
+        internal static readonly int[] SendTierEveryNth = { 1, 2, 7 };
 
         // Seconds between [Tier] accounting blocks (0 = silent, but the cap and
         // its pruning still run). Four lines per window, so this is cheap enough
         // to leave on through a group session.
-        internal const float DebugSendTierSeconds = 20f;
+        // 5s for a short capture (an hour gives ~720 points, good chart
+        // resolution). Raise to 20f for long unattended runs — at 8 players this
+        // is 32 lines per window, so 5s means ~6.4 lines/sec.
+        internal const float DebugSendTierSeconds = 5f;
+
+        // Promote projectiles above Default in the send order (v0.7.42). Pure
+        // ordering — projectiles still pass the same distance stride as
+        // everything else. false = vanilla ordering, one bool.
+        internal const bool DebugProjectilePriority = true;
 
         // How often the [Nav] navmesh gauge prints. Ours, no vanilla default.
         // Raise it if the log gets noisy; the numbers are instantaneous
@@ -598,8 +618,12 @@ namespace ServerZoneOwnership
             var passes = PassTimer.DrainSummary(_tickTotalMs);
             var reclaims = ReclaimStats.Drain(peers);
             var sync = SyncVolume.DrainStats(peers, PerfStatsIntervalSeconds);
-            if (passes != null || reclaims != null || sync != null)
-                Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}");
+            var terrain = TerrainComp_DoOperation_Census_Patch.Drain();
+            var proj = ZDOMan_ServerSortSendZDOS_ProjectilePriority_Patch.Drain();
+            if (passes != null || reclaims != null || sync != null || terrain != null || proj != null)
+                Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
+                            (terrain != null ? $" | {terrain}" : "") +
+                            (proj != null ? $" | {proj}" : ""));
         }
 
         // Periodic diagnostic flush. Drains counters accumulated by our
@@ -3508,6 +3532,9 @@ namespace ServerZoneOwnership
                     SendTarget.Map = Plugin.DebugSendTiers && netPeer != null
                         ? SendTiers.MapFor(netPeer.m_uid)
                         : null;
+                    SendTarget.Counters = Plugin.DebugSendTiers && netPeer != null
+                        ? SendTiers.CountersFor(netPeer.m_uid, name)
+                        : null;
                     SendTarget.Active = true;
 
                     object ret;
@@ -3520,6 +3547,7 @@ namespace ServerZoneOwnership
                         SendCensus.Capturing = false;
                         SendTarget.Active = false;
                         SendTarget.Map = null;
+                        SendTarget.Counters = null;
                     }
                     bool sent = ret is bool b && b;
                     SendPressure.RecordAttempt(name, sent, preQueue);
@@ -4014,8 +4042,10 @@ namespace ServerZoneOwnership
     {
         internal static bool Active;
         internal static long Uid;
+        internal static int Seq;                                 // this send's opportunity number for that peer
         internal static Vector3 RefPos;
         internal static Dictionary<ZDOID, SendTiers.Sent> Map;   // resolved once per send
+        internal static SendTiers.PeerCounters Counters;         // likewise, so increments stay array indexes
     }
 
     /// <summary>
@@ -4039,7 +4069,7 @@ namespace ServerZoneOwnership
     {
         internal struct Sent
         {
-            public float At;          // Time.time when it was last packed
+            public int LastSend;      // opportunity number of the last pack
             public ushort OwnerRev;   // to spot ownership changes, which must not wait
             public byte Tier;         // tier that governed the last send
             public ushort InWindow;   // packs this accounting window
@@ -4056,43 +4086,99 @@ namespace ServerZoneOwnership
             new Dictionary<long, Dictionary<ZDOID, Sent>>();
 
         private static readonly float[] s_edgeSq;
-        private static readonly float[] s_period;
+        private static readonly int[] s_stride;
 
-        // Per-tier accounting for the window.
-        private static readonly int[] s_cand, s_exempt, s_thr, s_packed, s_pairs, s_maxIn, s_sat;
-        private static int s_served, s_emptied, s_tiers;
+        // Monotonic count of send opportunities per peer. This is the clock —
+        // there is no time-based arithmetic anywhere in the cap any more.
+        private static readonly Dictionary<long, int> s_seq = new Dictionary<long, int>();
+
+        /// <summary>
+        /// Per-tier accounting for one peer for one window (v0.7.35).
+        ///
+        /// Previously these were single static arrays summed across every peer,
+        /// which made the output unusable for the thing it is for: the cap is
+        /// applied per peer, so "how is this player being served" cannot be read
+        /// out of a blended total. Eight players in eight different situations
+        /// average into something true of none of them.
+        ///
+        /// Costs nothing on the hot path. SendTarget already resolves per-send
+        /// state once per send (not per candidate), so the counter block is
+        /// resolved in the same place and every increment stays a direct array
+        /// index. One extra dictionary lookup per send, ~160/sec at 8 players.
+        ///
+        /// Exemptions are split by cause: the combined figure ran at 38% of all
+        /// candidates, too large to leave unattributed. A high first-delivery
+        /// share means movement-driven re-delivery (peers forget ZDOs via
+        /// ZDOSectorInvalidated as sectors cycle); a high ownership share would
+        /// point at our own reclaim pass.
+        /// </summary>
+        internal sealed class PeerCounters
+        {
+            public string Name = "?";
+            public readonly int[] Cand, ExUnlim, ExFirst, ExOwner, Thr, Packed;
+            public readonly int[] Pairs, MaxIn, Sat;
+            public int Served, Emptied;
+
+            public PeerCounters(int tiers)
+            {
+                Cand = new int[tiers]; ExUnlim = new int[tiers]; ExFirst = new int[tiers];
+                ExOwner = new int[tiers]; Thr = new int[tiers]; Packed = new int[tiers];
+                Pairs = new int[tiers]; MaxIn = new int[tiers]; Sat = new int[tiers];
+            }
+
+            public void ResetWindow()
+            {
+                Array.Clear(Cand, 0, Cand.Length); Array.Clear(ExUnlim, 0, ExUnlim.Length);
+                Array.Clear(ExFirst, 0, ExFirst.Length); Array.Clear(ExOwner, 0, ExOwner.Length);
+                Array.Clear(Thr, 0, Thr.Length); Array.Clear(Packed, 0, Packed.Length);
+                Array.Clear(Pairs, 0, Pairs.Length); Array.Clear(MaxIn, 0, MaxIn.Length);
+                Array.Clear(Sat, 0, Sat.Length);
+                Served = 0; Emptied = 0;
+            }
+        }
+
+        private static readonly Dictionary<long, PeerCounters> s_counters =
+            new Dictionary<long, PeerCounters>();
+        private static int s_tiers;
+
+        internal static PeerCounters CountersFor(long uid, string name)
+        {
+            if (!s_counters.TryGetValue(uid, out var c))
+            {
+                c = new PeerCounters(s_tiers);
+                s_counters[uid] = c;
+            }
+            c.Name = string.IsNullOrEmpty(name) ? uid.ToString() : name;
+            return c;
+        }
 
         static SendTiers()
         {
             s_tiers = Plugin.SendTierEdges.Length;
             s_edgeSq = new float[s_tiers];
-            s_period = new float[s_tiers];
+            s_stride = new int[s_tiers];
             for (int i = 0; i < s_tiers; i++)
             {
                 float e = Plugin.SendTierEdges[i];
                 s_edgeSq[i] = e >= float.MaxValue * 0.5f ? float.MaxValue : e * e;
-
-                // Due slightly early on purpose. Sends arrive on a jittery
-                // ~50ms cadence (DebugPeerSendHz over a ~30Hz loop), so an exact
-                // 1/N deadline gets missed by a few ms and slips a whole
-                // interval — a 10/s cap would measure 6.7/s.
-                float hz = i < Plugin.SendTierHz.Length ? Plugin.SendTierHz[i] : 0f;
-                s_period[i] = hz <= 0f ? 0f : Mathf.Max(0f, 1f / hz - 0.5f / Mathf.Max(1f, Plugin.DebugPeerSendHz));
+                s_stride[i] = i < Plugin.SendTierEveryNth.Length
+                    ? Mathf.Max(1, Plugin.SendTierEveryNth[i])
+                    : 1;
             }
-            s_cand = new int[s_tiers]; s_exempt = new int[s_tiers]; s_thr = new int[s_tiers];
-            s_packed = new int[s_tiers]; s_pairs = new int[s_tiers];
-            s_maxIn = new int[s_tiers]; s_sat = new int[s_tiers];
         }
+
 
         internal static string Describe()
         {
             var parts = new List<string>();
             for (int i = 0; i < s_tiers; i++)
             {
-                float hz = i < Plugin.SendTierHz.Length ? Plugin.SendTierHz[i] : 0f;
                 string edge = Plugin.SendTierEdges[i] >= float.MaxValue * 0.5f
                     ? "inf" : $"{Plugin.SendTierEdges[i]:F0}m";
-                parts.Add(hz <= 0f ? $"<{edge} unlimited" : $"<{edge} {hz:F0}/s (every {s_period[i] * 1000f:F0}ms)");
+                // Rate is derived for readability only; the stride is the truth.
+                parts.Add(s_stride[i] <= 1
+                    ? $"<{edge} every send"
+                    : $"<{edge} every {s_stride[i]}th (~{Plugin.DebugPeerSendHz / s_stride[i]:F1}/s)");
             }
             return string.Join(", ", parts);
         }
@@ -4124,9 +4210,18 @@ namespace ServerZoneOwnership
         {
             if (objects == null || objects.Count == 0) return;
             var map = SendTarget.Map;
-            if (map == null) return;
+            var ctr = SendTarget.Counters;
+            if (map == null || ctr == null) return;
 
-            float now = Time.time;
+            // This send's opportunity number for this peer. Incremented here
+            // because Filter runs exactly once per send that got as far as
+            // building a candidate list — a send refused by the byte gate never
+            // reaches us, and should not advance anyone's turn.
+            s_seq.TryGetValue(SendTarget.Uid, out int seq);
+            seq++;
+            s_seq[SendTarget.Uid] = seq;
+            SendTarget.Seq = seq;
+
             int w = 0;
             for (int r = 0; r < objects.Count; r++)
             {
@@ -4139,18 +4234,18 @@ namespace ServerZoneOwnership
                     // per candidate on a path that can see 600k/sec.
                     float sq = d.x * d.x + d.z * d.z;
                     int t = TierOf(sq);
-                    s_cand[t]++;
+                    ctr.Cand[t]++;
 
-                    if (s_period[t] <= 0f) s_exempt[t]++;                 // tier unlimited
-                    else if (!map.TryGetValue(zdo.m_uid, out var s)) s_exempt[t]++;   // first delivery
-                    else if (zdo.OwnerRevision != s.OwnerRev) s_exempt[t]++;          // ownership must not wait
-                    else if (now - s.At < s_period[t]) { keep = false; s_thr[t]++; }
+                    if (s_stride[t] <= 1) ctr.ExUnlim[t]++;                  // every send allowed
+                    else if (!map.TryGetValue(zdo.m_uid, out var s)) ctr.ExFirst[t]++;  // peer has never seen it
+                    else if (zdo.OwnerRevision != s.OwnerRev) ctr.ExOwner[t]++;         // ownership must not wait
+                    else if (seq - s.LastSend < s_stride[t]) { keep = false; ctr.Thr[t]++; }
                 }
                 if (keep) objects[w++] = objects[r];
             }
             if (w < objects.Count) objects.RemoveRange(w, objects.Count - w);
-            s_served++;
-            if (w == 0) s_emptied++;
+            ctr.Served++;
+            if (w == 0) ctr.Emptied++;
         }
 
         /// <summary>Called from the ZDO.Serialize postfix: this ZDO really was packed.</summary>
@@ -4161,10 +4256,10 @@ namespace ServerZoneOwnership
 
             Vector3 d = zdo.GetPosition() - SendTarget.RefPos;
             int t = TierOf(d.x * d.x + d.z * d.z);
-            s_packed[t]++;
+            if (SendTarget.Counters != null) SendTarget.Counters.Packed[t]++;
 
             map.TryGetValue(zdo.m_uid, out var s);
-            s.At = Time.time;
+            s.LastSend = SendTarget.Seq;
             s.OwnerRev = zdo.OwnerRevision;
             s.Tier = (byte)t;
             if (s.InWindow < ushort.MaxValue) s.InWindow++;
@@ -4176,7 +4271,12 @@ namespace ServerZoneOwnership
             foreach (var m in s_byPeer.Values) m.Remove(id);
         }
 
-        internal static void DropPeer(long uid) => s_byPeer.Remove(uid);
+        internal static void DropPeer(long uid)
+        {
+            s_byPeer.Remove(uid);
+            s_seq.Remove(uid);
+            s_counters.Remove(uid);
+        }
 
         private static readonly List<ZDOID> s_scratch = new List<ZDOID>();
 
@@ -4187,11 +4287,13 @@ namespace ServerZoneOwnership
         /// </summary>
         internal static void EmitAndPrune(float window, bool print)
         {
-            for (int i = 0; i < s_tiers; i++) { s_pairs[i] = 0; s_maxIn[i] = 0; s_sat[i] = 0; }
-
+            // Fold the per-(peer,ZDO) map into the owning peer's counters, so
+            // pairs/max/sat are attributed to the player they describe.
             foreach (var kv in s_byPeer)
             {
                 var map = kv.Value;
+                if (!s_counters.TryGetValue(kv.Key, out var ctr)) continue;
+                for (int i = 0; i < s_tiers; i++) { ctr.Pairs[i] = 0; ctr.MaxIn[i] = 0; ctr.Sat[i] = 0; }
 
                 // Snapshot the keys: the pass both removes stale entries and
                 // rewrites surviving ones, and a Dictionary cannot be mutated
@@ -4212,39 +4314,157 @@ namespace ServerZoneOwnership
                     }
 
                     int t = s.Tier < s_tiers ? s.Tier : s_tiers - 1;
-                    s_pairs[t]++;
-                    if (s.InWindow > s_maxIn[t]) s_maxIn[t] = s.InWindow;
-                    float hz = t < Plugin.SendTierHz.Length ? Plugin.SendTierHz[t] : 0f;
-                    if (hz > 0f && s.InWindow / window >= 0.8f * hz) s_sat[t]++;
+                    ctr.Pairs[t]++;
+                    if (s.InWindow > ctr.MaxIn[t]) ctr.MaxIn[t] = s.InWindow;
+                    // Saturated = took at least 80% of the sends its stride
+                    // permits. Expressed in opportunities, so no rate maths:
+                    // the ceiling for this window is served/stride.
+                    int ceiling = s_stride[t] <= 1 ? ctr.Served : ctr.Served / s_stride[t];
+                    if (ceiling > 0 && s.InWindow >= 0.8f * ceiling) ctr.Sat[t]++;
 
                     s.InWindow = 0;
                     map[id] = s;
                 }
             }
 
-            if (print && s_served > 0)
+            // One block per player. Timestamped (v0.7.35) because without it the
+            // lines cannot be aligned to [Perf], to wall clock, or to each other
+            // when building a time series after the fact.
+            foreach (var kv in s_counters)
             {
-                Plugin.Log.LogMessage(
-                    $"===[TIERS {window:F1}s]=== sends={s_served} emptied={s_emptied} " +
-                    $"| caps: {Describe()}");
-                for (int t = 0; t < s_tiers; t++)
+                var c = kv.Value;
+                if (print && c.Served > 0)
                 {
-                    int offered = s_cand[t] - s_thr[t];
-                    int cut = offered - s_packed[t];
-                    float hz = t < Plugin.SendTierHz.Length ? Plugin.SendTierHz[t] : 0f;
-                    string edge = Plugin.SendTierEdges[t] >= float.MaxValue * 0.5f
-                        ? "inf" : $"{Plugin.SendTierEdges[t]:F0}m";
                     Plugin.Log.LogMessage(
-                        $"[Tier <{edge,-5} cap={(hz <= 0f ? "none" : hz.ToString("F0") + "/s"),-6}] " +
-                        $"cand={s_cand[t],-7} ex={s_exempt[t],-6} thr={s_thr[t],-7} " +
-                        $"off={offered,-7} pk={s_packed[t],-7} cut={cut,-7} " +
-                        $"pairs={s_pairs[t],-6} max={s_maxIn[t] / window,5:F1}/s sat={(s_pairs[t] > 0 ? 100 * s_sat[t] / s_pairs[t] : 0),3}%");
+                        $"[{Plugin.Stamp}] ===[TIERS {window:F1}s]=== peer={c.Name} " +
+                        $"sends={c.Served} emptied={c.Emptied} | caps: {Describe()}");
+                    for (int t = 0; t < s_tiers; t++)
+                    {
+                        int offered = c.Cand[t] - c.Thr[t];
+                        int cut = offered - c.Packed[t];
+                        string edge = Plugin.SendTierEdges[t] >= float.MaxValue * 0.5f
+                            ? "inf" : $"{Plugin.SendTierEdges[t]:F0}m";
+                        Plugin.Log.LogMessage(
+                            $"[{Plugin.Stamp}] [Tier {c.Name}] <{edge,-5} " +
+                            $"every={s_stride[t],-3} " +
+                            $"cand={c.Cand[t],-7} new={c.ExFirst[t],-6} own={c.ExOwner[t],-5} " +
+                            $"unl={c.ExUnlim[t],-6} thr={c.Thr[t],-7} " +
+                            $"off={offered,-7} pk={c.Packed[t],-7} cut={cut,-7} " +
+                            $"pairs={c.Pairs[t],-6} max={c.MaxIn[t] / window,5:F1}/s " +
+                            $"sat={(c.Pairs[t] > 0 ? 100 * c.Sat[t] / c.Pairs[t] : 0),3}%");
+                    }
                 }
+                c.ResetWindow();
             }
+        }
+    }
 
-            Array.Clear(s_cand, 0, s_tiers); Array.Clear(s_exempt, 0, s_tiers);
-            Array.Clear(s_thr, 0, s_tiers); Array.Clear(s_packed, 0, s_tiers);
-            s_served = 0; s_emptied = 0;
+    /// <summary>
+    /// v0.7.42: give projectiles their own priority band, just above Default.
+    ///
+    /// Vanilla's ServerSendCompare sorts the non-group-A remainder by
+    /// ObjectType DESCENDING: Terrain(3), Solid(2), Prioritized(1), Default(0).
+    /// Every projectile prefab measured on this server is Default, so a
+    /// gjall_spit_projectile 7m from your face queues behind every standing
+    /// tree and dungeon wall that happened to take damage. Measured 2026-10-05
+    /// with 8 players, near-tier candidates were being cut 45-84% by the packet
+    /// budget, so that ordering actively costs projectile updates — while the
+    /// damage itself travels as a routed RPC on a separate path that is NOT
+    /// packet-limited. Hence impacts and damage arriving before the projectile
+    /// that caused them.
+    ///
+    /// The cost of fixing it is negligible: projectiles are ~34 bytes a send
+    /// (a mob is ~250, a terrain blob ~6,000), so promoting the whole category
+    /// moves a few hundred bytes per packet.
+    ///
+    /// Resulting order: group A (other players, boats), Terrain, Solid,
+    /// Prioritized, PROJECTILES, Default.
+    ///
+    /// This is ORDERING ONLY. Projectiles still have to earn their turn through
+    /// the distance stride in ZDOMan_ServerSortSendZDOS_Tier_Patch — stride 1
+    /// inside 30m, stride 7 past 100m — exactly like everything else. Eligible
+    /// and ordered are separate questions, decided in separate places.
+    ///
+    /// Implementation note: because vanilla has already sorted by the time this
+    /// Postfix runs, every Default ZDO forms a contiguous run at the TAIL
+    /// (Default cannot be in group A, and sorts last within the remainder). So
+    /// we only locate that run and stable-partition projectiles to the front of
+    /// it. Everything above is untouched, and relative order is preserved, so
+    /// projectiles stay sorted by distance-minus-staleness among themselves.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDOMan), "ServerSortSendZDOS")]
+    internal static class ZDOMan_ServerSortSendZDOS_ProjectilePriority_Patch
+    {
+        // prefab hash -> is it a Projectile. Resolved once per prefab, then an
+        // int lookup on the hot path rather than a GetComponent call.
+        //
+        // Deliberately Projectile and NOT the IProjectile interface: Aoe also
+        // implements IProjectile but covers stationary zone effects
+        // (GoblinShaman_protect_aoe, Fenring_attack_flames_aoe), which do not
+        // fly at anyone and do not need promoting.
+        private static readonly Dictionary<int, bool> s_isProjectile = new Dictionary<int, bool>();
+
+        private static bool IsProjectile(int prefabHash)
+        {
+            if (s_isProjectile.TryGetValue(prefabHash, out bool v)) return v;
+            v = false;
+            var scene = ZNetScene.instance;
+            if (scene != null)
+            {
+                var prefab = scene.GetPrefab(prefabHash);
+                if (prefab != null) v = prefab.GetComponent<Projectile>() != null;
+            }
+            s_isProjectile[prefabHash] = v;
+            return v;
+        }
+
+        static void Postfix(List<ZDO> __0)
+        {
+            if (!Plugin.DebugProjectilePriority) return;
+            var objects = __0;
+            if (objects == null || objects.Count < 2) return;
+
+            // Walk back over the trailing Default run.
+            int start = objects.Count;
+            while (start > 0)
+            {
+                var z = objects[start - 1];
+                if (z == null || z.Type != ZDO.ObjectType.Default) break;
+                start--;
+            }
+            if (start >= objects.Count - 1) return;   // 0 or 1 Default entries
+
+            // Stable partition within [start, Count): projectiles first.
+            // Two passes into a scratch list keeps it stable and O(n); an
+            // in-place rotation would not preserve relative order.
+            s_front.Clear(); s_back.Clear();
+            for (int i = start; i < objects.Count; i++)
+            {
+                var z = objects[i];
+                if (z != null && IsProjectile(z.GetPrefab())) s_front.Add(z);
+                else s_back.Add(z);
+            }
+            if (s_front.Count == 0) return;           // nothing to promote
+
+            int w = start;
+            for (int i = 0; i < s_front.Count; i++) objects[w++] = s_front[i];
+            for (int i = 0; i < s_back.Count; i++) objects[w++] = s_back[i];
+
+            Promoted += s_front.Count;
+            Windows++;
+        }
+
+        private static readonly List<ZDO> s_front = new List<ZDO>();
+        private static readonly List<ZDO> s_back = new List<ZDO>();
+
+        internal static int Promoted, Windows;
+
+        internal static string Drain()
+        {
+            if (Windows == 0) return null;
+            string s = $"projPromoted={Promoted} over {Windows} sorts";
+            Promoted = 0; Windows = 0;
+            return s;
         }
     }
 
@@ -4304,6 +4524,165 @@ namespace ServerZoneOwnership
         static void OnRemove(ZNetPeer __0)
         {
             if (Plugin.DebugSendTiers && __0 != null) SendTiers.DropPeer(__0.m_uid);
+        }
+    }
+
+    /// <summary>
+    /// v0.7.39: report each CookingStation prefab's m_recordCrafter flag once.
+    ///
+    /// WHY: on 2026-10-05 the mystical forge produced infinite items and would
+    /// not release its mold. Cause is vanilla CookingStation.SpawnItem:
+    ///
+    ///   if (m_recordCrafter) {
+    ///       component.m_itemData.m_crafterID = Player.m_localPlayer.GetPlayerID();
+    ///
+    /// Player.m_localPlayer is NULL on a dedicated server, so that throws — and
+    /// the throw escapes RPC_RemoveDoneItem BEFORE its SetSlot(i, "", ...) and
+    /// its RPC_SetSlotVisual, so the slot keeps its item and can be harvested
+    /// again indefinitely. In vanilla the CLIENT owns the station and runs this
+    /// locally where m_localPlayer exists; our server ownership moved it to a
+    /// machine that has no local player. Textbook case of the hazard catalogued
+    /// in the local-player-concept notes.
+    ///
+    /// The cooking station, iron cooking station and oven share this exact code
+    /// and have never misbehaved, so they presumably leave the flag false —
+    /// but m_recordCrafter is prefab-serialised and therefore invisible in the
+    /// decompile. Only runtime can tell us, which is what this is for.
+    ///
+    /// Logs once per prefab, and only for stations that actually exist in a
+    /// loaded zone — Unity never runs Awake on an uninstantiated prefab asset,
+    /// so nothing unbuilt is revealed.
+    /// </summary>
+    [HarmonyPatch(typeof(CookingStation), "Awake")]
+    internal static class CookingStation_Awake_CrafterFlag_Patch
+    {
+        private static readonly HashSet<string> s_seen = new HashSet<string>();
+
+        static void Postfix(CookingStation __instance)
+        {
+            if (__instance == null) return;
+            string name = __instance.gameObject != null
+                ? __instance.gameObject.name.Replace("(Clone)", "")
+                : "?";
+
+            // THE FIX. Clearing the flag makes vanilla skip the block that
+            // dereferences Player.m_localPlayer, so SpawnItem completes, the
+            // slot is cleared and the mold is released. Measured 2026-10-06:
+            // piece_FrostFoundry is the only station with this set — the oven,
+            // cooking station and iron cooking station all leave it false,
+            // which is why only the Frost Foundry ever misbehaved.
+            //
+            // Cost: items from affected stations carry no "Crafted by" name.
+            // That is cosmetic, and the alternative (threading the sender's
+            // player id from RPC_RemoveDoneItem through to the spawned
+            // ItemDrop) needs three more patches on a method this plugin has
+            // no other reason to touch. Not worth the fragility for a label —
+            // this plugin has twice been broken by patch surface alone.
+            //
+            // Safe because the server is always the owner in our design, so
+            // this code path only ever runs where m_localPlayer is null. It
+            // does NOT affect clients: their own stations are unpatched.
+            bool wasRisky = __instance.m_recordCrafter;
+            if (wasRisky) __instance.m_recordCrafter = false;
+
+            if (!s_seen.Add(name)) return;
+
+            string line =
+                $"[{Plugin.Stamp}] [Station] {name} recordCrafter={wasRisky} " +
+                $"slots={(__instance.m_slots != null ? __instance.m_slots.Length : 0)} " +
+                $"spawnPoint={(__instance.m_spawnPoint != null)}";
+
+            if (wasRisky)
+                Plugin.Log.LogWarning(line +
+                    "  <-- would throw on harvest (infinite items); recordCrafter CLEARED by this plugin");
+            else
+                Plugin.Log.LogInfo(line);
+        }
+    }
+
+    /// <summary>
+    /// v0.7.41: measure terrain operations, and how many of them change nothing.
+    ///
+    /// WHY: a TerrainComp ZDO serialises its whole delta blob — measured at
+    /// 6,108 bytes per send, ~18x a mob update — and ObjectType.Terrain sorts
+    /// FIRST in ServerSendCompare. One terrain send therefore consumes ~60% of
+    /// a 10KB packet and outranks everything else, while projectiles sort LAST
+    /// (every projectile prefab logged on 2026-10-05 was /D = Default). With
+    /// near-tier objects already 45-84% cut at 8 players, a burst of terrain
+    /// ops would evict projectile position updates from the packets — while
+    /// damage travels separately as a routed RPC and is NOT packet-limited.
+    /// That matches the reported symptom: impacts and damage landing before the
+    /// projectile that caused them.
+    ///
+    /// And vanilla saves unconditionally:
+    ///   InternalDoOperation(pos, rot, modifier);
+    ///   Save(paintOnly);     // no check for whether anything actually moved
+    /// so an AoE on bare rock, already-flat ground, or terrain too hard to
+    /// deform still costs 6KB per compiler per peer. TerrainOp.Awake also loops
+    /// every heightmap in the op radius, so one blast can hit 2-4 compilers.
+    ///
+    /// This only MEASURES. It changes no behaviour. If no-ops turn out to be a
+    /// large share, the fix is to skip Save() when nothing changed.
+    /// </summary>
+    [HarmonyPatch(typeof(TerrainComp), "DoOperation")]
+    internal static class TerrainComp_DoOperation_Census_Patch
+    {
+        private static readonly FieldInfo s_modHeight = AccessTools.Field(typeof(TerrainComp), "m_modifiedHeight");
+        private static readonly FieldInfo s_levelDelta = AccessTools.Field(typeof(TerrainComp), "m_levelDelta");
+        private static readonly FieldInfo s_smoothDelta = AccessTools.Field(typeof(TerrainComp), "m_smoothDelta");
+        private static readonly FieldInfo s_modPaint = AccessTools.Field(typeof(TerrainComp), "m_modifiedPaint");
+
+        internal static int Ops, NoOps, Changed;
+        internal static readonly HashSet<string> Sectors = new HashSet<string>();
+
+        /// <summary>
+        /// Cheap digest of the delta arrays. Not a hash — a sum plus a count,
+        /// which is enough to tell "identical" from "something moved" and costs
+        /// one pass over ~1k entries rather than a copy.
+        /// </summary>
+        private static double Digest(TerrainComp c)
+        {
+            double d = 0;
+            if (s_modHeight.GetValue(c) is bool[] mh)
+                for (int i = 0; i < mh.Length; i++) if (mh[i]) d += 1.0;
+            if (s_modPaint.GetValue(c) is bool[] mp)
+                for (int i = 0; i < mp.Length; i++) if (mp[i]) d += 2.0;
+            if (s_levelDelta.GetValue(c) is float[] ld)
+                for (int i = 0; i < ld.Length; i++) d += ld[i];
+            if (s_smoothDelta.GetValue(c) is float[] sd)
+                for (int i = 0; i < sd.Length; i++) d += sd[i] * 3.0;
+            return d;
+        }
+
+        static void Prefix(TerrainComp __instance, out double __state)
+        {
+            __state = double.NaN;
+            if (__instance == null || ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            try { __state = Digest(__instance); } catch { }
+        }
+
+        static void Postfix(TerrainComp __instance, double __state)
+        {
+            if (__instance == null || double.IsNaN(__state)) return;
+            double after;
+            try { after = Digest(__instance); } catch { return; }
+
+            Ops++;
+            if (after == __state) NoOps++; else Changed++;
+            var s = ZoneSystem.GetZone(__instance.transform.position);
+            Sectors.Add($"{s.x},{s.y}");
+        }
+
+        /// <summary>Drained onto the [Perf] companion line; null when idle.</summary>
+        internal static string Drain()
+        {
+            if (Ops == 0) return null;
+            int bytesWasted = NoOps * 6108;
+            string s = $"terrainOps={Ops} changed={Changed} noop={NoOps} " +
+                       $"({(Ops > 0 ? 100 * NoOps / Ops : 0)}%) sectors={Sectors.Count} " +
+                       $"wastedPerPeer={bytesWasted / 1024}KB";
+            Ops = 0; NoOps = 0; Changed = 0; Sectors.Clear();
+            return s;
         }
     }
 
