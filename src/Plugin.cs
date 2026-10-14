@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.43";
+        public const string PluginVersion = "0.7.47";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -621,6 +621,7 @@ namespace ServerZoneOwnership
             var terrain = TerrainComp_DoOperation_Census_Patch.Drain();
             var proj = ZDOMan_ServerSortSendZDOS_ProjectilePriority_Patch.Drain();
             var rpcd = ZNetView_HandleRoutedRPC_Diag_Patch.Drain();
+            MountSyncDiag.Flush();
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
                             (terrain != null ? $" | {terrain}" : "") +
@@ -1727,6 +1728,120 @@ namespace ServerZoneOwnership
     [HarmonyPatch(typeof(ZDOMan), "ReleaseZDOS")]
     internal static class ZDOMan_ReleaseZDOS_Patch
     {
+        // v0.7.44 FIX (container stick): vanilla hands a container to the peer
+        // that opens it (Container.RPC_RequestOpen does SetOwner(uid)), but our
+        // 2s reclaim takes it back before that peer's client has set s_inUse=1
+        // — measured 310 reclaims against 309 grants, i.e. essentially every
+        // open. Ownership then flips repeatedly until the client's copy and
+        // ours disagree, the client routes RPC_RequestOpen to the stale owner,
+        // and vanilla answers "but im not the owner" with NO response at all,
+        // leaving the UI waiting forever. Captured live 2026-10-11 14:38-14:39.
+        //
+        // The previous attempt (writing s_inUse=1 ourselves) could never work:
+        // the new owner's UpdateUseVisual rewrites that field from its own
+        // local m_inUse, which is still false until the UI opens. So this
+        // guard holds state OUR side instead, and keys on revisions rather
+        // than on grants we handled — a client-to-client handoff never reaches
+        // the server, but the resulting OwnerRevision bump does arrive via ZDO
+        // sync, so we notice it either way.
+        //
+        // DataRevision is included because closing and reopening while already
+        // the owner does NOT bump OwnerRevision (SetOwner no-ops when the owner
+        // is unchanged). Both open and close write s_inUse, and ZDO.Set calls
+        // IncreaseDataRevision, so any interaction refreshes the grace. Cost is
+        // containers staying peer-owned while in active use, which is the safe
+        // direction: containers need next to no server-side simulation.
+        internal const float ContainerGraceSeconds = 10f;
+        private const float ContainerWatchExpirySeconds = 60f;
+        private const int ContainerWatchSweepEveryNPasses = 30;
+
+        private struct ContainerWatch
+        {
+            public ushort OwnerRev;
+            public uint DataRev;
+            public float Stamp;
+        }
+
+        private static readonly Dictionary<int, bool> s_containerPrefabCache = new Dictionary<int, bool>();
+        private static readonly Dictionary<ZDOID, ContainerWatch> s_containerWatch = new Dictionary<ZDOID, ContainerWatch>();
+        private static int s_containerWatchPassCount;
+        internal static int s_containerGraceSkips;
+
+        private static bool PrefabHasContainer(int prefabHash)
+        {
+            if (s_containerPrefabCache.TryGetValue(prefabHash, out bool known)) return known;
+            var prefab = ZNetScene.instance?.GetPrefab(prefabHash);
+            // Do NOT cache a negative when the lookup itself failed: the
+            // scene may not be ready yet, and caching false here would
+            // permanently exclude this prefab from every guard below.
+            if (prefab == null) return false;
+            bool has = prefab.GetComponent<Container>() != null;
+            s_containerPrefabCache[prefabHash] = has;
+            return has;
+        }
+
+        // Containers that drift out of the active sectors stop being visited,
+        // so their entries would leak. Swept rather than removed per-pass to
+        // keep the hot loop free of enumeration.
+        private static void SweepContainerWatch()
+        {
+            if (++s_containerWatchPassCount < ContainerWatchSweepEveryNPasses) return;
+            s_containerWatchPassCount = 0;
+            float now = Time.time;
+            List<ZDOID> drop = null;
+            foreach (var kv in s_containerWatch)
+            {
+                if (now - kv.Value.Stamp <= ContainerWatchExpirySeconds) continue;
+                (drop ?? (drop = new List<ZDOID>())).Add(kv.Key);
+            }
+            if (drop == null) return;
+            foreach (var id in drop) s_containerWatch.Remove(id);
+        }
+
+        // v0.7.44 diagnostic: is our 2s reclaim fighting vanilla's mount
+        // ownership handoff? Sadle.RPC_RequestControl does
+        // `GetZDO().SetOwner(sender)` when a player mounts, and
+        // Sadle.RPC_Controls opens with `if (!m_nview.IsOwner()) return;` — so
+        // every control input arriving while WE hold ownership is silently
+        // dropped. Suspected cause of a ridden mount stalling then skipping
+        // ahead. Keyed by prefab hash because the Sadle component is only
+        // discoverable via GetComponent on the prefab.
+        private static readonly Dictionary<int, bool> s_sadlePrefabCache = new Dictionary<int, bool>();
+        internal static int s_mountReclaimLivePeer;
+        internal static int s_mountLeftWithRider;
+        internal static int s_mountReclaimOther;
+
+        internal static bool IsSaddlePrefab(int prefabHash) => PrefabHasSadle(prefabHash);
+
+        private static bool PrefabHasSadle(int prefabHash)
+        {
+            if (s_sadlePrefabCache.TryGetValue(prefabHash, out bool known)) return known;
+            var prefab = ZNetScene.instance?.GetPrefab(prefabHash);
+            // Do NOT cache a negative when the lookup itself failed: the
+            // scene may not be ready yet, and caching false here would
+            // permanently exclude this prefab from every guard below.
+            if (prefab == null) return false;
+
+            // v0.7.46: `GetComponent<Sadle>()` on the root ALWAYS misses.
+            // Sadle.Awake does `GetComponentInParent<Character>()`, so the
+            // component sits on a CHILD, and Tameable.SetSaddle does
+            // `m_saddle.gameObject.SetActive(enabled)` — so that child is
+            // INACTIVE until a saddle is equipped. Hence includeInactive:true,
+            // with the serialised Tameable.m_saddle reference as a fallback in
+            // case the child is parented elsewhere.
+            bool has = prefab.GetComponentInChildren<Sadle>(true) != null;
+            if (!has)
+            {
+                var tameable = prefab.GetComponent<Tameable>();
+                has = tameable != null && tameable.m_saddle != null;
+            }
+            s_sadlePrefabCache[prefabHash] = has;
+            if (has)
+                Plugin.Log.LogInfo(
+                    $"[{Plugin.Stamp}] [Diag] Saddle-capable prefab detected: {prefab.name}");
+            return has;
+        }
+
         private static readonly List<ZDO> s_sectorBuffer = new List<ZDO>();
         private static readonly HashSet<ZDO> s_seenZdos = new HashSet<ZDO>();
 
@@ -1787,6 +1902,89 @@ namespace ServerZoneOwnership
                     // skip below, or a parked (server-owned) boat would never
                     // be handed over when someone boards it.
                     if (ShipOwnership.TryAssignToPeer(zdo)) continue;
+                    // v0.7.44 trace (bug #1): one line per pass per ridden
+                    // mount, whether or not we reclaim it. Placed BEFORE the
+                    // already-owned early-exit on purpose: once we hold the
+                    // mount, every later pass short-circuits there, so the
+                    // reclaim warning alone would go silent and be
+                    // indistinguishable from the diagnostic never firing.
+                    //
+                    // ownerIsUs=True on consecutive passes means ownership is
+                    // STABLE with us — Sadle.RequestControl is invoked once
+                    // from Interact and never re-requested, so one steal per
+                    // mount is the expected shape, not continuous churn. If
+                    // the mount still skips while this reads stable, ownership
+                    // is not the cause and the send rate is the next suspect.
+                    if (PrefabHasSadle(zdo.GetPrefab()))
+                    {
+                        long mountRider = zdo.GetLong(ZDOVars.s_user, 0L);
+                        if (mountRider != 0L)
+                        {
+                            long mountOwner = zdo.GetOwner();
+                            var mPrefab = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
+                            var mPos = zdo.GetPosition();
+                            Plugin.Log.LogInfo(
+                                $"[{Plugin.Stamp}] [Diag] Mount seen prefab={(mPrefab != null ? mPrefab.name : "?")} " +
+                                $"rider={mountRider} owner={mountOwner} ownerIsUs={(mountOwner == sessionId)} " +
+                                $"ownerLive={ServerCoverage.IsLivePeer(mountOwner)} " +
+                                $"ownerRev={zdo.OwnerRevision} dataRev={zdo.DataRevision} " +
+                                $"pos=world({mPos.x:F0},{mPos.z:F0})");
+                        }
+                    }
+                    // v0.7.47 FIX (bug #1): leave a ridden mount owned by its
+                    // rider, the way vanilla does.
+                    //
+                    // Sadle.RPC_RequestControl does `GetZDO().SetOwner(sender)`
+                    // when a player mounts, so in vanilla the rider's own client
+                    // owns and simulates the creature it is sitting on. Our
+                    // reclaim took that back, making the rider a NON-owner of
+                    // its own mount — and ZSyncTransform.SyncPosition then
+                    // dead-reckons for non-owners:
+                    //     m_targetPosTimer += dt (clamped to 2s)
+                    //     position += zdo.GetVec3(s_velHash) * m_targetPosTimer
+                    //     transform.position = (dist < 5f) ? Lerp(...) : position
+                    // so the rider's client projects the mount forward by
+                    // velocity x gap and HARD-SNAPS once that exceeds 5m.
+                    //
+                    // Measured 2026-10-13 while riding: 4 snap events, peak
+                    // projection 11.31m, on gaps of 672-3699ms. Windows holding
+                    // near the healthy 50ms gap produced none. An owner runs
+                    // OwnerSync instead and never extrapolates at all, so
+                    // handing ownership back removes this outright rather than
+                    // narrowing the window.
+                    //
+                    // NOTE s_user means different things per prefab: Sadle
+                    // writes `player.GetZDOID().UserID` (a PEER uid) whereas
+                    // ShipControlls writes `player.GetPlayerID()`. Confirmed
+                    // empirically — our MountSync line showed peer=2614171117
+                    // and rider=2614171117 for the same ride — so it is used
+                    // directly as the owner here, NOT resolved through
+                    // GetPlayerID() the way ShipOwnership has to.
+                    //
+                    // Placed BEFORE the already-owned early-exit because the
+                    // server currently owns ridden mounts; a guard after it
+                    // would never fire. A dead or absent rider falls through to
+                    // the normal reclaim, which is the cleanup path.
+                    if (PrefabHasSadle(zdo.GetPrefab()))
+                    {
+                        long mountRider = zdo.GetLong(ZDOVars.s_user, 0L);
+                        if (mountRider != 0L && ServerCoverage.IsLivePeer(mountRider))
+                        {
+                            long mountPrev = zdo.GetOwner();
+                            if (mountPrev != mountRider)
+                            {
+                                zdo.SetOwner(mountRider);
+                                var mPos2 = zdo.GetPosition();
+                                var mPf2 = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
+                                Plugin.Log.LogInfo(
+                                    $"[{Plugin.Stamp}] [Diag] Mount ownership → rider {mountRider} " +
+                                    $"(was {mountPrev}) prefab={(mPf2 != null ? mPf2.name : "?")} " +
+                                    $"pos=world({mPos2.x:F0},{mPos2.z:F0})");
+                            }
+                            System.Threading.Interlocked.Increment(ref s_mountLeftWithRider);
+                            continue;
+                        }
+                    }
                     if (zdo.GetOwner() == sessionId) continue;
                     // Skip ZDOs a peer is actively using (Container/wagon/etc.
                     // in-use flag). Vanilla hands ownership to the interacting
@@ -1806,6 +2004,46 @@ namespace ServerZoneOwnership
                     {
                         if (ServerCoverage.IsLivePeer(zdo.GetOwner())) continue;
                         zdo.Set(ZDOVars.s_inUse, 0);
+                    }
+                    // v0.7.44 FIX: grace period on a container a live peer has
+                    // just taken or touched. See ContainerGraceSeconds above
+                    // for why this keys on revisions rather than on grants.
+                    // Ordered after the s_inUse guard so an already-open
+                    // container short-circuits on vanilla's own flag first and
+                    // never needs an entry here.
+                    if (PrefabHasContainer(zdo.GetPrefab()))
+                    {
+                        bool liveOwner = ServerCoverage.IsLivePeer(zdo.GetOwner());
+                        bool watched = s_containerWatch.TryGetValue(zdo.m_uid, out var watch);
+                        if (liveOwner)
+                        {
+                            // Unknown counts as activity: after a restart a peer
+                            // may already be mid-open, and reclaiming to learn
+                            // otherwise is exactly the bug. Costs one grace
+                            // period per container, once.
+                            if (!watched || watch.OwnerRev != zdo.OwnerRevision
+                                         || watch.DataRev != zdo.DataRevision)
+                            {
+                                s_containerWatch[zdo.m_uid] = new ContainerWatch
+                                {
+                                    OwnerRev = zdo.OwnerRevision,
+                                    DataRev = zdo.DataRevision,
+                                    Stamp = Time.time,
+                                };
+                                System.Threading.Interlocked.Increment(ref s_containerGraceSkips);
+                                continue;
+                            }
+                            if (Time.time - watch.Stamp < ContainerGraceSeconds)
+                            {
+                                System.Threading.Interlocked.Increment(ref s_containerGraceSkips);
+                                continue;
+                            }
+                        }
+                        else if (watched)
+                        {
+                            // Owner is gone or is us — nothing to protect.
+                            s_containerWatch.Remove(zdo.m_uid);
+                        }
                     }
                     // v0.6.7: a hitched cart is in use too. Carts never set
                     // s_inUse — the only "busy" signal is s_attachJointHash,
@@ -1896,6 +2134,32 @@ namespace ServerZoneOwnership
                         }
                     }
 
+                    // v0.7.44 diagnostic: mount ownership churn. Fires only
+                    // for a saddled creature with a rider recorded (s_user).
+                    // A LIVE prevOwner means we are taking the mount away from
+                    // the player riding it, which drops their control input in
+                    // Sadle.RPC_Controls until the next handoff. Immediate
+                    // warning rather than a digest counter: this only happens
+                    // while somebody is mounted, so the volume is bounded, and
+                    // the per-event timing is the whole point.
+                    if (PrefabHasSadle(zdo.GetPrefab()))
+                    {
+                        long rider = zdo.GetLong(ZDOVars.s_user, 0L);
+                        if (rider != 0L)
+                        {
+                            var mountPos = zdo.GetPosition();
+                            var mountPrefab = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
+                            bool liveOwner = ServerCoverage.IsLivePeer(prevOwner);
+                            if (liveOwner) System.Threading.Interlocked.Increment(ref s_mountReclaimLivePeer);
+                            else System.Threading.Interlocked.Increment(ref s_mountReclaimOther);
+                            Plugin.Log.LogWarning(
+                                $"[{Plugin.Stamp}] [Diag] Mount reclaimed prefab={(mountPrefab != null ? mountPrefab.name : "?")} " +
+                                $"rider={rider} prevOwner={prevOwner} live={liveOwner} " +
+                                $"pos=world({mountPos.x:F0},{mountPos.z:F0}) " +
+                                $"ownerRev={zdo.OwnerRevision} dataRev={zdo.DataRevision}");
+                        }
+                    }
+
                     // v0.7.11: every SetOwner bumps OwnerRevision, and vanilla's
                     // ZDOPeer.ShouldSend returns true unconditionally when a
                     // peer's known OwnerRevision is behind — so each reclaim
@@ -1964,6 +2228,7 @@ namespace ServerZoneOwnership
                     }
                 }
             }
+            SweepContainerWatch();
             ReclaimStats.EndPass();
             return false;
         }
@@ -3597,7 +3862,8 @@ namespace ServerZoneOwnership
             // ZDO volume our reclaim alone put on the wire this window.
             int forcedSends = s_ownerChanges * Mathf.Max(peers, 1);
             string s = $"reclaims={s_ownerChanges}/{s_passes}pass (max {s_maxInPass}/pass) " +
-                       $"scanned={s_scanned} forcedZdoSends~{forcedSends}";
+                       $"scanned={s_scanned} forcedZdoSends~{forcedSends}" +
+                       $" containerGrace={System.Threading.Interlocked.Exchange(ref ZDOMan_ReleaseZDOS_Patch.s_containerGraceSkips, 0)} mountWithRider={System.Threading.Interlocked.Exchange(ref ZDOMan_ReleaseZDOS_Patch.s_mountLeftWithRider, 0)}";
             s_passes = 0; s_scanned = 0; s_ownerChanges = 0; s_maxInPass = 0;
             return s;
         }
@@ -4040,6 +4306,141 @@ namespace ServerZoneOwnership
     /// a no-op (every ZDO would look never-sent, so everything would be exempt)
     /// with nothing in the log saying so.
     /// </summary>
+    /// <summary>
+    /// v0.7.45 diagnostic (bug #1): measure the client-side extrapolation
+    /// window for a ridden mount, which is what option 1 (hand mount ownership
+    /// to the rider) would eliminate outright.
+    ///
+    /// ZSyncTransform.SyncPosition, on a NON-owner:
+    ///     if (zdo.DataRevision != m_posRevision) { m_posRevision = ...; m_targetPosTimer = 0f; }
+    ///     if (zdo.HasOwner()) {
+    ///         m_targetPosTimer += dt;  m_targetPosTimer = Min(m_targetPosTimer, 2f);
+    ///         position += zdo.GetVec3(s_velHash) * m_targetPosTimer;
+    ///     }
+    ///     transform.position = (dist &lt; 5f) ? Lerp(..., 0.2f) : position;   // SNAP past 5m
+    ///
+    /// So the rider's own client dead-reckons the thing it is sitting on, by
+    /// velocity x time-since-the-last-DataRevision-change, and hard-snaps once
+    /// that lands more than 5m from where it had it. That is the reported
+    /// "accelerates wildly, never properly on the ground".
+    ///
+    /// The timer resets on a DataRevision CHANGE, not on any send, so a resend
+    /// carrying an unchanged revision does not help the client at all — hence
+    /// we only count gaps between sends whose revision actually moved.
+    ///
+    /// extrap = vel * gap is the distance the rider's client projects ahead.
+    /// over5m counting above zero means real snaps, which is the visible skip.
+    /// If option 1 is right, this whole measurement becomes moot for the rider:
+    /// an owner runs OwnerSync and never extrapolates.
+    /// </summary>
+    internal static class MountSyncDiag
+    {
+        private struct Key
+        {
+            public long Peer;
+            public ZDOID Zdo;
+        }
+
+        private sealed class KeyCmp : IEqualityComparer<Key>
+        {
+            public bool Equals(Key a, Key b) => a.Peer == b.Peer && a.Zdo == b.Zdo;
+            public int GetHashCode(Key k) => k.Peer.GetHashCode() ^ k.Zdo.GetHashCode();
+        }
+
+        private sealed class Track
+        {
+            public float LastRevSendTime;
+            public uint LastDataRev;
+            public bool Primed;
+            public int Sends;
+            public int RevSends;
+            public float GapSum, GapMax;
+            public float VelSum, VelMax;
+            public float ExtrapSum, ExtrapMax;
+            public int Over5m;
+            public long Rider;
+            public string Prefab;
+        }
+
+        private static readonly Dictionary<Key, Track> s_tracks =
+            new Dictionary<Key, Track>(new KeyCmp());
+
+        // Called from SendTiers.RecordPacked, i.e. on an ACTUAL pack into a
+        // packet for SendTarget.Uid — not on a send attempt.
+        internal static void OnPacked(ZDO zdo, long peerUid)
+        {
+            if (zdo == null) return;
+            long rider = zdo.GetLong(ZDOVars.s_user, 0L);
+            if (rider == 0L) return;
+            if (!ZDOMan_ReleaseZDOS_Patch.IsSaddlePrefab(zdo.GetPrefab())) return;
+
+            var key = new Key { Peer = peerUid, Zdo = zdo.m_uid };
+            if (!s_tracks.TryGetValue(key, out var t))
+            {
+                t = new Track();
+                s_tracks[key] = t;
+            }
+            t.Rider = rider;
+            t.Sends++;
+            if (t.Prefab == null)
+            {
+                var p = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
+                t.Prefab = p != null ? p.name : "?";
+            }
+
+            uint rev = zdo.DataRevision;
+            if (!t.Primed)
+            {
+                t.Primed = true;
+                t.LastDataRev = rev;
+                t.LastRevSendTime = Time.time;
+                return;
+            }
+            if (rev == t.LastDataRev) return;   // carries nothing new; client's timer keeps running
+
+            float gap = Time.time - t.LastRevSendTime;
+            t.LastDataRev = rev;
+            t.LastRevSendTime = Time.time;
+
+            float vel = zdo.GetVec3(ZDOVars.s_velHash, Vector3.zero).magnitude;
+            float extrap = vel * Mathf.Min(gap, 2f);   // the client clamps its timer at 2s
+
+            t.RevSends++;
+            t.GapSum += gap; if (gap > t.GapMax) t.GapMax = gap;
+            t.VelSum += vel; if (vel > t.VelMax) t.VelMax = vel;
+            t.ExtrapSum += extrap; if (extrap > t.ExtrapMax) t.ExtrapMax = extrap;
+            if (extrap > 5f) t.Over5m++;
+        }
+
+        internal static void Flush()
+        {
+            if (s_tracks.Count == 0) return;
+            foreach (var kv in s_tracks)
+            {
+                var t = kv.Value;
+                if (t.RevSends == 0) continue;
+                Plugin.Log.LogInfo(
+                    $"[{Plugin.Stamp}] [Diag] MountSync peer={kv.Key.Peer} prefab={t.Prefab} " +
+                    $"rider={t.Rider} sends={t.Sends} revSends={t.RevSends} " +
+                    $"gapMs mean={(t.GapSum / t.RevSends) * 1000f:F0} max={t.GapMax * 1000f:F0} " +
+                    $"vel mean={t.VelSum / t.RevSends:F1} max={t.VelMax:F1} " +
+                    $"extrapM mean={t.ExtrapSum / t.RevSends:F2} max={t.ExtrapMax:F2} " +
+                    $"over5m={t.Over5m}");
+            }
+            // Keep the per-key timing anchors, reset only the accumulators, so
+            // a gap spanning a flush boundary is not silently dropped.
+            foreach (var kv in s_tracks)
+            {
+                var t = kv.Value;
+                t.Sends = 0; t.RevSends = 0;
+                t.GapSum = 0f; t.GapMax = 0f;
+                t.VelSum = 0f; t.VelMax = 0f;
+                t.ExtrapSum = 0f; t.ExtrapMax = 0f;
+                t.Over5m = 0;
+            }
+        }
+    }
+
     internal static class SendTarget
     {
         internal static bool Active;
@@ -4266,6 +4667,7 @@ namespace ServerZoneOwnership
             s.Tier = (byte)t;
             if (s.InWindow < ushort.MaxValue) s.InWindow++;
             map[zdo.m_uid] = s;
+            MountSyncDiag.OnPacked(zdo, SendTarget.Uid);
         }
 
         internal static void DropZdo(ZDOID id)
