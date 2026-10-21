@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.52";
+        public const string PluginVersion = "0.7.53";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -637,6 +637,7 @@ namespace ServerZoneOwnership
             var terrain = TerrainComp_DoOperation_Census_Patch.Drain();
             var proj = ZDOMan_ServerSortSendZDOS_ProjectilePriority_Patch.Drain();
             var rpcd = ZNetView_HandleRoutedRPC_Diag_Patch.Drain();
+            Incinerator_Diag_Patch.Poll();
             var zb = ZoneSystem_IsZoneReadyForType_Diag_Patch.Drain();
             if (zb != null) Log.LogWarning($"[{Stamp}] [Diag] {zb}");
             var dw = ZRoutedRpc_HandleRoutedRPC_DeadWindow_Patch.Drain();
@@ -5413,6 +5414,119 @@ namespace ServerZoneOwnership
         static void Prefix(out long __state) { __state = PassTimer.Now; }
         [HarmonyPriority(Priority.Last)]
         static void Postfix(long __state) { PassTimer.Record(PassTimer.ZoneLoad, __state); }
+    }
+
+    /// <summary>
+    /// v0.7.53 diagnostic (bug #8): why the Obliterator sometimes animates and
+    /// burns nothing.
+    ///
+    /// Narrowed by elimination 2026-10-21: 32 incinerate requests were logged
+    /// and vanilla's three refusal messages ("but im not the owner", "but it's
+    /// in use", "but it's empty") fired ZERO times. So every request passed the
+    /// RPC_RequestIncinerate gate and started the coroutine.
+    ///
+    /// Which leaves the one abort path with no logging — the re-check AFTER the
+    /// delay, in Incinerate():
+    ///     isInUse = true;
+    ///     InvokeRPC(Everybody, "RPC_AnimateLever");                 // animates FIRST
+    ///     yield return new WaitForSeconds(Random(m_effectDelayMin, m_effectDelayMax));
+    ///     InvokeRPC(Everybody, "RPC_AnimateLeverReturn");
+    ///     if (!m_nview.IsValid() || !m_nview.IsOwner() || m_container.IsInUse())
+    ///     { isInUse = false; yield break; }                         // silent
+    /// The lever has already played both ways by then, so an abort here is
+    /// indistinguishable from "pulled it, nothing happened".
+    ///
+    /// The coroutine body lives in a compiler-generated class, so rather than
+    /// patch mid-iterator this samples the three conditions across the delay
+    /// window and uses StopAOE as the success marker — `Invoke("StopAOE", 4f)`
+    /// sits immediately after the guard and runs on no other path.
+    ///
+    /// Suspect: our own 2s reclaim flipping container ownership, or m_inUse
+    /// going stale, during the delay. Same field as bug #2.
+    /// </summary>
+    [HarmonyPatch(typeof(Incinerator))]
+    internal static class Incinerator_Diag_Patch
+    {
+        private static readonly FieldInfo s_container =
+            AccessTools.Field(typeof(Incinerator), "m_container");
+        private static readonly FieldInfo s_nview =
+            AccessTools.Field(typeof(Incinerator), "m_nview");
+
+        private sealed class Watch
+        {
+            public float Started;
+            public bool Succeeded;
+            public string Worst;      // first bad state seen during the window
+        }
+
+        private static readonly Dictionary<Incinerator, Watch> s_watch =
+            new Dictionary<Incinerator, Watch>();
+
+        [HarmonyPostfix]
+        [HarmonyPatch("RPC_RequestIncinerate")]
+        static void AfterRequest(Incinerator __instance, long uid)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            s_watch[__instance] = new Watch { Started = Time.time };
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [Diag] Obliterator request uid={uid} " +
+                $"state={Describe(__instance)}");
+        }
+
+        // Invoke("StopAOE", 4f) sits immediately after the post-delay guard, so
+        // reaching it means the burn proceeded. Nothing else calls it.
+        [HarmonyPrefix]
+        [HarmonyPatch("StopAOE")]
+        static void OnStopAOE(Incinerator __instance)
+        {
+            if (s_watch.TryGetValue(__instance, out var w)) w.Succeeded = true;
+        }
+
+        internal static string Describe(Incinerator inc)
+        {
+            var nview = s_nview?.GetValue(inc) as ZNetView;
+            var cont = s_container?.GetValue(inc) as Container;
+            bool valid = nview != null && nview.IsValid();
+            bool owner = valid && nview.IsOwner();
+            bool inUse = cont != null && cont.IsInUse();
+            long own = (valid && nview.GetZDO() != null) ? nview.GetZDO().GetOwner() : 0L;
+            return $"valid={valid} owner={owner} ownerUid={own} containerInUse={inUse}";
+        }
+
+        // Called from the stats tick. Samples open windows so a condition that
+        // flips mid-delay is caught, and reports the outcome once the coroutine
+        // has had time to finish.
+        internal static void Poll()
+        {
+            if (s_watch.Count == 0) return;
+            List<Incinerator> done = null;
+            float now = Time.time;
+            foreach (var kv in s_watch)
+            {
+                var inc = kv.Key; var w = kv.Value;
+                if (inc == null) { (done ?? (done = new List<Incinerator>())).Add(inc); continue; }
+
+                if (w.Worst == null)
+                {
+                    string s = Describe(inc);
+                    if (s.Contains("owner=False") || s.Contains("containerInUse=True")
+                        || s.Contains("valid=False"))
+                        w.Worst = s;
+                }
+
+                // m_effectDelayMax is small; 10s is generous cover for the
+                // coroutine plus the 4s StopAOE delay.
+                if (now - w.Started < 10f) continue;
+                if (w.Succeeded)
+                    Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Diag] Obliterator BURNED ok");
+                else
+                    Plugin.Log.LogWarning(
+                        $"[{Plugin.Stamp}] [Diag] Obliterator ABORTED after animating — " +
+                        $"no StopAOE. badStateSeen={(w.Worst ?? "none(!)")} nowState={Describe(inc)}");
+                (done ?? (done = new List<Incinerator>())).Add(inc);
+            }
+            if (done != null) foreach (var k in done) s_watch.Remove(k);
+        }
     }
 
     /// <summary>
