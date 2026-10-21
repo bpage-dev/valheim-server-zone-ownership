@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.51";
+        public const string PluginVersion = "0.7.52";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -153,6 +153,22 @@ namespace ServerZoneOwnership
         // ordering — projectiles still pass the same distance stride as
         // everything else. false = vanilla ordering, one bool.
         internal const bool DebugProjectilePriority = true;
+
+        // v0.7.52 — BUG #7 KILL SWITCH. Set false to restore the pre-fix
+        // behaviour exactly (random-event spawners run in every zone that
+        // contains a player), then rebuild and restart. One line, no git.
+        //
+        // Scopes random-event spawning to zones inside the event area.
+        // SpawnSystem is per-zone and vanilla only asks "are there players in
+        // MY zone", never "is my zone near the event" — correct on a client
+        // where the only loaded zones surround the local player, who is inside
+        // the event area by definition, but wrong here because zones load
+        // around every peer. Result: an invasion at one base attacked players
+        // anywhere in the world.
+        //
+        // Gated on vanilla's own IsInsideRandomEventArea, and affects ONLY the
+        // event spawner list — see the isolation proof in the bug table.
+        internal const bool DebugScopeEventSpawns = true;
 
         // How often the [Nav] navmesh gauge prints. Ours, no vanilla default.
         // Raise it if the log gets noisy; the numbers are instantaneous
@@ -675,11 +691,12 @@ namespace ServerZoneOwnership
             // biome/geometry rejection (or spawner config), not our prefix.
             // If eventInv == 0 while an event is active, RandEventSystem's
             // GetCurrentSpawners is returning null — investigate that side.
-            if (eventInv > 0)
+            int evScoped = SpawnSystem_UpdateSpawning_Patch.s_eventSpawnScopedOut;
+            if (eventInv > 0 || evScoped > 0)
             {
                 Log.LogInfo(
                     $"[{Plugin.Stamp}] [Diag] SpawnSystem invocations in last {PeerAwareSummaryIntervalSeconds:F0}s: " +
-                    $"biome={biomeInv} event={eventInv}.");
+                    $"biome={biomeInv} event={eventInv} eventScopedOut={System.Threading.Interlocked.Exchange(ref SpawnSystem_UpdateSpawning_Patch.s_eventSpawnScopedOut, 0)}.");
             }
         }
 
@@ -1408,6 +1425,38 @@ namespace ServerZoneOwnership
 
         // Drained on a timer by Plugin.FlushSuppressedNRECount so we never
         // silently bury vanilla NREs — one summary line per interval.
+        private static readonly MethodInfo IsInsideEventAreaMethod =
+            AccessTools.Method(typeof(RandEventSystem), "IsInsideRandomEventArea",
+                new[] { typeof(RandomEvent), typeof(UnityEngine.Vector3) });
+        private static readonly FieldInfo ActiveEventField =
+            AccessTools.Field(typeof(RandEventSystem), "m_activeEvent");
+        internal static int s_eventSpawnScopedOut;
+
+        // v0.7.52 (bug #7): is THIS zone inside the active event's area?
+        // Uses vanilla's own geometry rather than a radius of our own, so the
+        // boundary matches exactly what a client would compute.
+        //
+        // Fails OPEN on any reflection or state surprise: if we cannot answer
+        // the question we let vanilla's behaviour stand, because the failure
+        // mode of a false negative is an invasion that never arrives, which is
+        // worse than the bug we are fixing.
+        private static bool ZoneInActiveEventArea(UnityEngine.Vector3 zonePos)
+        {
+            if (!Plugin.DebugScopeEventSpawns) return true;
+            var res = RandEventSystem.instance;
+            if (res == null || IsInsideEventAreaMethod == null || ActiveEventField == null) return true;
+            var active = ActiveEventField.GetValue(res) as RandomEvent;
+            if (active == null) return true;
+            try
+            {
+                return (bool)IsInsideEventAreaMethod.Invoke(res, new object[] { active, zonePos });
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
         internal static int s_suppressedNRECount;
 
         static bool Prefix(SpawnSystem __instance)
@@ -1442,11 +1491,13 @@ namespace ServerZoneOwnership
             }
 
             var currentSpawners = RandEventSystem.instance?.GetCurrentSpawners();
-            if (currentSpawners != null)
+            if (currentSpawners != null && ZoneInActiveEventArea(__instance.transform.position))
             {
                 System.Threading.Interlocked.Increment(ref SpawnDiag.s_eventSpawnInvocations);
                 InvokeUpdateSpawnList(__instance, currentSpawners, time, eventSpawners: true, "e_");
             }
+            else if (currentSpawners != null)
+                System.Threading.Interlocked.Increment(ref s_eventSpawnScopedOut);
 
             // Alt-biome spawners — added in build 25185644. Vanilla walks the
             // heightmap's corner alt-biomes and runs their spawn lists with a
