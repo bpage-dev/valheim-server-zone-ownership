@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.47";
+        public const string PluginVersion = "0.7.51";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -621,6 +621,14 @@ namespace ServerZoneOwnership
             var terrain = TerrainComp_DoOperation_Census_Patch.Drain();
             var proj = ZDOMan_ServerSortSendZDOS_ProjectilePriority_Patch.Drain();
             var rpcd = ZNetView_HandleRoutedRPC_Diag_Patch.Drain();
+            var zb = ZoneSystem_IsZoneReadyForType_Diag_Patch.Drain();
+            if (zb != null) Log.LogWarning($"[{Stamp}] [Diag] {zb}");
+            var dw = ZRoutedRpc_HandleRoutedRPC_DeadWindow_Patch.Drain();
+            if (dw != null) Log.LogWarning($"[{Stamp}] [Diag] {dw}");
+            var cs = ZNetScene_CreateObjectsSorted_Diag_Patch.Drain();
+            if (cs != null) Log.LogInfo($"[{Stamp}] [Diag] {cs}");
+            var lp = Procreation_Diag_Patch.Drain();
+            if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
             MountSyncDiag.Flush();
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
@@ -4333,6 +4341,129 @@ namespace ServerZoneOwnership
     /// If option 1 is right, this whole measurement becomes moot for the rider:
     /// an owner runs OwnerSync and never extrapolates.
     /// </summary>
+    /// <summary>
+    /// v0.7.48 diagnostic, requested 2026-10-18. Deliberately opaque.
+    ///
+    /// The user wants to know whether a particular consumable's intended effect
+    /// is firing, WITHOUT being told what that effect is. So this logs under the
+    /// neutral tag `[Diag] LP`, reports a prefab HASH rather than a name (the
+    /// creature involved would hint at the mechanic), and uses numeric codes in
+    /// place of descriptive field names. The user reads their own server log, so
+    /// the log itself must not spoil anything either.
+    ///
+    /// DO NOT record the code legend in memory — the user reads those files.
+    /// Re-derive it from the gate order in the patched method if needed.
+    ///
+    /// Method: snapshot the relevant ZDO state in a Prefix, re-read it in a
+    /// Postfix, and report the transition. That avoids having to know which
+    /// internal branch ran, and avoids reimplementing vanilla's logic.
+    ///
+    /// One gate is a random roll and is deliberately NOT evaluated here:
+    /// sampling UnityEngine.Random in our patch would consume a value from the
+    /// shared generator and change vanilla's own outcomes. So `b=9` means every
+    /// checkable precondition passed and the roll or an instance-count cap
+    /// decided it — not that something is broken.
+    ///
+    /// Relevance to this plugin: the patched method early-returns unless
+    /// `m_nview.IsOwner()`, and our server ownership means the SERVER now runs
+    /// it where vanilla ran it on a client. There is no Player.m_localPlayer
+    /// reference in that class, so no Pattern C hazard, but `o=F` appearing
+    /// would mean it is running nowhere at all, which is the silent-failure
+    /// case worth catching.
+    /// </summary>
+    [HarmonyPatch(typeof(Procreation), "Procreate")]
+    internal static class Procreation_Diag_Patch
+    {
+        private static readonly FieldInfo s_nview = AccessTools.Field(typeof(Procreation), "m_nview");
+        private static readonly FieldInfo s_tameable = AccessTools.Field(typeof(Procreation), "m_tameable");
+        private static readonly FieldInfo s_baseAI = AccessTools.Field(typeof(Procreation), "m_baseAI");
+
+        private static int s_calls, s_advanced, s_fired, s_completed;
+        private static readonly Dictionary<int, int> s_blocks = new Dictionary<int, int>();
+
+        private struct Snap
+        {
+            public bool Valid;
+            public int Points;
+            public long Stage2;
+            public bool Owner;
+            public bool Enabled;
+            public int Block;
+        }
+
+        private static Snap Read(Procreation p)
+        {
+            var snap = default(Snap);
+            var nview = s_nview?.GetValue(p) as ZNetView;
+            if (nview == null || !nview.IsValid()) return snap;
+            var zdo = nview.GetZDO();
+            if (zdo == null) return snap;
+
+            snap.Valid = true;
+            snap.Owner = nview.IsOwner();
+            snap.Points = zdo.GetInt(ZDOVars.s_lovePoints);
+            snap.Stage2 = zdo.GetLong(ZDOVars.s_pregnant, 0L);
+
+            var tam = s_tameable?.GetValue(p) as Tameable;
+            var ai = s_baseAI?.GetValue(p) as BaseAI;
+            snap.Enabled = tam != null && tam.IsTamed();
+
+            // Checkable gates, in the order vanilla evaluates them. 9 = all
+            // checkable ones passed; the undetermined roll decides from there.
+            if (!snap.Owner) snap.Block = 1;
+            else if (!snap.Enabled) snap.Block = 2;
+            else if (snap.Stage2 != 0L) snap.Block = 3;
+            else if (ai != null && ai.IsAlerted()) snap.Block = 4;
+            else if (tam != null && tam.IsHungry()) snap.Block = 5;
+            else snap.Block = 9;
+            return snap;
+        }
+
+        static void Prefix(Procreation __instance, out Snap __state)
+        {
+            __state = (ZNet.instance != null && ZNet.instance.IsServer())
+                ? Read(__instance) : default(Snap);
+        }
+
+        static void Postfix(Procreation __instance, Snap __state)
+        {
+            if (!__state.Valid) return;
+            var after = Read(__instance);
+            if (!after.Valid) return;
+
+            s_calls++;
+            string what = null;
+            if (after.Points > __state.Points) { s_advanced++; what = "adv"; }
+            else if (__state.Stage2 == 0L && after.Stage2 != 0L) { s_fired++; what = "FIRED"; }
+            else if (__state.Stage2 != 0L && after.Stage2 == 0L) { s_completed++; what = "DONE"; }
+            else
+            {
+                s_blocks.TryGetValue(__state.Block, out int c);
+                s_blocks[__state.Block] = c + 1;
+                return;   // uninteresting; counted and drained in the summary
+            }
+
+            var nview = s_nview?.GetValue(__instance) as ZNetView;
+            var zdo = nview?.GetZDO();
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [Diag] LP {what} z={(zdo != null ? zdo.m_uid.ToString() : "?")} " +
+                $"p={(zdo != null ? zdo.GetPrefab() : 0)} o={(__state.Owner ? "T" : "F")} " +
+                $"n={__state.Points}->{after.Points}/{__instance.m_requiredLovePoints} " +
+                $"s2={(__state.Stage2 != 0L ? 1 : 0)}->{(after.Stage2 != 0L ? 1 : 0)} b={__state.Block}");
+        }
+
+        internal static string Drain()
+        {
+            if (s_calls == 0 && s_blocks.Count == 0) return null;
+            string blocks = string.Join(" ", s_blocks.OrderBy(kv => kv.Key)
+                .Select(kv => $"{kv.Key}:{kv.Value}"));
+            string s = $"LP calls={s_calls} adv={s_advanced} fired={s_fired} done={s_completed} b[{blocks}]";
+            s_calls = 0; s_advanced = 0; s_fired = 0; s_completed = 0;
+            s_blocks.Clear();
+            return s;
+        }
+    }
+
     internal static class MountSyncDiag
     {
         private struct Key
@@ -5191,6 +5322,10 @@ namespace ServerZoneOwnership
 
         private static readonly double s_msPerTick = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
+        // v0.7.49: microseconds, for the per-invocation createSorted diagnostic.
+        internal static long ElapsedUs(long startTicks) =>
+            (long)((Now - startTicks) * s_msPerTick * 1000.0);
+
         internal static long Now => System.Diagnostics.Stopwatch.GetTimestamp();
 
         internal static void Record(int pass, long startTicks)
@@ -5227,6 +5362,390 @@ namespace ServerZoneOwnership
         static void Prefix(out long __state) { __state = PassTimer.Now; }
         [HarmonyPriority(Priority.Last)]
         static void Postfix(long __state) { PassTimer.Record(PassTimer.ZoneLoad, __state); }
+    }
+
+    /// <summary>
+    /// v0.7.51 diagnostic (bug #6): name the zone and the object that is
+    /// blocking player creation.
+    ///
+    /// Heimdall was stuck in a teleporter for 54 minutes on 2026-10-20, alone
+    /// on the server, and two full relogs did not clear it — only a restart
+    /// did. The dead-window diagnostic showed 10 dropped-RPC spans against
+    /// their player ZDO with `uncreated=1`, so it is NOT the creation backlog.
+    ///
+    /// The mechanism is ZoneSystem.IsZoneReadyForType:
+    ///     foreach (ZDO item in m_loadingObjectsInZones[zoneID])
+    ///         if ((int)objectType &lt; (int)item.Type) return false;
+    /// A Player is Prioritized (1), so anything Solid (2) or Terrain (3) still
+    /// registered as "loading" in that zone blocks the player from ever being
+    /// instantiated — and CreateObjectsSorted just `continue`s past it every
+    /// frame, forever, without consuming budget. No GameObject means every RPC
+    /// to that player dies silently at the FindInstance null check.
+    ///
+    /// Only LocationProxy and DungeonGenerator ever register as loading, and
+    /// LocationProxy.SpawnLocation has a stuck path:
+    ///     m_instance = ZoneSystem.instance.SpawnProxyLocation(...);
+    ///     if (m_instance == null) return false;    // returns WITHOUT unsetting
+    /// so a proxy that can never spawn keeps its zone blocked for its lifetime.
+    /// That it survived a relog fits: the registry is keyed by ZONE, not player.
+    ///
+    /// Reports the longest-blocked zone and what is blocking it, because
+    /// duration is what separates a normal load from the bug.
+    /// </summary>
+    [HarmonyPatch(typeof(ZoneSystem), nameof(ZoneSystem.IsZoneReadyForType))]
+    internal static class ZoneSystem_IsZoneReadyForType_Diag_Patch
+    {
+        private static readonly FieldInfo s_loading =
+            AccessTools.Field(typeof(ZoneSystem), "m_loadingObjectsInZones");
+
+        private struct Block { public long FirstAt; public int Hits; public string Blockers; }
+        private static readonly Dictionary<Vector2s, Block> s_blocked = new Dictionary<Vector2s, Block>();
+        private static int s_denials;
+
+        private static long NowMs => (long)(Time.realtimeSinceStartup * 1000f);
+
+        static void Postfix(ZoneSystem __instance, Vector2s zoneID, ZDO.ObjectType objectType, bool __result)
+        {
+            if (__result) { s_blocked.Remove(zoneID); return; }
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            // Only Prioritized matters here: that is the band a Player sits in.
+            if (objectType != ZDO.ObjectType.Prioritized) return;
+
+            s_denials++;
+            s_blocked.TryGetValue(zoneID, out var b);
+            if (b.FirstAt == 0) b.FirstAt = NowMs;
+            b.Hits++;
+
+            // Resolve the blockers only on first sight — this runs per ZDO per
+            // frame and GetPrefab is not free.
+            if (b.Blockers == null)
+            {
+                b.Blockers = "?";
+                var map = s_loading?.GetValue(__instance) as Dictionary<Vector2s, List<ZDO>>;
+                if (map != null && map.TryGetValue(zoneID, out var list) && list != null)
+                {
+                    var names = new List<string>();
+                    var scene = ZNetScene.instance;
+                    foreach (var z in list)
+                    {
+                        if (z == null) continue;
+                        var pf = scene?.GetPrefab(z.GetPrefab());
+                        names.Add($"{(pf != null ? pf.name : "?")}/{z.Type}");
+                        if (names.Count >= 4) break;
+                    }
+                    if (names.Count > 0) b.Blockers = string.Join(",", names);
+                }
+            }
+            s_blocked[zoneID] = b;
+        }
+
+        internal static string Drain()
+        {
+            if (s_denials == 0) return null;
+            long now = NowMs; long worst = 0; string what = "?"; string zone = "?";
+            foreach (var kv in s_blocked)
+            {
+                long age = now - kv.Value.FirstAt;
+                if (age > worst) { worst = age; what = kv.Value.Blockers; zone = $"{kv.Key.x},{kv.Key.y}"; }
+            }
+            string s = $"zoneBlock denials={s_denials} zonesBlocked={s_blocked.Count} " +
+                       $"longest={worst / 1000}s zone={zone} by={what}";
+            s_denials = 0;
+            return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.51 diagnostic (bug #6): mark teleports server-side.
+    ///
+    /// Vanilla logs "Teleporting &lt;name&gt;" in TeleportWorld.Teleport, but that
+    /// is reached from Interact and runs on the CLIENT that pressed the key —
+    /// and Player.TeleportTo bounces straight to the owner if it is not one, so
+    /// the whole sequence is client-side. Confirmed absent from our log.
+    ///
+    /// A position jump is the only reliable server-side signal: nothing moves
+    /// hundreds of metres in one tick legitimately. Catches deaths and respawns
+    /// too, which matters because respawns were what interrupted the dungeon
+    /// window in [[valheim-timeline-table]].
+    ///
+    /// The point is correlation: pairing "Teleport peer=X" against a
+    /// "DeadWindow prefab=Player" that starts moments later is what turns bug
+    /// #6 from a strong hypothesis into a confirmed trigger.
+    /// </summary>
+    [HarmonyPatch(typeof(ZoneSystem), "Update")]
+    internal static class ZoneSystem_Update_TeleportMark_Patch
+    {
+        private const float JumpMetres = 100f;
+        private static readonly Dictionary<long, Vector3> s_lastPos = new Dictionary<long, Vector3>();
+
+        static void Postfix()
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            var peers = ZNet.instance.GetPeers();
+            if (peers == null) return;
+            foreach (var peer in peers)
+            {
+                if (peer == null) continue;
+                var now = peer.m_refPos;
+                if (s_lastPos.TryGetValue(peer.m_uid, out var prev))
+                {
+                    float d = Utils.DistanceXZ(prev, now);
+                    if (d >= JumpMetres)
+                    {
+                        Plugin.Log.LogWarning(
+                            $"[{Plugin.Stamp}] [Diag] Teleport peer={peer.m_playerName} " +
+                            $"from=world({prev.x:F0},{prev.z:F0}) to=world({now.x:F0},{now.z:F0}) " +
+                            $"dist={d:F0}m zone={ZoneSystem.GetZone(now).x},{ZoneSystem.GetZone(now).y}");
+                    }
+                }
+                s_lastPos[peer.m_uid] = now;
+            }
+        }
+    }
+
+    /// <summary>
+    /// v0.7.50 diagnostic: the post-teleport dead window.
+    ///
+    /// User report 2026-10-20: after teleporting, "something seemed off" and
+    /// chests could not be opened for at least a few seconds. That is this,
+    /// in vanilla ZRoutedRpc.HandleRoutedRPC:
+    ///
+    ///     ZDO zDO = ZDOMan.instance.GetZDO(data.m_targetZDO);
+    ///     if (zDO != null) {
+    ///         ZNetView v = ZNetScene.instance.FindInstance(zDO);
+    ///         if (v != null) v.HandleRoutedRPC(data);
+    ///         // else: dropped, no log, no response
+    ///     }
+    ///
+    /// Both exits are silent. A chest only opens if WE have instantiated its
+    /// GameObject, because Container.RPC_RequestOpen runs on the owner and
+    /// needs a live component to receive it. Until the per-frame creation
+    /// budget works down through Terrain, then Solid, to that chest, the
+    /// request hits nothing and the client waits forever for a reply.
+    ///
+    /// Note this sits one level ABOVE the v0.7.43 drop diagnostic, which only
+    /// fires once a ZNetView exists but lacks the handler. That one could never
+    /// see this class of failure.
+    ///
+    /// The number that matters is the DEAD WINDOW: how long a ZDO keeps
+    /// refusing interaction. So first failure per ZDO is timestamped, and when
+    /// an RPC for it finally lands the span is reported. Spans over
+    /// DeadWindowReportMs are logged individually; everything is counted.
+    ///
+    /// Affects every interaction RPC, not just containers — damage, pickup,
+    /// rename, hit. `hash` tells them apart.
+    /// </summary>
+    [HarmonyPatch(typeof(ZRoutedRpc), "HandleRoutedRPC")]
+    internal static class ZRoutedRpc_HandleRoutedRPC_DeadWindow_Patch
+    {
+        private const long DeadWindowReportMs = 400;
+
+        private static int s_noZdo, s_noInstance, s_ok, s_spans;
+        private static long s_spanMsMax, s_spanMsSum;
+        private struct Pend { public long At; public string Prefab; }
+        private static readonly Dictionary<ZDOID, Pend> s_firstFail = new Dictionary<ZDOID, Pend>();
+        private static readonly Dictionary<int, int> s_byHash = new Dictionary<int, int>();
+        private static readonly Dictionary<string, int> s_byPrefab = new Dictionary<string, int>();
+
+        private static long NowMs => (long)(Time.realtimeSinceStartup * 1000f);
+
+        static void Prefix(ZRoutedRpc.RoutedRPCData __0)
+        {
+            if (__0 == null) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (__0.m_targetZDO.IsNone()) return;   // global RPC, not an object interaction
+
+            var zdo = ZDOMan.instance?.GetZDO(__0.m_targetZDO);
+            if (zdo == null) { s_noZdo++; return; }
+
+            var scene = ZNetScene.instance;
+            var view = scene?.FindInstance(zdo);
+            if (view != null)
+            {
+                s_ok++;
+                // Did this ZDO just come back to life? Report how long it was dead.
+                if (s_firstFail.TryGetValue(__0.m_targetZDO, out var pend))
+                {
+                    long span = NowMs - pend.At;
+                    s_firstFail.Remove(__0.m_targetZDO);
+                    s_spans++; s_spanMsSum += span;
+                    if (span > s_spanMsMax) s_spanMsMax = span;
+                    if (span >= DeadWindowReportMs)
+                    {
+                        string nm = "?";
+                        if (scene != null)
+                        {
+                            var pf = scene.GetPrefab(zdo.GetPrefab());
+                            if (pf != null) nm = pf.name;
+                        }
+                        Plugin.Log.LogWarning(
+                            $"[{Plugin.Stamp}] [Diag] DeadWindow {span}ms prefab={nm} " +
+                            $"uncreated={ZNetScene_CreateObjectsSorted_Diag_Patch.s_lastUncreated} " +
+                            $"budget={ZNetScene_CreateObjectsSorted_Diag_Patch.s_lastBudget} " +
+                            $"handed={ZNetScene_CreateObjectsSorted_Diag_Patch.s_lastHanded} " +
+                            $"hash={__0.m_methodHash} zdo={__0.m_targetZDO}");
+                    }
+                }
+                return;
+            }
+
+            // No GameObject: the interaction is being silently thrown away.
+            s_noInstance++;
+
+            string pn = "?";
+            if (scene != null)
+            {
+                var pf = scene.GetPrefab(zdo.GetPrefab());
+                if (pf != null) pn = pf.name;
+            }
+            if (s_byPrefab.TryGetValue(pn, out int pc)) s_byPrefab[pn] = pc + 1;
+            else if (s_byPrefab.Count < 32) s_byPrefab[pn] = 1;
+
+            if (s_byHash.TryGetValue(__0.m_methodHash, out int hc)) s_byHash[__0.m_methodHash] = hc + 1;
+            else if (s_byHash.Count < 32) s_byHash[__0.m_methodHash] = 1;
+
+            // v0.7.51: carries the prefab so Drain can name the OLDEST stuck
+            // object. A permanently stuck one never emits a span — recovery is
+            // what produces the measurement — so without this the worst case is
+            // the one case that stays invisible. Heimdall sat stuck for 54
+            // minutes on 2026-10-20 and the spans stopped 16 minutes before the
+            // restart, which read as "resolved" and meant the opposite.
+            if (!s_firstFail.ContainsKey(__0.m_targetZDO) && s_firstFail.Count < 4096)
+                s_firstFail[__0.m_targetZDO] = new Pend { At = NowMs, Prefab = pn };
+        }
+
+        // v0.7.51: names the longest-stuck object, which is the only way a
+        // never-recovering one becomes visible.
+        private static string OldestPending()
+        {
+            if (s_firstFail.Count == 0) return "";
+            long now = NowMs; long worst = 0; string what = "?";
+            foreach (var kv in s_firstFail)
+            {
+                long age = now - kv.Value.At;
+                if (age > worst) { worst = age; what = kv.Value.Prefab; }
+            }
+            return $" oldestStuck={worst / 1000}s({what})";
+        }
+
+        internal static string Drain()
+        {
+            if (s_noInstance == 0 && s_noZdo == 0) return null;
+            string top = string.Join(" ", s_byPrefab.OrderByDescending(kv => kv.Value)
+                .Take(5).Select(kv => $"{kv.Key}x{kv.Value}"));
+            string hashes = string.Join(" ", s_byHash.OrderByDescending(kv => kv.Value)
+                .Take(4).Select(kv => $"{kv.Key}x{kv.Value}"));
+            string s = $"deadRPC noInstance={s_noInstance} noZdo={s_noZdo} ok={s_ok} " +
+                       $"spans={s_spans} spanMs(mean/max)=" +
+                       $"{(s_spans > 0 ? s_spanMsSum / s_spans : 0)}/{s_spanMsMax} " +
+                       $"pending={s_firstFail.Count} | {top} | hash {hashes}";
+            s_noZdo = 0; s_noInstance = 0; s_ok = 0;
+            s_spans = 0; s_spanMsSum = 0; s_spanMsMax = 0;
+            s_byHash.Clear(); s_byPrefab.Clear();
+            return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.49 diagnostic: attribute the travel-lag hitches.
+    ///
+    /// Established 2026-10-20 from the 2026-10-19 group night: felt lag tracks
+    /// `hitch/win` (1.16 travelling vs 0.18 stationary, 6x) and the only pass
+    /// that scales with it is createDestroy (max single invocation 244ms
+    /// travelling vs 58ms in a stationary battle). Stationary battles are
+    /// smooth however large; travel is not.
+    ///
+    /// The suspected chain, from ZNetScene.CreateObjectsSorted:
+    ///     int num = Mathf.Max(m_tempCurrentObjects2.Count / 100, maxCreatedPerFrame);
+    ///     m_tempCurrentObjects2.Sort(ZDOCompare);
+    /// 1. the per-frame creation budget SCALES with the backlog and has no
+    ///    ceiling — 10k uncreated means 100/frame, 50k means 500/frame;
+    /// 2. the whole uncreated list is sorted EVERY frame, O(n log n), even when
+    ///    only ten objects get created;
+    /// 3. our CreateDestroyObjects patch feeds it the UNION of every peer's
+    ///    sector walk, where vanilla only ever has one local player's area — so
+    ///    both costs scale with how dispersed the party is.
+    ///
+    /// This logs the three numbers that would confirm or refute it: the size of
+    /// the list we hand over, how much of it is uncreated (which drives both
+    /// the sort and the budget), and how many objects actually got made. If
+    /// `uncreated` spikes while travelling and tracks the frame cost, the chain
+    /// holds and the fix is the deferred round-robin refactor (BPTODO) — feed
+    /// one peer's area per frame instead of the union.
+    ///
+    /// Also splits create from remove, since our pass invokes both and only the
+    /// total was timed before.
+    /// </summary>
+    [HarmonyPatch(typeof(ZNetScene), "CreateObjectsSorted")]
+    internal static class ZNetScene_CreateObjectsSorted_Diag_Patch
+    {
+        private static readonly FieldInfo s_temp2 =
+            AccessTools.Field(typeof(ZNetScene), "m_tempCurrentObjects2");
+
+        internal static int s_calls;
+        internal static long s_usTotal;
+        internal static int s_usMax;
+        internal static int s_handedMax, s_uncreatedMax, s_createdMax, s_budgetMax;
+        internal static long s_handedSum, s_uncreatedSum, s_createdSum;
+        // Snapshot of the worst single invocation, which is the one that hitches.
+        internal static int s_worstHanded, s_worstUncreated, s_worstCreated, s_worstBudget;
+
+        // v0.7.50: live state from the MOST RECENT invocation, so the dead-window
+        // diagnostic can stamp the backlog that caused it onto its own line
+        // instead of relying on a 20s rollup to correlate after the fact.
+        internal static int s_lastHanded, s_lastUncreated, s_lastBudget;
+
+        static void Prefix(out long __state) { __state = PassTimer.Now; }
+
+        static void Postfix(ZNetScene __instance, List<ZDO> currentNearObjects,
+                            int maxCreatedPerFrame, ref int created, long __state)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+            int us = (int)PassTimer.ElapsedUs(__state);
+            // The list is cleared at the START of the next call, so reading it
+            // in a Postfix still shows what this invocation worked on.
+            var temp2 = s_temp2?.GetValue(__instance) as List<ZDO>;
+            int uncreated = temp2 != null ? temp2.Count : -1;
+            int handed = currentNearObjects != null ? currentNearObjects.Count : -1;
+            int budget = uncreated > 0
+                ? System.Math.Max(uncreated / 100, maxCreatedPerFrame)
+                : maxCreatedPerFrame;
+
+            s_calls++;
+            s_usTotal += us;
+            s_handedSum += handed > 0 ? handed : 0;
+            s_uncreatedSum += uncreated > 0 ? uncreated : 0;
+            s_createdSum += created;
+            if (handed > s_handedMax) s_handedMax = handed;
+            if (uncreated > s_uncreatedMax) s_uncreatedMax = uncreated;
+            if (created > s_createdMax) s_createdMax = created;
+            if (budget > s_budgetMax) s_budgetMax = budget;
+            s_lastHanded = handed; s_lastUncreated = uncreated; s_lastBudget = budget;
+            if (us > s_usMax)
+            {
+                s_usMax = us;
+                s_worstHanded = handed; s_worstUncreated = uncreated;
+                s_worstCreated = created; s_worstBudget = budget;
+            }
+        }
+
+        internal static string Drain()
+        {
+            if (s_calls == 0) return null;
+            string s = $"createSorted calls={s_calls} " +
+                       $"ms={s_usTotal / 1000} max={s_usMax / 1000}.{(s_usMax % 1000) / 100}ms " +
+                       $"handed(mean/max)={s_handedSum / s_calls}/{s_handedMax} " +
+                       $"uncreated(mean/max)={s_uncreatedSum / s_calls}/{s_uncreatedMax} " +
+                       $"created(mean/max)={s_createdSum / s_calls}/{s_createdMax} " +
+                       $"budgetMax={s_budgetMax} | worst: handed={s_worstHanded} " +
+                       $"uncreated={s_worstUncreated} created={s_worstCreated} budget={s_worstBudget}";
+            s_calls = 0; s_usTotal = 0; s_usMax = 0;
+            s_handedMax = 0; s_uncreatedMax = 0; s_createdMax = 0; s_budgetMax = 0;
+            s_handedSum = 0; s_uncreatedSum = 0; s_createdSum = 0;
+            s_worstHanded = 0; s_worstUncreated = 0; s_worstCreated = 0; s_worstBudget = 0;
+            return s;
+        }
     }
 
     [HarmonyPatch(typeof(ZNetScene), "CreateDestroyObjects")]
