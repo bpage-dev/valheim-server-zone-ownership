@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.53";
+        public const string PluginVersion = "0.7.54";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -644,6 +644,8 @@ namespace ServerZoneOwnership
             var terrain = TerrainComp_DoOperation_Census_Patch.Drain();
             var proj = ZDOMan_ServerSortSendZDOS_ProjectilePriority_Patch.Drain();
             var rpcd = ZNetView_HandleRoutedRPC_Diag_Patch.Drain();
+            var cdp = CreateDestroyPhases.Drain();
+            if (cdp != null) Log.LogInfo($"[{Stamp}] [Diag] {cdp}");
             Incinerator_Diag_Patch.Poll();
             var zb = ZoneSystem_IsZoneReadyForType_Diag_Patch.Drain();
             if (zb != null) Log.LogWarning($"[{Stamp}] [Diag] {zb}");
@@ -1657,6 +1659,8 @@ namespace ServerZoneOwnership
             // Character ZDOs still can't reach the distant list and bypass
             // terrain gating (the v0.4.1 mid-air-spawn bug). Peers overlap, so
             // dedup on the way in.
+            // v0.7.54: phase timing — see CreateDestroyPhases for why.
+            long tWalk = CreateDestroyPhases.Now;
             foreach (var pos in ServerCoverage.GetUniquePeerPositions())
             {
                 s_nearBuffer.Clear();
@@ -1668,8 +1672,13 @@ namespace ServerZoneOwnership
                     if (s_seenDistant.Add(zdo)) distantObjects.Add(zdo);
             }
 
+            long tCreate = CreateDestroyPhases.Now;
             ReflectionCache.ZNetScene_CreateObjects.Invoke(__instance, new object[] { currentObjects, distantObjects });
+            long tRemove = CreateDestroyPhases.Now;
             ReflectionCache.ZNetScene_RemoveObjects.Invoke(__instance, new object[] { currentObjects, distantObjects });
+            CreateDestroyPhases.Record(tWalk, tCreate, tRemove, CreateDestroyPhases.Now,
+                ZNet.instance.GetPeers().Count, currentObjects.Count,
+                distantObjects.Count, CreateDestroyPhases.LiveInstances(__instance));
             return false;
         }
     }
@@ -5533,6 +5542,91 @@ namespace ServerZoneOwnership
                 (done ?? (done = new List<Incinerator>())).Add(inc);
             }
             if (done != null) foreach (var k in done) s_watch.Remove(k);
+        }
+    }
+
+    /// <summary>
+    /// v0.7.54: split our CreateDestroyObjects pass into its three phases.
+    ///
+    /// Needed before the round-robin refactor can be designed. All we have today
+    /// is the total — `createDestroy=443ms/win (max 244ms)` — which cannot say
+    /// whether the cost is the per-peer sector walks, vanilla's creation, or
+    /// vanilla's removal. The three phases want different cadences and the right
+    /// design depends on which dominates:
+    ///
+    ///   walk   — FindSectorObjects once per unique peer position, unioned.
+    ///            Scales with peer count and dispersion. Sliceable per peer.
+    ///   create — vanilla CreateObjects. Sorts the UNCREATED subset each call and
+    ///            instantiates up to the budget. Drives post-teleport latency.
+    ///            Sliceable, and the phase we may want running every tick.
+    ///   remove — vanilla RemoveObjects. Iterates EVERY live instance and
+    ///            destroys anything absent from the lists handed in, so it must
+    ///            always see the full union. NOT sliceable. Likely the reason to
+    ///            keep a stride.
+    ///
+    /// If remove dominates, decoupling the cadences (create every tick, remove
+    /// strided) gets the latency win without the CPU cost, and the full
+    /// round-robin refactor is not needed. If walk dominates, slicing is the
+    /// answer and the refactor earns its risk.
+    /// </summary>
+    internal static class CreateDestroyPhases
+    {
+        private static readonly double s_msPerTick =
+            1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+        private static int s_passes;
+        private static double s_walkMs, s_createMs, s_removeMs;
+        private static double s_walkMax, s_createMax, s_removeMax;
+        private static long s_nearSum, s_distantSum, s_peerSum;
+        private static int s_nearMax, s_instancesMax;
+
+        // m_instances is what RemoveObjects iterates in full on every call, so
+        // its size is the scale factor for that phase.
+        private static readonly FieldInfo s_instancesField =
+            AccessTools.Field(typeof(ZNetScene), "m_instances");
+
+        internal static int LiveInstances(ZNetScene scene)
+        {
+            var col = s_instancesField?.GetValue(scene) as System.Collections.ICollection;
+            return col != null ? col.Count : -1;
+        }
+
+        internal static long Now => System.Diagnostics.Stopwatch.GetTimestamp();
+        private static double Ms(long from) => (Now - from) * s_msPerTick;
+
+        internal static void Record(long walkStart, long createStart, long removeStart,
+                                    long doneAt, int peers, int near, int distant,
+                                    int liveInstances)
+        {
+            double w = (createStart - walkStart) * s_msPerTick;
+            double c = (removeStart - createStart) * s_msPerTick;
+            double r = (doneAt - removeStart) * s_msPerTick;
+
+            s_passes++;
+            s_walkMs += w; s_createMs += c; s_removeMs += r;
+            if (w > s_walkMax) s_walkMax = w;
+            if (c > s_createMax) s_createMax = c;
+            if (r > s_removeMax) s_removeMax = r;
+            s_nearSum += near; s_distantSum += distant; s_peerSum += peers;
+            if (near > s_nearMax) s_nearMax = near;
+            if (liveInstances > s_instancesMax) s_instancesMax = liveInstances;
+        }
+
+        internal static string Drain()
+        {
+            if (s_passes == 0) return null;
+            string s = $"cdPhases passes={s_passes} " +
+                       $"walk={s_walkMs:F0}ms(max {s_walkMax:F1}) " +
+                       $"create={s_createMs:F0}ms(max {s_createMax:F1}) " +
+                       $"remove={s_removeMs:F0}ms(max {s_removeMax:F1}) | " +
+                       $"peers~{s_peerSum / s_passes} near~{s_nearSum / s_passes}/{s_nearMax} " +
+                       $"distant~{s_distantSum / s_passes} instancesMax={s_instancesMax}";
+            s_passes = 0;
+            s_walkMs = 0; s_createMs = 0; s_removeMs = 0;
+            s_walkMax = 0; s_createMax = 0; s_removeMax = 0;
+            s_nearSum = 0; s_distantSum = 0; s_peerSum = 0;
+            s_nearMax = 0; s_instancesMax = 0;
+            return s;
         }
     }
 
