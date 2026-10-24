@@ -51,6 +51,13 @@ namespace ServerZoneOwnership
         //
         // BPTODO refactor roundrobin the create/destroy ticks among players
         // rather than artificially all on every x'th frame (eg 8), flattening spike
+        // NOTE the stride's cost is partly offset by an accident in our favour:
+        // ZNetScene.InLoadingScreen() returns true unconditionally on a headless
+        // server (no local player), so vanilla hands us maxCreatedPerFrame=100
+        // permanently where a client gets 10 outside of teleports. Stride 8 costs
+        // 8x in frequency, that gives back 10x in volume per pass. Change either
+        // one without the other and object-creation latency moves sharply — see
+        // ZNetScene_CreateObjectsSorted_Diag_Patch.
         internal const int DebugCreateDestroyStride = 8;
 
         // --- Per-peer send rate (v0.7.17) ---------------------------------
@@ -5873,6 +5880,17 @@ namespace ServerZoneOwnership
             var temp2 = s_temp2?.GetValue(__instance) as List<ZDO>;
             int uncreated = temp2 != null ? temp2.Count : -1;
             int handed = currentNearObjects != null ? currentNearObjects.Count : -1;
+            // DO NOT "FIX" ZNetScene.InLoadingScreen — the null local player is
+            // load-bearing in our favour here:
+            //     if (!(Player.m_localPlayer == null))
+            //         return Player.m_localPlayer.IsTeleporting();
+            //     return true;                    // headless server: ALWAYS true
+            // A client gets maxCreatedPerFrame=10 normally and 100 only while
+            // teleporting; we get 100 permanently. Measured 2026-10-23: 100 in
+            // all 4314 windows of a 24h session, including with zero peers.
+            // That free 10x is roughly what offsets DebugCreateDestroyStride=8,
+            // so making this behave "correctly" like a client would slow object
+            // creation tenfold. If it ever changes, re-check the stride too.
             int budget = uncreated > 0
                 ? System.Math.Max(uncreated / 100, maxCreatedPerFrame)
                 : maxCreatedPerFrame;
