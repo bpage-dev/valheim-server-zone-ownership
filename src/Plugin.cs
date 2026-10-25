@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.54";
+        public const string PluginVersion = "0.7.55";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -59,6 +59,12 @@ namespace ServerZoneOwnership
         // one without the other and object-creation latency moves sharply — see
         // ZNetScene_CreateObjectsSorted_Diag_Patch.
         internal const int DebugCreateDestroyStride = 8;
+
+        // v0.7.55 — ROUND-ROBIN KILL SWITCH. false restores the previous
+        // single-spike behaviour exactly: both phases on the full union, once
+        // per stride. Creation is sliced per peer when true; removal is NEVER
+        // sliced either way.
+        internal const bool DebugRoundRobinCreate = true;
 
         // --- Per-peer send rate (v0.7.17) ---------------------------------
         // Sends per second EACH peer should receive, independent of how many
@@ -1369,10 +1375,40 @@ namespace ServerZoneOwnership
     [HarmonyPatch(typeof(ZNet), nameof(ZNet.GetReferencePosition))]
     internal static class ZNet_GetReferencePosition_Patch
     {
+        // v0.7.55: scoped override so object CREATION sorts by distance to the
+        // peer whose slice is being built, not to the centroid.
+        //
+        // CreateObjectsSorted seeds its sort with GetReferencePosition():
+        //     Vector3 referencePosition = ZNet.instance.GetReferencePosition();
+        //     ... m_tempSortValue = DistanceSqr(referencePosition, zdo.GetPosition())
+        // With our centroid that origin is a geometric average that may sit near
+        // nobody, so creation order suited no actual player. Slicing per peer
+        // stops peers competing, but the ordering WITHIN a slice stays
+        // centroid-biased unless the origin moves too.
+        //
+        // Scope is deliberately tiny: set immediately before the CreateObjects
+        // call and cleared in a finally. Inside that call the only meaningful
+        // consumer is the sort — IsActiveAreaLoaded is forced true by our own
+        // patch and IsZoneReadyForType does not read a position. Leaving this
+        // set would hand a stale single-peer position to every consumer in
+        // [[valheim-reference-position-consumers]], hence the finally.
+        private static bool s_overrideActive;
+        private static Vector3 s_overridePos;
+
+        internal static void BeginOverride(Vector3 pos)
+        {
+            s_overridePos = pos;
+            s_overrideActive = true;
+        }
+
+        internal static void EndOverride() => s_overrideActive = false;
+
         static bool Prefix(ZNet __instance, ref Vector3 __result)
         {
             if (__instance == null || !__instance.IsServer())
                 return true;
+
+            if (s_overrideActive) { __result = s_overridePos; return false; }
 
             var peers = __instance.GetPeers();
             if (peers == null || peers.Count == 0) return true;
@@ -1612,74 +1648,200 @@ namespace ServerZoneOwnership
     internal static class ZNetScene_CreateDestroyObjects_Patch
     {
         // Local scratch objects — reused across ticks.
+        //
+        // v0.7.55: creation and removal now use SEPARATE lists, and the naming
+        // is deliberate. Handing a per-peer SLICE to RemoveObjects would destroy
+        // every other peer's objects, permanently for non-persistent ones, so
+        // "slice" and "union" never share a variable.
         private static readonly List<ZDO> s_nearBuffer = new List<ZDO>();
         private static readonly List<ZDO> s_distantBuffer = new List<ZDO>();
         private static readonly HashSet<ZDO> s_seenNear = new HashSet<ZDO>();
         private static readonly HashSet<ZDO> s_seenDistant = new HashSet<ZDO>();
 
-        private static int s_frame;
+        // Creation slice: ONE peer's area, rebuilt fresh every tick.
+        private static readonly List<ZDO> s_sliceNear = new List<ZDO>();
+        private static readonly List<ZDO> s_sliceDistant = new List<ZDO>();
 
+        private static int s_frame;
+        private static int s_rrCursor;          // which peer's turn it is
+        private static bool s_unionBuiltThisTick;
+
+        /// <summary>
+        /// v0.7.55: round-robin creation, strided removal.
+        ///
+        /// Before: the entire pass ran on one tick in DebugCreateDestroyStride
+        /// (8), walking every peer's sectors and then creating and removing from
+        /// that union. All the work landed in one spike, and the per-pass
+        /// creation budget - max(uncreated/100, 100) - was spent on a
+        /// CENTROID-sorted list, so whichever peer happened to sit nearest the
+        /// centroid took most of it.
+        ///
+        /// Now the two phases are decoupled, because they want opposite things:
+        ///
+        ///   CREATION  - every tick, ONE peer's freshly walked slice. Each peer
+        ///               still comes up every N ticks, but gets the whole budget
+        ///               floor of 100 on its turn instead of an unfair share of
+        ///               a shared pass. Estimated per-peer throughput at 8 peers
+        ///               goes from ~91 objects/sec to ~350. Slicing is safe here:
+        ///               CreateObjects only instantiates, it never destroys.
+        ///
+        ///   REMOVAL   - unchanged cadence (every Nth tick), on a freshly walked
+        ///               FULL union. RemoveObjects is a whitelist: it destroys
+        ///               every live instance absent from the lists it is handed,
+        ///               and permanently destroys non-persistent ones it owns.
+        ///               It must never see a slice, and its frequency is left
+        ///               alone so this change cannot regress its cost.
+        ///
+        /// Rejected design: a persistent union refreshed one slice per tick.
+        /// ZDOs are POOLED (ZDOPool.Release in ZDOMan.HandleDestroyedZDO), so a
+        /// ZDO reference held across ticks can come back pointing at a different
+        /// object. Rebuilding both lists fresh avoids that entirely.
+        ///
+        /// DebugRoundRobinCreate = false restores the previous single-spike
+        /// behaviour exactly.
+        /// </summary>
         static bool Prefix(ZNetScene __instance)
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
 
-            // v0.7.10: stride is a REHEARSAL for round-robin, not round-robin.
-            // This pass is our most expensive (12.4% of wall clock, single calls
-            // up to 214ms), and the planned fix is to walk one peer's area per
-            // frame instead of every peer's. Before building that, we want to
-            // know how the resulting latency FEELS — with 8 peers, a given
-            // player's surroundings would refresh every 8th frame.
-            //
-            // Setting the stride to 8 with one player online reproduces exactly
-            // that delay (~0.27s at 30 ticks/sec) while keeping the test simple:
-            // skip the whole pass on off-frames. It saves the same work for one
-            // player that round-robin would save with eight, so it also shows
-            // the [Pass] cost drop, but the point is the visible effect: how
-            // late do objects and mobs appear as you travel.
             s_frame++;
-            if (Plugin.DebugCreateDestroyStride > 1
-                && s_frame % Plugin.DebugCreateDestroyStride != 0)
-            {
-                return false;   // skip this tick entirely, as round-robin would
-            }
-
-            var currentObjects = (List<ZDO>)ReflectionCache.ZNetScene_tempCurrentObjects.GetValue(__instance);
-            var distantObjects = (List<ZDO>)ReflectionCache.ZNetScene_tempCurrentDistantObjects.GetValue(__instance);
-            currentObjects.Clear();
-            distantObjects.Clear();
-            s_seenNear.Clear();
-            s_seenDistant.Clear();
+            s_unionBuiltThisTick = false;
 
             var simDist = ServerCoverage.GetSimulationDistance();
             var zdoMan = ZDOMan.instance;
+            bool removalTick = Plugin.DebugCreateDestroyStride <= 1
+                               || s_frame % Plugin.DebugCreateDestroyStride == 0;
 
-            // Run vanilla's own near+distant sector walk once per peer zone and
-            // merge. FindSectorObjects handles the radius-vs-classic selection
-            // and keeps the distant ring restricted to Distant-flagged ZDOs, so
-            // Character ZDOs still can't reach the distant list and bypass
-            // terrain gating (the v0.4.1 mid-air-spawn bug). Peers overlap, so
-            // dedup on the way in.
-            // v0.7.54: phase timing — see CreateDestroyPhases for why.
+            if (!Plugin.DebugRoundRobinCreate)
+            {
+                // Legacy path: one spike per stride, both phases on the union.
+                if (!removalTick) return false;
+                long tW0 = CreateDestroyPhases.Now;
+                BuildUnion(__instance, zdoMan, simDist,
+                           out var legacyNear, out var legacyDistant);
+                long tC0 = CreateDestroyPhases.Now;
+                ReflectionCache.ZNetScene_CreateObjects.Invoke(
+                    __instance, new object[] { legacyNear, legacyDistant });
+                long tR0 = CreateDestroyPhases.Now;
+                InvokeRemoveWithUnion(__instance, legacyNear, legacyDistant);
+                CreateDestroyPhases.Record(tW0, tC0, tR0, CreateDestroyPhases.Now,
+                    ZNet.instance.GetPeers().Count, legacyNear.Count,
+                    legacyDistant.Count, CreateDestroyPhases.LiveInstances(__instance));
+                return false;
+            }
+
+            // ---- PHASE 1: creation, one peer per tick -----------------------
             long tWalk = CreateDestroyPhases.Now;
+            long tCreate;
+            int sliceNear = 0, sliceDistant = 0;
+
+            // GetUniquePeerPositions returns a SHARED static list that it clears
+            // and refills per call, so read what we need immediately and do not
+            // hold it across the removal phase.
+            var positions = ServerCoverage.GetUniquePeerPositions();
+            if (positions.Count > 0)
+            {
+                // Peer counts change as people join and leave, so clamp rather
+                // than assuming the cursor is still in range.
+                if (s_rrCursor >= positions.Count) s_rrCursor = 0;
+                var pos = positions[s_rrCursor];
+                s_rrCursor = (s_rrCursor + 1) % positions.Count;
+
+                s_sliceNear.Clear();
+                s_sliceDistant.Clear();
+                zdoMan.FindSectorObjects(ZoneSystem.GetZone(pos), simDist,
+                                         s_sliceNear, s_sliceDistant);
+                sliceNear = s_sliceNear.Count;
+                sliceDistant = s_sliceDistant.Count;
+                tCreate = CreateDestroyPhases.Now;
+                // Sort creation by distance to THIS peer, not the centroid.
+                // finally is load-bearing: leaving the override set would feed a
+                // single peer's position to every reference-position consumer.
+                ZNet_GetReferencePosition_Patch.BeginOverride(pos);
+                try
+                {
+                    ReflectionCache.ZNetScene_CreateObjects.Invoke(
+                        __instance, new object[] { s_sliceNear, s_sliceDistant });
+                }
+                finally
+                {
+                    ZNet_GetReferencePosition_Patch.EndOverride();
+                }
+            }
+            else
+            {
+                tCreate = CreateDestroyPhases.Now;
+            }
+
+            // ---- PHASE 2: removal, strided, FULL union ----------------------
+            long tRemove = CreateDestroyPhases.Now;
+            if (removalTick)
+            {
+                BuildUnion(__instance, zdoMan, simDist, out var unionNear, out var unionDistant);
+                InvokeRemoveWithUnion(__instance, unionNear, unionDistant);
+                CreateDestroyPhases.Record(tWalk, tCreate, tRemove, CreateDestroyPhases.Now,
+                    ZNet.instance.GetPeers().Count, unionNear.Count,
+                    unionDistant.Count, CreateDestroyPhases.LiveInstances(__instance));
+            }
+            else
+            {
+                CreateDestroyPhases.Record(tWalk, tCreate, tRemove, tRemove,
+                    ZNet.instance.GetPeers().Count, sliceNear, sliceDistant,
+                    CreateDestroyPhases.LiveInstances(__instance));
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Walks EVERY unique peer position and unions the results into vanilla's
+        /// own temp lists. Sets s_unionBuiltThisTick, which is the only thing that
+        /// authorises a RemoveObjects call.
+        ///
+        /// Note an empty peer set yields empty lists, and RemoveObjects will then
+        /// destroy every live instance. That is pre-existing behaviour with no
+        /// players online and is left unchanged.
+        /// </summary>
+        private static void BuildUnion(ZNetScene scene, ZDOMan zdoMan, SimulationDistance simDist,
+                                       out List<ZDO> unionNear, out List<ZDO> unionDistant)
+        {
+            unionNear = (List<ZDO>)ReflectionCache.ZNetScene_tempCurrentObjects.GetValue(scene);
+            unionDistant = (List<ZDO>)ReflectionCache.ZNetScene_tempCurrentDistantObjects.GetValue(scene);
+            unionNear.Clear();
+            unionDistant.Clear();
+            s_seenNear.Clear();
+            s_seenDistant.Clear();
+
             foreach (var pos in ServerCoverage.GetUniquePeerPositions())
             {
                 s_nearBuffer.Clear();
                 s_distantBuffer.Clear();
-                zdoMan.FindSectorObjects(ZoneSystem.GetZone(pos), simDist, s_nearBuffer, s_distantBuffer);
+                zdoMan.FindSectorObjects(ZoneSystem.GetZone(pos), simDist,
+                                         s_nearBuffer, s_distantBuffer);
                 foreach (var zdo in s_nearBuffer)
-                    if (s_seenNear.Add(zdo)) currentObjects.Add(zdo);
+                    if (s_seenNear.Add(zdo)) unionNear.Add(zdo);
                 foreach (var zdo in s_distantBuffer)
-                    if (s_seenDistant.Add(zdo)) distantObjects.Add(zdo);
+                    if (s_seenDistant.Add(zdo)) unionDistant.Add(zdo);
             }
+            s_unionBuiltThisTick = true;
+        }
 
-            long tCreate = CreateDestroyPhases.Now;
-            ReflectionCache.ZNetScene_CreateObjects.Invoke(__instance, new object[] { currentObjects, distantObjects });
-            long tRemove = CreateDestroyPhases.Now;
-            ReflectionCache.ZNetScene_RemoveObjects.Invoke(__instance, new object[] { currentObjects, distantObjects });
-            CreateDestroyPhases.Record(tWalk, tCreate, tRemove, CreateDestroyPhases.Now,
-                ZNet.instance.GetPeers().Count, currentObjects.Count,
-                distantObjects.Count, CreateDestroyPhases.LiveInstances(__instance));
-            return false;
+        /// <summary>
+        /// The one place RemoveObjects may be called. The guard is not defensive
+        /// politeness - handing a per-peer slice here destroys every other peer's
+        /// objects, and permanently destroys non-persistent ones the server owns.
+        /// </summary>
+        private static void InvokeRemoveWithUnion(ZNetScene scene,
+                                                  List<ZDO> unionNear, List<ZDO> unionDistant)
+        {
+            if (!s_unionBuiltThisTick)
+            {
+                Plugin.Log.LogError(
+                    "[CreateDestroy] REFUSING RemoveObjects: union was not built this tick. " +
+                    "This would have destroyed every object outside the list.");
+                return;
+            }
+            ReflectionCache.ZNetScene_RemoveObjects.Invoke(
+                scene, new object[] { unionNear, unionDistant });
         }
     }
 
