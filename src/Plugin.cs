@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.56";
+        public const string PluginVersion = "0.7.57";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -2006,6 +2006,42 @@ namespace ServerZoneOwnership
         private static int s_containerWatchPassCount;
         internal static int s_containerGraceSkips;
 
+        /// <summary>
+        /// v0.7.57: widened from a root-only GetComponent, which silently
+        /// excluded any prefab whose Container sits on a child.
+        ///
+        /// Found via bug #8 on 2026-10-25. The Obliterator churned ownership
+        /// server-to-client 18 times in three minutes because our grace period
+        /// never recognised it as a container, so the reclaim took it straight
+        /// back every ~2s. A lever pull landed while we owned it, ownership
+        /// flipped to the client mid-delay, and the re-check at
+        /// Incinerator.Incinerate():186 silently aborted the burn. The lever had
+        /// already animated by then, so it looked like nothing happened.
+        ///
+        /// Identical trap to PrefabHasSadle before v0.7.46: GetComponent only
+        /// inspects the root. Searched with includeInactive because a container
+        /// child can be inactive until used, same as the saddle child.
+        ///
+        /// NOT YET PROVEN to fix the Obliterator. Incinerator.m_container is a
+        /// serialized reference and may point at a sibling or an unrelated
+        /// object rather than a child, in which case this still misses it. The
+        /// lazy log below is what settles that: if "incinerator" appears, the
+        /// children search reached it. If it does not, follow the serialized
+        /// reference instead, the way PrefabHasSadle falls back to
+        /// Tameable.m_saddle.
+        ///
+        /// The log is deliberately lazy rather than a startup dump. This is only
+        /// called for ZDOs the reclaim loop actually walks, i.e. objects in
+        /// loaded zones near players, so it can only ever name things the user
+        /// has already encountered. A startup enumeration of every container
+        /// prefab would spoil unfound content — see
+        /// [[feedback-no-spoilers-in-vcs]] for the user's standing preference.
+        ///
+        /// Widening only ever DECLINES to reclaim: it writes nothing and
+        /// destroys nothing, so an unexpected match costs at most ten extra
+        /// seconds of peer ownership, which is the direction vanilla errs in
+        /// anyway.
+        /// </summary>
         private static bool PrefabHasContainer(int prefabHash)
         {
             if (s_containerPrefabCache.TryGetValue(prefabHash, out bool known)) return known;
@@ -2014,8 +2050,15 @@ namespace ServerZoneOwnership
             // scene may not be ready yet, and caching false here would
             // permanently exclude this prefab from every guard below.
             if (prefab == null) return false;
-            bool has = prefab.GetComponent<Container>() != null;
+
+            bool onRoot = prefab.GetComponent<Container>() != null;
+            bool has = onRoot || prefab.GetComponentInChildren<Container>(true) != null;
+
             s_containerPrefabCache[prefabHash] = has;
+            if (has)
+                Plugin.Log.LogInfo(
+                    $"[{Plugin.Stamp}] [Diag] Container-bearing prefab: {prefab.name} " +
+                    $"(onRoot={onRoot}) — grace period applies");
             return has;
         }
 
