@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.55";
+        public const string PluginVersion = "0.7.56";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -653,6 +653,7 @@ namespace ServerZoneOwnership
             var cdp = CreateDestroyPhases.Drain();
             if (cdp != null) Log.LogInfo($"[{Stamp}] [Diag] {cdp}");
             Incinerator_Diag_Patch.Poll();
+            IncineratorOwnerWatch.Poll();
             var zb = ZoneSystem_IsZoneReadyForType_Diag_Patch.Drain();
             if (zb != null) Log.LogWarning($"[{Stamp}] [Diag] {zb}");
             var dw = ZRoutedRpc_HandleRoutedRPC_DeadWindow_Patch.Drain();
@@ -5789,6 +5790,128 @@ namespace ServerZoneOwnership
             s_nearSum = 0; s_distantSum = 0; s_peerSum = 0;
             s_nearMax = 0; s_instancesMax = 0;
             return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.56 diagnostic (bug #8): trace ownership on the Obliterator's ZDO.
+    ///
+    /// 2026-10-25 narrowed this by elimination. The user pulled the lever twice:
+    /// the first burned (request 15:37:48, StopAOE 15:38:06), the second did
+    /// nothing. The second produced NO server log at all — not our
+    /// "Obliterator request", not vanilla's "wants to incinerate", and no
+    /// dropped RPC (deadRPC activity stopped at 15:11). So it is NOT the
+    /// post-delay abort at Incinerate():186 that was suspected, and the request
+    /// never crossed the wire.
+    ///
+    /// By then the server state was clean: StopAOE had cleared isInUse, we owned
+    /// the ZDO, and the container was not in use. A request arriving would have
+    /// been accepted. So the refusal happened CLIENT-side, in OnIncinerate:
+    ///     if (!m_nview.IsValid() || !m_nview.HasOwner()) return false;
+    ///     if (!PrivateArea.CheckAccess(base.transform.position)) return false;
+    /// Ward access cannot change between two pulls seconds apart, which leaves
+    /// HasOwner() reading false on the client — i.e. its copy of the ZDO
+    /// believed nobody owned it.
+    ///
+    /// HasOwner() is ZDO.Owned, set by SetOwnerInternal, which on a client is
+    /// driven entirely by the ZDO sync:
+    ///     if (uid == 0L) { ReleaseOwner(...); Owned = false; Owner = false; }
+    ///     else           { SetOwner(...);     Owned = true;  ... }
+    /// So either we released ownership (uid 0) and the client learned of it, or
+    /// we did not and the client's view is stale. This diagnostic distinguishes
+    /// those two, which is as far as a SERVER-ONLY plugin can go — clients run
+    /// vanilla and cannot be instrumented.
+    ///
+    ///   owner=0 appearing          -> we really did release it. Our bug, fixable here.
+    ///   owner stable as the server -> the client's view is stale, so the fault
+    ///                                 is in ownership DELIVERY, and the next
+    ///                                 question is whether that ZDO was being
+    ///                                 sent to that peer at all.
+    ///
+    /// Logs every ownership change plus a periodic snapshot, because a stable
+    /// owner is the informative result here and silence would be ambiguous.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDO), "SetOwner")]
+    internal static class ZDO_SetOwner_IncineratorDiag_Patch
+    {
+        private static readonly Dictionary<int, bool> s_isIncinerator = new Dictionary<int, bool>();
+
+        internal static bool PrefabIsIncinerator(int prefabHash)
+        {
+            if (s_isIncinerator.TryGetValue(prefabHash, out bool known)) return known;
+            var prefab = ZNetScene.instance?.GetPrefab(prefabHash);
+            // Do not cache a negative when the lookup itself failed - the scene
+            // may not be ready yet. Same trap as PrefabHasSadle in v0.7.46.
+            if (prefab == null) return false;
+            bool has = prefab.GetComponent<Incinerator>() != null;
+            s_isIncinerator[prefabHash] = has;
+            return has;
+        }
+
+        static void Prefix(ZDO __instance, long uid)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (__instance == null) return;
+            if (!PrefabIsIncinerator(__instance.GetPrefab())) return;
+
+            long prev = __instance.GetOwner();
+            if (prev == uid) return;   // vanilla SetOwner no-ops here anyway
+
+            var pos = __instance.GetPosition();
+            Plugin.Log.LogWarning(
+                $"[{Plugin.Stamp}] [Diag] Obliterator OWNER {prev} -> {uid} " +
+                $"(us={ZDOMan.GetSessionID()}) released={(uid == 0L)} " +
+                $"ownerRev={__instance.OwnerRevision} dataRev={__instance.DataRevision} " +
+                $"pos=world({pos.x:F0},{pos.z:F0})");
+        }
+    }
+
+    /// <summary>
+    /// v0.7.56: periodic owner snapshot for every Obliterator in the loaded
+    /// scene. A STABLE owner is the informative outcome for bug #8 - it would
+    /// mean the client's view is stale rather than the server churning - so
+    /// silence from the SetOwner trace must be distinguishable from the
+    /// diagnostic simply not running.
+    /// </summary>
+    internal static class IncineratorOwnerWatch
+    {
+        private static readonly FieldInfo s_instancesField =
+            AccessTools.Field(typeof(ZNetScene), "m_instances");
+
+        private static int s_sinceLast;
+
+        internal static void Poll()
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            // The stats tick is already ~20s; sample every third one.
+            if (++s_sinceLast < 3) return;
+            s_sinceLast = 0;
+
+            var scene = ZNetScene.instance;
+            if (scene == null) return;
+            var map = s_instancesField?.GetValue(scene) as System.Collections.IDictionary;
+            if (map == null) return;
+
+            int found = 0;
+            var sb = new System.Text.StringBuilder();
+            foreach (System.Collections.DictionaryEntry entry in map)
+            {
+                var view = entry.Value as ZNetView;
+                if (view == null || !view.IsValid()) continue;
+                var zdo = view.GetZDO();
+                if (zdo == null) continue;
+                if (!ZDO_SetOwner_IncineratorDiag_Patch.PrefabIsIncinerator(zdo.GetPrefab())) continue;
+
+                long owner = zdo.GetOwner();
+                var p = zdo.GetPosition();
+                if (found > 0) sb.Append(" | ");
+                sb.Append($"owner={owner} hasOwner={(owner != 0L)} isUs={(owner == ZDOMan.GetSessionID())} " +
+                          $"ownerRev={zdo.OwnerRevision} pos=world({p.x:F0},{p.z:F0})");
+                found++;
+                if (found >= 4) break;
+            }
+            if (found == 0) return;
+            Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Diag] ObliteratorWatch n={found} {sb}");
         }
     }
 
