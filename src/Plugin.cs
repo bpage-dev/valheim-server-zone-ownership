@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.64";
+        public const string PluginVersion = "0.7.65";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -6905,6 +6905,7 @@ namespace ServerZoneOwnership
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             StatusAttributeCensus.MaybeReport();
+            ConsumableEffectCensus.MaybeReport();
             var peers = ZNet.instance.GetPeers();
             if (peers == null || peers.Count == 0) return;
 
@@ -7067,6 +7068,67 @@ namespace ServerZoneOwnership
             Plugin.Log.LogInfo(
                 $"[{Plugin.Stamp}] [Diag] seAttribCensus effects={total} " +
                 $"withAttributes={withAny} | {bits}");
+        }
+    }
+
+    /// <summary>
+    /// v0.7.65 (bug #11): read the item-to-effect mapping out of the live asset
+    /// database instead of guessing it from the decompile.
+    ///
+    /// Searching the source for an item by name cannot work. A consumable
+    /// points at its effect through a serialised asset reference
+    /// (ItemDrop.ItemData.SharedData.m_consumeStatusEffect), so no item name
+    /// and no effect name appears anywhere in the decompiled C#. On
+    /// 2026-10-25 I searched for one anyway and it produced a chain of false
+    /// positives: most hits were the letters of "LevelOverride", and the one
+    /// that looked like a real consumer matched only on a localization token
+    /// for a UI string. Everything built on that was wrong.
+    ///
+    /// This lists every consumable that applies an effect, with the effect's
+    /// attribute bits, and separately every effect that declares any attribute
+    /// at all. That is the mapping, from the data, with no inference.
+    /// </summary>
+    internal static class ConsumableEffectCensus
+    {
+        private static bool s_done;
+
+        internal static void MaybeReport()
+        {
+            if (s_done) return;
+            var db = ObjectDB.instance;
+            if (db == null || db.m_items == null || db.m_items.Count == 0) return;
+            if (db.m_StatusEffects == null || db.m_StatusEffects.Count == 0) return;
+            s_done = true;
+
+            // Effects that declare an attribute: the short, decisive list.
+            foreach (var se in db.m_StatusEffects)
+            {
+                if (se == null || (int)se.m_attributes == 0) continue;
+                Plugin.Log.LogInfo(
+                    $"[{Plugin.Stamp}] [Diag] attribEffect asset={se.name} " +
+                    $"name={se.m_name} bits={(int)se.m_attributes}");
+            }
+
+            int withEffect = 0;
+            foreach (var go in db.m_items)
+            {
+                if (go == null) continue;
+                var drop = go.GetComponent<ItemDrop>();
+                var shared = drop?.m_itemData?.m_shared;
+                var se = shared?.m_consumeStatusEffect;
+                if (se == null) continue;
+                withEffect++;
+                int bits = (int)se.m_attributes;
+                // Only the ones carrying an attribute are interesting here;
+                // the rest are ordinary food and healing.
+                if (bits != 0)
+                    Plugin.Log.LogInfo(
+                        $"[{Plugin.Stamp}] [Diag] consumable item={go.name} " +
+                        $"effect={se.name} bits={bits}");
+            }
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [Diag] consumableCensus items={db.m_items.Count} " +
+                $"withConsumeEffect={withEffect}");
         }
     }
 }
