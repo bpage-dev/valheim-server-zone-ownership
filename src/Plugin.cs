@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.60";
+        public const string PluginVersion = "0.7.61";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -108,6 +108,12 @@ namespace ServerZoneOwnership
         // the call vanilla makes once per ZDO that fits inside the byte budget.
         // So these are real sends, with real byte counts, not offers.
         internal const float DebugSendCensusSeconds = 5f;
+
+        // v0.7.61: how often the status-attribute watch samples each connected
+        // player's replicated mask. Driven off the per-frame timer rather than
+        // the ~20s diagnostic flush, so a short in-game test does not need the
+        // player standing still for a minute. 0 disables it.
+        internal const float DebugStatusAttribWatchSeconds = 10f;
 
         // --- Distance-tiered send rate (v0.7.30) ---------------------------
         // THE PROBLEM: because the server owns every mob, every mob's motion
@@ -307,6 +313,7 @@ namespace ServerZoneOwnership
         // the server is up.
         private bool _loggedSimDistance;
         private float _censusTimer;
+        private float _seAttribTimer;
         private float _tierTimer;
 
         private void Awake()
@@ -502,6 +509,16 @@ namespace ServerZoneOwnership
                 }
             }
 
+            if (Plugin.DebugStatusAttribWatchSeconds > 0f)
+            {
+                _seAttribTimer += Time.deltaTime;
+                if (_seAttribTimer >= Plugin.DebugStatusAttribWatchSeconds)
+                {
+                    StatusAttribWatch.Poll();
+                    _seAttribTimer = 0f;
+                }
+            }
+
             // Tier accounting AND pruning. Runs even when printing is off,
             // capped at 30s, because the prune is what bounds the per-peer map;
             // leaving it to a disabled log would let the map grow unbounded.
@@ -662,7 +679,6 @@ namespace ServerZoneOwnership
             if (cs != null) Log.LogInfo($"[{Stamp}] [Diag] {cs}");
             var lp = Procreation_Diag_Patch.Drain();
             if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
-            StatusAttribWatch.Poll();
             var sea = SEMan_HaveStatusAttribute_Diag_Patch.Drain();
             if (sea != null) Log.LogInfo($"[{Stamp}] [Diag] {sea}");
             MountSyncDiag.Flush();
@@ -6883,15 +6899,9 @@ namespace ServerZoneOwnership
     /// </summary>
     internal static class StatusAttribWatch
     {
-        private static int s_sinceLast;
-
         internal static void Poll()
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            // The flush tick is ~20s; every third keeps this cheap.
-            if (++s_sinceLast < 3) return;
-            s_sinceLast = 0;
-
             var peers = ZNet.instance.GetPeers();
             if (peers == null || peers.Count == 0) return;
 
