@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.61";
+        public const string PluginVersion = "0.7.62";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -681,6 +681,8 @@ namespace ServerZoneOwnership
             if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
             var sea = SEMan_HaveStatusAttribute_Diag_Patch.Drain();
             if (sea != null) Log.LogInfo($"[{Stamp}] [Diag] {sea}");
+            var cch = ConsumerChainDiag.Drain();
+            if (cch != null) Log.LogInfo($"[{Stamp}] [Diag] {cch}");
             MountSyncDiag.Flush();
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
@@ -6925,6 +6927,63 @@ namespace ServerZoneOwnership
             Plugin.Log.LogInfo(
                 $"[{Plugin.Stamp}] [Diag] seAttribWatch players={Player.GetAllPlayers().Count} " +
                 $"localPlayer={(Player.m_localPlayer == null ? "null" : "set")} | {sb}");
+        }
+    }
+
+    /// <summary>
+    /// v0.7.62 diagnostic (bug #11): find where the chain stops.
+    ///
+    /// v0.7.61 established that SEMan.HaveStatusAttribute is never called on
+    /// this server — not once in ten minutes of play, with the patch confirmed
+    /// applied (55 classes, none failed). So the consumer that tests a
+    /// player's replicated attribute mask never reaches its check, and the
+    /// mask reading 0 is a side issue until that is explained.
+    ///
+    /// The chain has two levels: an owner-gated per-creature helper, and the
+    /// method it calls, which performs the check about ten lines in behind one
+    /// condition and one early return. We own the creature, so the owner gate
+    /// is not the obstacle. Counting entries at both levels splits it:
+    ///
+    ///   outer=0                 -> the helper never runs here; look at what
+    ///                              drives it rather than at the gate
+    ///   outer>0, inner=0        -> the helper runs but skips the call
+    ///   inner>0, attribChecks=0 -> the check is unreachable inside the
+    ///                              method; it takes the early exit
+    ///
+    /// Counters only, drained with the other diagnostics. Named for its role
+    /// rather than its subject, so this records nothing about what is under
+    /// investigation.
+    /// </summary>
+    internal static class ConsumerChainDiag
+    {
+        internal static int s_outer, s_inner;
+
+        internal static string Drain()
+        {
+            if (s_outer == 0 && s_inner == 0) return null;
+            string s = $"consumerChain outer={s_outer} inner={s_inner}";
+            s_outer = 0; s_inner = 0;
+            return s;
+        }
+    }
+
+    [HarmonyPatch(typeof(Tameable), "TamingUpdate")]
+    internal static class ConsumerChainOuter_Diag_Patch
+    {
+        static void Prefix()
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            ConsumerChainDiag.s_outer++;
+        }
+    }
+
+    [HarmonyPatch(typeof(Tameable), "DecreaseRemainingTime")]
+    internal static class ConsumerChainInner_Diag_Patch
+    {
+        static void Prefix()
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            ConsumerChainDiag.s_inner++;
         }
     }
 }
