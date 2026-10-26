@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.62";
+        public const string PluginVersion = "0.7.63";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -6957,23 +6957,46 @@ namespace ServerZoneOwnership
     internal static class ConsumerChainDiag
     {
         internal static int s_outer, s_inner;
+        // v0.7.63: the outer helper's single gate, split into its parts.
+        internal static int s_noNview, s_invalid, s_owned, s_notOwned;
 
         internal static string Drain()
         {
             if (s_outer == 0 && s_inner == 0) return null;
-            string s = $"consumerChain outer={s_outer} inner={s_inner}";
+            string s = $"consumerChain outer={s_outer} inner={s_inner} " +
+                       $"| gate: noNview={s_noNview} invalid={s_invalid} " +
+                       $"owned={s_owned} notOwned={s_notOwned}";
             s_outer = 0; s_inner = 0;
+            s_noNview = 0; s_invalid = 0; s_owned = 0; s_notOwned = 0;
             return s;
         }
     }
 
+    /// <summary>
+    /// v0.7.63: outer=35 inner=0 on the first window after deploying v0.7.62,
+    /// so the helper runs here but never makes its call. The only gate between
+    /// the helper's entry and that call is a validity/ownership test, and the
+    /// call sits one block deeper, inside it. These counters say which half of
+    /// that gate rejects — and in particular whether we actually own the
+    /// objects whose logic we are now responsible for simulating.
+    /// </summary>
     [HarmonyPatch(typeof(Tameable), "TamingUpdate")]
     internal static class ConsumerChainOuter_Diag_Patch
     {
-        static void Prefix()
+        private static readonly FieldInfo s_nviewField =
+            AccessTools.Field(typeof(Tameable), "m_nview");
+
+        static void Prefix(Tameable __instance)
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             ConsumerChainDiag.s_outer++;
+            if (__instance == null) return;
+
+            var nview = s_nviewField?.GetValue(__instance) as ZNetView;
+            if (nview == null) { ConsumerChainDiag.s_noNview++; return; }
+            if (!nview.IsValid()) { ConsumerChainDiag.s_invalid++; return; }
+            if (nview.IsOwner()) ConsumerChainDiag.s_owned++;
+            else ConsumerChainDiag.s_notOwned++;
         }
     }
 
