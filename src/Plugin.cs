@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.78";
+        public const string PluginVersion = "0.7.79";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -108,12 +108,6 @@ namespace ServerZoneOwnership
         // the call vanilla makes once per ZDO that fits inside the byte budget.
         // So these are real sends, with real byte counts, not offers.
         internal const float DebugSendCensusSeconds = 5f;
-
-        // v0.7.61: how often the status-attribute watch samples each connected
-        // player's replicated mask. Driven off the per-frame timer rather than
-        // the ~20s diagnostic flush, so a short in-game test does not need the
-        // player standing still for a minute. 0 disables it.
-        internal const float DebugStatusAttribWatchSeconds = 10f;
 
         // v0.7.69 bug #11: run the pheromone mechanic server-side. False
         // restores vanilla behaviour, which on this server is a silent no-op.
@@ -336,7 +330,6 @@ namespace ServerZoneOwnership
         // the server is up.
         private bool _loggedSimDistance;
         private float _censusTimer;
-        private float _seAttribTimer;
         private float _tierTimer;
 
         private void Awake()
@@ -532,16 +525,6 @@ namespace ServerZoneOwnership
                 }
             }
 
-            if (Plugin.DebugStatusAttribWatchSeconds > 0f)
-            {
-                _seAttribTimer += Time.deltaTime;
-                if (_seAttribTimer >= Plugin.DebugStatusAttribWatchSeconds)
-                {
-                    StatusAttribWatch.Poll();
-                    _seAttribTimer = 0f;
-                }
-            }
-
             // Tier accounting AND pruning. Runs even when printing is off,
             // capped at 30s, because the prune is what bounds the per-peer map;
             // leaving it to a disabled log would let the map grow unbounded.
@@ -702,10 +685,6 @@ namespace ServerZoneOwnership
             if (cs != null) Log.LogInfo($"[{Stamp}] [Diag] {cs}");
             var lp = Procreation_Diag_Patch.Drain();
             if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
-            var sea = SEMan_HaveStatusAttribute_Diag_Patch.Drain();
-            if (sea != null) Log.LogInfo($"[{Stamp}] [Diag] {sea}");
-            var cch = ConsumerChainDiag.Drain();
-            if (cch != null) Log.LogInfo($"[{Stamp}] [Diag] {cch}");
             var srp = StatusEffectRpcWatch.Drain();
             if (srp != null) Log.LogInfo($"[{Stamp}] [Diag] {srp}");
             var phr = PheromoneServerSide.Drain();
@@ -6853,339 +6832,12 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// v0.7.59 diagnostic (bug #11): does this server ever see a client's
-    /// active status-effect attributes?
-    ///
-    /// Vanilla replicates a BITMASK, not the effects themselves:
-    ///   SEMan.HaveStatusEffect(hash) reads m_statusEffectsHashSet, a purely
-    ///   LOCAL collection, so it is always false on a machine that does not
-    ///   own the character.
-    ///   SEMan.HaveStatusAttribute(attr) is the cross-machine path: when not
-    ///   the owner it falls back to ZDOVars.s_seAttrib on the ZDO.
-    /// That mask is written in SEMan.Update, which Character.CustomFixedUpdate
-    /// reaches only inside `if (zDO.IsOwner())` — so the owning client writes
-    /// it and every other machine reads it over ZDO sync.
-    ///
-    /// This matters because our server owns and simulates the world, so a
-    /// consumer that reacts to a player's active effect now evaluates HERE,
-    /// against a mask we never write and only receive. Four outcomes, each
-    /// pointing somewhere different:
-    ///
-    ///   never called              -> the consumer is not running server-side
-    ///                               at all; look at what gates it
-    ///   called, mask always 0     -> the attribute is not reaching us; the
-    ///                               replication path is the bug
-    ///   called, mask != 0, false  -> it arrives, but not the bit being tested
-    ///   called, result true       -> the check passes; the fault is downstream
-    ///
-    /// Deliberately patched on the GENERIC status API rather than on any
-    /// particular consumer, so it reports for every effect and hard-codes
-    /// nothing about which one is under investigation. Logs the raw numeric
-    /// bit rather than the enum name, so the output stays readable without
-    /// naming what is being tested.
-    /// </summary>
-    [HarmonyPatch(typeof(SEMan), "HaveStatusAttribute")]
-    internal static class SEMan_HaveStatusAttribute_Diag_Patch
-    {
-        private static readonly FieldInfo s_charField = AccessTools.Field(typeof(SEMan), "m_character");
-        private static readonly FieldInfo s_nviewField = AccessTools.Field(typeof(SEMan), "m_nview");
 
-        private struct Tally
-        {
-            public int True, False, MaskZero, MaskSet, LastMask;
-        }
 
-        private static readonly Dictionary<int, Tally> s_byAttr = new Dictionary<int, Tally>();
-        private static int s_onPlayers, s_onOthers;
 
-        static void Postfix(SEMan __instance, StatusEffect.StatusAttribute value, bool __result)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            if (__instance == null) return;
 
-            var ch = s_charField?.GetValue(__instance) as Character;
-            bool onPlayer = ch is Player;
-            if (onPlayer) s_onPlayers++; else s_onOthers++;
-            // Only the player side is in question: a creature's own attributes
-            // are written by us, since we own the creature.
-            if (!onPlayer) return;
 
-            int mask = 0;
-            var nview = s_nviewField?.GetValue(__instance) as ZNetView;
-            if (nview != null && nview.IsValid())
-            {
-                var zdo = nview.GetZDO();
-                if (zdo != null) mask = zdo.GetInt(ZDOVars.s_seAttrib, 0);
-            }
 
-            int key = (int)value;
-            bool known = s_byAttr.TryGetValue(key, out var t);
-            if (!known && s_byAttr.Count >= 32) return;
-            if (__result) t.True++; else t.False++;
-            if (mask == 0) t.MaskZero++; else { t.MaskSet++; t.LastMask = mask; }
-            s_byAttr[key] = t;
-        }
-
-        internal static string Drain()
-        {
-            if (s_onPlayers == 0 && s_onOthers == 0) return null;
-            string per = string.Join(" ", s_byAttr.OrderBy(kv => kv.Key).Select(kv =>
-                $"bit{kv.Key}[true={kv.Value.True} false={kv.Value.False} " +
-                $"mask0={kv.Value.MaskZero} maskSet={kv.Value.MaskSet} last={kv.Value.LastMask}]"));
-            string s = $"seAttrib onPlayers={s_onPlayers} onOthers={s_onOthers} {per}";
-            s_onPlayers = 0; s_onOthers = 0; s_byAttr.Clear();
-            return s;
-        }
-    }
-
-    /// <summary>
-    /// v0.7.59: the other half of the same question, and the one that does not
-    /// depend on any consumer running at all. Reads the replicated attribute
-    /// mask straight off each connected player's own ZDO.
-    ///
-    /// A non-zero mask here proves the client->server path works and the
-    /// server can see that player's active effects. Zero while an effect is
-    /// known to be active proves it does not. Also reports the server-side
-    /// Player instance count, because every vanilla consumer finds its subject
-    /// through Player.GetAllPlayers(), which returns the static s_players list
-    /// filled in Player.Awake — if the server never instantiates Player
-    /// objects that list is empty and no consumer can ever find anybody,
-    /// whatever the mask says. See [[valheim-local-player-concept]].
-    /// </summary>
-    internal static class StatusAttribWatch
-    {
-        internal static void Poll()
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            StatusAttributeCensus.MaybeReport();
-            ConsumableEffectCensus.MaybeReport();
-            PheromoneEffectDump.MaybeReport();
-            var peers = ZNet.instance.GetPeers();
-            if (peers == null || peers.Count == 0) return;
-
-            var sb = new System.Text.StringBuilder();
-            int n = 0;
-            foreach (var peer in peers)
-            {
-                if (peer == null || peer.m_characterID.IsNone()) continue;
-                var zdo = ZDOMan.instance?.GetZDO(peer.m_characterID);
-                // -1 distinguishes "no ZDO at all" from a genuine mask of 0.
-                int mask = zdo != null ? zdo.GetInt(ZDOVars.s_seAttrib, 0) : -1;
-                bool inst = zdo != null && ZNetScene.instance != null
-                            && ZNetScene.instance.FindInstance(zdo) != null;
-                if (n++ > 0) sb.Append(" | ");
-                sb.Append($"{peer.m_playerName} mask={mask} inst={inst} " +
-                          $"owner={(zdo != null ? zdo.GetOwner() : 0L)} " +
-                          $"ownedByUs={(zdo != null && zdo.GetOwner() == ZDOMan.GetSessionID())}");
-            }
-            if (n == 0) return;
-
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Diag] seAttribWatch players={Player.GetAllPlayers().Count} " +
-                $"localPlayer={(Player.m_localPlayer == null ? "null" : "set")} | {sb}");
-        }
-    }
-
-    /// <summary>
-    /// v0.7.62 diagnostic (bug #11): find where the chain stops.
-    ///
-    /// v0.7.61 established that SEMan.HaveStatusAttribute is never called on
-    /// this server — not once in ten minutes of play, with the patch confirmed
-    /// applied (55 classes, none failed). So the consumer that tests a
-    /// player's replicated attribute mask never reaches its check, and the
-    /// mask reading 0 is a side issue until that is explained.
-    ///
-    /// The chain has two levels: an owner-gated per-creature helper, and the
-    /// method it calls, which performs the check about ten lines in behind one
-    /// condition and one early return. We own the creature, so the owner gate
-    /// is not the obstacle. Counting entries at both levels splits it:
-    ///
-    ///   outer=0                 -> the helper never runs here; look at what
-    ///                              drives it rather than at the gate
-    ///   outer>0, inner=0        -> the helper runs but skips the call
-    ///   inner>0, attribChecks=0 -> the check is unreachable inside the
-    ///                              method; it takes the early exit
-    ///
-    /// Counters only, drained with the other diagnostics. Named for its role
-    /// rather than its subject, so this records nothing about what is under
-    /// investigation.
-    /// </summary>
-    internal static class ConsumerChainDiag
-    {
-        internal static int s_outer, s_inner;
-        // v0.7.63: the outer helper's single gate, split into its parts.
-        internal static int s_noNview, s_invalid, s_owned, s_notOwned;
-
-        internal static string Drain()
-        {
-            if (s_outer == 0 && s_inner == 0) return null;
-            string s = $"consumerChain outer={s_outer} inner={s_inner} " +
-                       $"| gate: noNview={s_noNview} invalid={s_invalid} " +
-                       $"owned={s_owned} notOwned={s_notOwned}";
-            s_outer = 0; s_inner = 0;
-            s_noNview = 0; s_invalid = 0; s_owned = 0; s_notOwned = 0;
-            return s;
-        }
-    }
-
-    /// <summary>
-    /// v0.7.63: outer=35 inner=0 on the first window after deploying v0.7.62,
-    /// so the helper runs here but never makes its call. The only gate between
-    /// the helper's entry and that call is a validity/ownership test, and the
-    /// call sits one block deeper, inside it. These counters say which half of
-    /// that gate rejects — and in particular whether we actually own the
-    /// objects whose logic we are now responsible for simulating.
-    /// </summary>
-    [HarmonyPatch(typeof(Tameable), "TamingUpdate")]
-    internal static class ConsumerChainOuter_Diag_Patch
-    {
-        private static readonly FieldInfo s_nviewField =
-            AccessTools.Field(typeof(Tameable), "m_nview");
-
-        static void Prefix(Tameable __instance)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            ConsumerChainDiag.s_outer++;
-            if (__instance == null) return;
-
-            var nview = s_nviewField?.GetValue(__instance) as ZNetView;
-            if (nview == null) { ConsumerChainDiag.s_noNview++; return; }
-            if (!nview.IsValid()) { ConsumerChainDiag.s_invalid++; return; }
-            if (nview.IsOwner()) ConsumerChainDiag.s_owned++;
-            else ConsumerChainDiag.s_notOwned++;
-        }
-    }
-
-    [HarmonyPatch(typeof(Tameable), "DecreaseRemainingTime")]
-    internal static class ConsumerChainInner_Diag_Patch
-    {
-        static void Prefix()
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            ConsumerChainDiag.s_inner++;
-        }
-    }
-
-    /// <summary>
-    /// v0.7.64 (bug #11): is the attribute path even in play?
-    ///
-    /// StatusEffect.m_attributes is a [BitMask] public field set per asset in
-    /// the editor, so it is PREFAB-SERIALISED and invisible in the decompile —
-    /// the same trap as the per-prefab ZDO flags, see [[valheim-prefab-flags]].
-    /// Reading the source therefore cannot tell us whether any given effect
-    /// declares the attribute a consumer tests, which makes a mask of 0 on a
-    /// player ambiguous: either replication is broken, or the effect genuinely
-    /// declares nothing and the whole attribute path is a red herring.
-    ///
-    /// Settled from the live asset database instead: count how many status
-    /// effects declare each bit. If a bit is declared by nothing at all, then
-    /// any consumer gated on it can never fire for anyone on any server, and
-    /// our ownership changes are not the cause.
-    ///
-    /// Counts only, never names, so this reports nothing about which effect is
-    /// which. Runs once, from the watch poll rather than Awake, because
-    /// ObjectDB is not populated that early.
-    /// </summary>
-    internal static class StatusAttributeCensus
-    {
-        private static bool s_done;
-
-        internal static void MaybeReport()
-        {
-            if (s_done) return;
-            var db = ObjectDB.instance;
-            if (db == null || db.m_StatusEffects == null || db.m_StatusEffects.Count == 0) return;
-            s_done = true;
-
-            int total = 0, withAny = 0;
-            var perBit = new Dictionary<int, int>();
-            foreach (var se in db.m_StatusEffects)
-            {
-                if (se == null) continue;
-                total++;
-                int a = (int)se.m_attributes;
-                if (a == 0) continue;
-                withAny++;
-                for (int b = 0; b < 32; b++)
-                {
-                    int bit = 1 << b;
-                    if ((a & bit) == 0) continue;
-                    perBit.TryGetValue(bit, out int c);
-                    perBit[bit] = c + 1;
-                }
-            }
-
-            string bits = perBit.Count == 0
-                ? "none"
-                : string.Join(" ", perBit.OrderBy(kv => kv.Key)
-                    .Select(kv => $"bit{kv.Key}x{kv.Value}"));
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Diag] seAttribCensus effects={total} " +
-                $"withAttributes={withAny} | {bits}");
-        }
-    }
-
-    /// <summary>
-    /// v0.7.65 (bug #11): read the item-to-effect mapping out of the live asset
-    /// database instead of guessing it from the decompile.
-    ///
-    /// Searching the source for an item by name cannot work. A consumable
-    /// points at its effect through a serialised asset reference
-    /// (ItemDrop.ItemData.SharedData.m_consumeStatusEffect), so no item name
-    /// and no effect name appears anywhere in the decompiled C#. On
-    /// 2026-10-25 I searched for one anyway and it produced a chain of false
-    /// positives: most hits were the letters of "LevelOverride", and the one
-    /// that looked like a real consumer matched only on a localization token
-    /// for a UI string. Everything built on that was wrong.
-    ///
-    /// This lists every consumable that applies an effect, with the effect's
-    /// attribute bits, and separately every effect that declares any attribute
-    /// at all. That is the mapping, from the data, with no inference.
-    /// </summary>
-    internal static class ConsumableEffectCensus
-    {
-        private static bool s_done;
-
-        internal static void MaybeReport()
-        {
-            if (s_done) return;
-            var db = ObjectDB.instance;
-            if (db == null || db.m_items == null || db.m_items.Count == 0) return;
-            if (db.m_StatusEffects == null || db.m_StatusEffects.Count == 0) return;
-            s_done = true;
-
-            // Effects that declare an attribute: the short, decisive list.
-            foreach (var se in db.m_StatusEffects)
-            {
-                if (se == null || (int)se.m_attributes == 0) continue;
-                Plugin.Log.LogInfo(
-                    $"[{Plugin.Stamp}] [Diag] attribEffect asset={se.name} " +
-                    $"name={se.m_name} bits={(int)se.m_attributes}");
-            }
-
-            int withEffect = 0;
-            foreach (var go in db.m_items)
-            {
-                if (go == null) continue;
-                var drop = go.GetComponent<ItemDrop>();
-                var shared = drop?.m_itemData?.m_shared;
-                var se = shared?.m_consumeStatusEffect;
-                if (se == null) continue;
-                withEffect++;
-                int bits = (int)se.m_attributes;
-                // Only the ones carrying an attribute are interesting here;
-                // the rest are ordinary food and healing.
-                if (bits != 0)
-                    Plugin.Log.LogInfo(
-                        $"[{Plugin.Stamp}] [Diag] consumable item={go.name} " +
-                        $"effect={se.name} bits={bits}");
-            }
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Diag] consumableCensus items={db.m_items.Count} " +
-                $"withConsumeEffect={withEffect}");
-        }
-    }
 
     /// <summary>
     /// v0.7.66 (bug #11): is there ANY channel by which this server could learn
@@ -7258,125 +6910,6 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// v0.7.67 (bug #11): dump the serialised fields of the effects that drive
-    /// the mechanism, since asset values cannot be read from the decompile.
-    ///
-    /// Two questions this answers:
-    ///   1. which pheromone fields the effect actually sets — four of the six
-    ///      are declared in SE_Stats and read NOWHERE in assembly_valheim, so
-    ///      if the effect relies on those it relies on dead data;
-    ///   2. whether it perturbs any REPLICATED stat (health, max health,
-    ///      stamina, eitr all have ZDO fields), which would give this server an
-    ///      indirect fingerprint for when the effect is active.
-    ///
-    /// Scoped to consumables whose effect sets at least one pheromone field, so
-    /// the output stays a handful of lines rather than the whole catalogue.
-    /// Non-default values only, for the same reason.
-    /// </summary>
-    internal static class PheromoneEffectDump
-    {
-        private static bool s_done;
-
-        private static readonly string[] s_pheromoneFields =
-        {
-            "m_pheromoneTarget", "m_pheromoneFlee", "m_pheromoneSpawnChanceOverride",
-            "m_pheromoneSpawnMinLevel", "m_pheromoneLevelUpMultiplier",
-            "m_pheromoneMaxInstanceOverride"
-        };
-
-        private static bool IsDefault(object v)
-        {
-            if (v == null) return true;
-            if (v is bool b) return !b;
-            if (v is int i) return i == 0;
-            if (v is float f) return Mathf.Approximately(f, 0f);
-            if (v is string s) return string.IsNullOrEmpty(s);
-            return false;
-        }
-
-        private static bool SetsAnyPheromoneField(StatusEffect se)
-        {
-            var t = se.GetType();
-            foreach (var name in s_pheromoneFields)
-            {
-                var fi = AccessTools.Field(t, name);
-                if (fi == null) continue;
-                object v = fi.GetValue(se);
-                // The level-up multiplier defaults to 1f, so treat that as unset.
-                if (name == "m_pheromoneLevelUpMultiplier" && v is float lm
-                    && Mathf.Approximately(lm, 1f)) continue;
-                if (!IsDefault(v)) return true;
-            }
-            return false;
-        }
-
-
-        /// <summary>
-        /// v0.7.68: the last candidate for an ACTIVE-ONLY trigger.
-        ///
-        /// The server cannot read a player's effects, but it can see ZDOs. When
-        /// a status effect starts it instantiates everything in its start-effect
-        /// list; any of those prefabs carrying a ZNetView creates a ZDO, which
-        /// reaches us through ordinary sync. That would be an exact signal — it
-        /// exists only while the effect is being applied, which is precisely the
-        /// scoping the carve-out needs.
-        ///
-        /// Most vanilla effect prefabs are local-only visuals with no ZNetView,
-        /// so this probably finds nothing. Reporting it either way: a negative
-        /// closes the last avenue, and closing it is worth as much as finding it.
-        /// </summary>
-        private static void ReportEffectPrefabs(string label, StatusEffect se, EffectList list)
-        {
-            if (list?.m_effectPrefabs == null || list.m_effectPrefabs.Length == 0) return;
-            foreach (var ed in list.m_effectPrefabs)
-            {
-                if (ed?.m_prefab == null) continue;
-                var nview = ed.m_prefab.GetComponent<ZNetView>();
-                bool networked = nview != null;
-                Plugin.Log.LogWarning(
-                    $"[{Plugin.Stamp}] [Diag]   {label} prefab={ed.m_prefab.name} " +
-                    $"enabled={ed.m_enabled} NETWORKED={networked}" +
-                    (networked ? "  <-- SERVER-VISIBLE TRIGGER" : ""));
-            }
-        }
-
-        internal static void MaybeReport()
-        {
-            if (s_done) return;
-            var db = ObjectDB.instance;
-            if (db == null || db.m_items == null || db.m_items.Count == 0) return;
-            s_done = true;
-
-            foreach (var go in db.m_items)
-            {
-                if (go == null) continue;
-                var shared = go.GetComponent<ItemDrop>()?.m_itemData?.m_shared;
-                var se = shared?.m_consumeStatusEffect;
-                if (se == null || !SetsAnyPheromoneField(se)) continue;
-
-                Plugin.Log.LogWarning(
-                    $"[{Plugin.Stamp}] [Diag] pheromoneItem item={go.name} " +
-                    $"effect={se.name} type={se.GetType().Name} " +
-                    $"ttl={se.m_ttl} attributes={(int)se.m_attributes}");
-
-                ReportEffectPrefabs("startEffect", se, se.m_startEffects);
-                ReportEffectPrefabs("stopEffect", se, se.m_stopEffects);
-
-                foreach (var fi in se.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance))
-                {
-                    object v;
-                    try { v = fi.GetValue(se); } catch { continue; }
-                    if (IsDefault(v)) continue;
-                    // Unity objects print their name; that is what we want here.
-                    string shown = v is UnityEngine.Object uo ? uo.name : v.ToString();
-                    if (shown.Length > 48) shown = shown.Substring(0, 48);
-                    Plugin.Log.LogWarning(
-                        $"[{Plugin.Stamp}] [Diag]   {fi.Name} = {shown}");
-                }
-            }
-        }
-    }
 
     /// <summary>
     /// v0.7.69 FIX (bug #11): run the pheromone mechanic server-side.
@@ -7449,26 +6982,7 @@ namespace ServerZoneOwnership
         private static bool s_scanned;
 
         internal static int s_alerts, s_fleeGrants;
-        internal static int s_bailNoEffects, s_bailNoMatch, s_ticked;
-        private static readonly HashSet<string> s_namedNoEffects = new HashSet<string>();
-        private static readonly HashSet<string> s_namedCandidates = new HashSet<string>();
 
-        // Named once per creature kind, so the log stays short and only ever
-        // mentions creatures the server has actually simulated.
-        internal static void NoteNoEffects(string name)
-        {
-            if (string.IsNullOrEmpty(name) || s_namedNoEffects.Count > 64) return;
-            if (!s_namedNoEffects.Add(name)) return;
-            Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Pheromone] no visual configured on {name}"
-                               + " - vanilla would bail here too");
-        }
-
-        internal static void NoteCandidate(string name)
-        {
-            if (string.IsNullOrEmpty(name) || s_namedCandidates.Count > 64) return;
-            if (!s_namedCandidates.Add(name)) return;
-            Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Pheromone] ticked but unmatched: {name}");
-        }
 
         /// <summary>
         /// Marker prefabs shared with unrelated effects are useless as a signal
@@ -7643,15 +7157,12 @@ namespace ServerZoneOwnership
         internal static string Drain()
         {
             if (s_markers.Count == 0) return null;
-            if (s_windows.Count == 0 && s_alerts == 0 && s_fleeGrants == 0
-                && s_bailNoEffects == 0 && s_bailNoMatch == 0) return null;
-            string s = $"pheromone markers={s_markers.Count} windows={s_windows.Count} " +
-                       $"ticked={System.Threading.Interlocked.Exchange(ref s_ticked, 0)} " +
-                       $"alerts={System.Threading.Interlocked.Exchange(ref s_alerts, 0)} " +
-                       $"fleeGrants={System.Threading.Interlocked.Exchange(ref s_fleeGrants, 0)} " +
-                       $"bailNoVisual={System.Threading.Interlocked.Exchange(ref s_bailNoEffects, 0)} " +
-                       $"bailNoMatch={System.Threading.Interlocked.Exchange(ref s_bailNoMatch, 0)}";
-            return s;
+            // Only speaks up while an effect is actually in play, so this is
+            // silent on a normal server and says what happened when it matters.
+            if (s_windows.Count == 0 && s_alerts == 0 && s_fleeGrants == 0) return null;
+            return $"pheromone markers={s_markers.Count} windows={s_windows.Count} " +
+                   $"alerts={System.Threading.Interlocked.Exchange(ref s_alerts, 0)} " +
+                   $"fleeGrants={System.Threading.Interlocked.Exchange(ref s_fleeGrants, 0)}";
         }
     }
 
@@ -7674,16 +7185,9 @@ namespace ServerZoneOwnership
             if (!Plugin.DebugPheromoneServerSide) return true;
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
             if (__instance == null || s_timerField == null) return true;
-            // v0.7.70: vanilla bails here for creatures with no visual configured.
-            // Counted and named once per prefab, because if the TARGET creature
-            // lands here then vanilla could never alert it either and the gate,
-            // not our plumbing, is what makes the item inert.
-            if (!__instance.m_pheromoneLoveEffect.HasEffects())
-            {
-                System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_bailNoEffects);
-                PheromoneServerSide.NoteNoEffects(__instance.m_name);
-                return false;
-            }
+            // Vanilla gates on this too: creatures with no effect configured do
+            // no work and cannot be alerted by this mechanic.
+            if (!__instance.m_pheromoneLoveEffect.HasEffects()) return false;
 
             float timer = (float)s_timerField.GetValue(__instance);
             if (timer < 0f) return false;
@@ -7691,13 +7195,8 @@ namespace ServerZoneOwnership
             if (timer > 0f) { s_timerField.SetValue(__instance, timer); return false; }
             s_timerField.SetValue(__instance, 5f);
 
-            System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_ticked);
             if (!PheromoneServerSide.TryMatch(__instance.m_name, __instance.transform.position))
-            {
-                System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_bailNoMatch);
-                PheromoneServerSide.NoteCandidate(__instance.m_name);
                 return false;
-            }
 
             __instance.m_pheromoneLoveEffect.Create(
                 __instance.transform.position, __instance.transform.rotation);
