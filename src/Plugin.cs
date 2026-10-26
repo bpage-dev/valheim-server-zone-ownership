@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.80";
+        public const string PluginVersion = "0.7.81";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -137,6 +137,11 @@ namespace ServerZoneOwnership
         // logs a warning, because a wrongful destroy would otherwise be hidden
         // rather than surfaced.
         internal const bool DebugGhostDestroyRetry = true;
+
+        // v0.7.81 bug #9 prevention: repeat each destroy broadcast once, so a
+        // single lost packet no longer leaves a cluster of phantoms. Loss on
+        // separate sends is independent, so this squares the failure rate.
+        internal const bool DebugDuplicateDestroySend = true;
 
         // --- Distance-tiered send rate (v0.7.30) ---------------------------
         // THE PROBLEM: because the server owns every mob, every mob's motion
@@ -521,6 +526,8 @@ namespace ServerZoneOwnership
                 _tickWorstMs = 0f;
             }
 
+            DuplicateDestroySend.Poll();
+
             if (DebugSendCensusSeconds > 0f)
             {
                 _censusTimer += Time.deltaTime;
@@ -693,6 +700,8 @@ namespace ServerZoneOwnership
             if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
             var srp = StatusEffectRpcWatch.Drain();
             if (srp != null) Log.LogInfo($"[{Stamp}] [Diag] {srp}");
+            var dds = DuplicateDestroySend.Drain();
+            if (dds != null) Log.LogInfo($"[{Stamp}] [Diag] {dds}");
             var gfx = GhostDestroyRetry.Drain();
             if (gfx != null) Log.LogWarning($"[{Stamp}] [Diag] {gfx}");
             var phr = PheromoneServerSide.Drain();
@@ -7824,6 +7833,106 @@ namespace ServerZoneOwnership
             if (!Plugin.DebugGhostDestroyRetry) return;
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             GhostDestroyRetry.NoteDestroyed(zdo);
+        }
+    }
+
+    /// <summary>
+    /// v0.7.81 FIX (bug #9, prevention): send every destroy twice.
+    ///
+    /// `ZDOMan.SendDestroyed` packs the whole destroy list into one ZPackage,
+    /// broadcasts it once with no acknowledgement and no retry, and clears the
+    /// list BEFORE the send. One lost packet therefore loses every destroy it
+    /// carried, which is why phantoms arrive in clusters — measured 2026-10-26
+    /// as ~60 successful pickups alongside four phantoms appearing together
+    /// from a single hive harvest.
+    ///
+    /// Packet loss on separate sends is independent, so repeating the broadcast
+    /// once takes the failure rate from p to roughly p squared. Unlike the
+    /// v0.7.80 retry, which reacts after a player has poked a phantom three
+    /// times, this prevents the phantom ever appearing.
+    ///
+    /// SAFETY — a duplicate destroy cannot destroy the wrong thing, for three
+    /// independent reasons, all checked in 1.0.20:
+    ///   1. `HandleDestroyedZDO` returns immediately when `GetZDO(uid)` is
+    ///      null, so a peer that already applied the first copy, or never had
+    ///      the object, does nothing. The operation is idempotent.
+    ///   2. Ids are allocated `m_nextUid++` with a collision loop in
+    ///      `CreateNewZDO`, so they are monotonic and never recycled within a
+    ///      session. `HandleDestroyedZDO` also pushes `m_nextUid` past any id
+    ///      it destroys, i.e. vanilla guards against reuse itself.
+    ///   3. `m_sessionID` is `Utils.GenerateUID()` per ZDOMan, so an id from an
+    ///      earlier run cannot collide with this run's.
+    /// The only dangerous operation would be destroying an id we never
+    /// destroyed; this re-sends exactly the list vanilla already broadcast.
+    ///
+    /// Cost is one extra small packet per destroy batch, and only when
+    /// something was actually destroyed.
+    /// </summary>
+    internal static class DuplicateDestroySend
+    {
+        // Long enough that the copies are unlikely to share a loss event,
+        // short enough that no client has time to render a phantom.
+        private const float ResendDelaySeconds = 1.0f;
+
+        private static readonly List<ZDOID> s_pending = new List<ZDOID>();
+        private static float s_dueAt;
+
+        internal static int s_batches, s_ids;
+
+        /// <summary>
+        /// Captured in a Prefix because `SendDestroyed` clears the list before
+        /// sending, so a Postfix would see nothing.
+        /// </summary>
+        internal static void Capture(List<ZDOID> list)
+        {
+            if (!Plugin.DebugDuplicateDestroySend) return;
+            if (list == null || list.Count == 0) return;
+            if (s_pending.Count > 4096) return;
+            s_pending.AddRange(list);
+            s_dueAt = Time.time + ResendDelaySeconds;
+        }
+
+        internal static void Poll()
+        {
+            if (!Plugin.DebugDuplicateDestroySend) return;
+            if (s_pending.Count == 0 || Time.time < s_dueAt) return;
+            if (ZRoutedRpc.instance == null) { s_pending.Clear(); return; }
+
+            // Same wire format vanilla uses: a count followed by the ids.
+            var pkg = new ZPackage();
+            pkg.Write(s_pending.Count);
+            foreach (var id in s_pending) pkg.Write(id);
+            ZRoutedRpc.instance.InvokeRoutedRPC(0L, "DestroyZDO", pkg);
+
+            System.Threading.Interlocked.Increment(ref s_batches);
+            System.Threading.Interlocked.Add(ref s_ids, s_pending.Count);
+            s_pending.Clear();
+        }
+
+        internal static string Drain()
+        {
+            int b = System.Threading.Interlocked.Exchange(ref s_batches, 0);
+            int n = System.Threading.Interlocked.Exchange(ref s_ids, 0);
+            if (b == 0) return null;
+            return $"destroyResend batches={b} ids={n}";
+        }
+    }
+
+    /// <summary>
+    /// v0.7.81: capture the destroy list before vanilla clears it.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDOMan), "SendDestroyed")]
+    internal static class ZDOMan_SendDestroyed_Duplicate_Patch
+    {
+        private static readonly FieldInfo s_destroySendList =
+            AccessTools.Field(typeof(ZDOMan), "m_destroySendList");
+
+        static void Prefix(ZDOMan __instance)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (__instance == null || s_destroySendList == null) return;
+            var list = s_destroySendList.GetValue(__instance) as List<ZDOID>;
+            DuplicateDestroySend.Capture(list);
         }
     }
 }
