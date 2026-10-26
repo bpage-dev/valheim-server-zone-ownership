@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.69";
+        public const string PluginVersion = "0.7.70";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -7414,6 +7414,26 @@ namespace ServerZoneOwnership
         private static bool s_scanned;
 
         internal static int s_alerts, s_fleeGrants;
+        internal static int s_bailNoEffects, s_bailNoMatch, s_ticked;
+        private static readonly HashSet<string> s_namedNoEffects = new HashSet<string>();
+        private static readonly HashSet<string> s_namedCandidates = new HashSet<string>();
+
+        // Named once per creature kind, so the log stays short and only ever
+        // mentions creatures the server has actually simulated.
+        internal static void NoteNoEffects(string name)
+        {
+            if (string.IsNullOrEmpty(name) || s_namedNoEffects.Count > 64) return;
+            if (!s_namedNoEffects.Add(name)) return;
+            Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Pheromone] no visual configured on {name}"
+                               + " - vanilla would bail here too");
+        }
+
+        internal static void NoteCandidate(string name)
+        {
+            if (string.IsNullOrEmpty(name) || s_namedCandidates.Count > 64) return;
+            if (!s_namedCandidates.Add(name)) return;
+            Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Pheromone] ticked but unmatched: {name}");
+        }
 
         /// <summary>
         /// Marker prefabs shared with unrelated effects are useless as a signal
@@ -7554,10 +7574,14 @@ namespace ServerZoneOwnership
         internal static string Drain()
         {
             if (s_markers.Count == 0) return null;
-            if (s_windows.Count == 0 && s_alerts == 0 && s_fleeGrants == 0) return null;
+            if (s_windows.Count == 0 && s_alerts == 0 && s_fleeGrants == 0
+                && s_bailNoEffects == 0 && s_bailNoMatch == 0) return null;
             string s = $"pheromone markers={s_markers.Count} windows={s_windows.Count} " +
+                       $"ticked={System.Threading.Interlocked.Exchange(ref s_ticked, 0)} " +
                        $"alerts={System.Threading.Interlocked.Exchange(ref s_alerts, 0)} " +
-                       $"fleeGrants={System.Threading.Interlocked.Exchange(ref s_fleeGrants, 0)}";
+                       $"fleeGrants={System.Threading.Interlocked.Exchange(ref s_fleeGrants, 0)} " +
+                       $"bailNoVisual={System.Threading.Interlocked.Exchange(ref s_bailNoEffects, 0)} " +
+                       $"bailNoMatch={System.Threading.Interlocked.Exchange(ref s_bailNoMatch, 0)}";
             return s;
         }
     }
@@ -7581,7 +7605,16 @@ namespace ServerZoneOwnership
             if (!Plugin.DebugPheromoneServerSide) return true;
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
             if (__instance == null || s_timerField == null) return true;
-            if (!__instance.m_pheromoneLoveEffect.HasEffects()) return false;
+            // v0.7.70: vanilla bails here for creatures with no visual configured.
+            // Counted and named once per prefab, because if the TARGET creature
+            // lands here then vanilla could never alert it either and the gate,
+            // not our plumbing, is what makes the item inert.
+            if (!__instance.m_pheromoneLoveEffect.HasEffects())
+            {
+                System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_bailNoEffects);
+                PheromoneServerSide.NoteNoEffects(__instance.m_name);
+                return false;
+            }
 
             float timer = (float)s_timerField.GetValue(__instance);
             if (timer < 0f) return false;
@@ -7589,8 +7622,13 @@ namespace ServerZoneOwnership
             if (timer > 0f) { s_timerField.SetValue(__instance, timer); return false; }
             s_timerField.SetValue(__instance, 5f);
 
+            System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_ticked);
             if (!PheromoneServerSide.TryMatch(__instance.m_name, __instance.transform.position))
+            {
+                System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_bailNoMatch);
+                PheromoneServerSide.NoteCandidate(__instance.m_name);
                 return false;
+            }
 
             __instance.m_pheromoneLoveEffect.Create(
                 __instance.transform.position, __instance.transform.rotation);
