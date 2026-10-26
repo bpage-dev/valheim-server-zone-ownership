@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.79";
+        public const string PluginVersion = "0.7.80";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -131,6 +131,12 @@ namespace ServerZoneOwnership
         // and vanilla never reads. BEYOND vanilla, deliberately - independent
         // of DebugPheromoneServerSide so it can be reverted on its own.
         internal const bool DebugPheromoneSpawnBoost = true;
+
+        // v0.7.80 bug #9: re-broadcast a destroy for a phantom object once a
+        // client has asked for it enough times to rule out a race. Every retry
+        // logs a warning, because a wrongful destroy would otherwise be hidden
+        // rather than surfaced.
+        internal const bool DebugGhostDestroyRetry = true;
 
         // --- Distance-tiered send rate (v0.7.30) ---------------------------
         // THE PROBLEM: because the server owns every mob, every mob's motion
@@ -687,6 +693,8 @@ namespace ServerZoneOwnership
             if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
             var srp = StatusEffectRpcWatch.Drain();
             if (srp != null) Log.LogInfo($"[{Stamp}] [Diag] {srp}");
+            var gfx = GhostDestroyRetry.Drain();
+            if (gfx != null) Log.LogWarning($"[{Stamp}] [Diag] {gfx}");
             var phr = PheromoneServerSide.Drain();
             if (phr != null) Log.LogInfo($"[{Stamp}] [Diag] {phr}");
             var phs = PheromoneSpawnOverride.Drain();
@@ -6309,6 +6317,9 @@ namespace ServerZoneOwnership
             rec.Hash = d.m_methodHash;
             s_ghosts[d.m_targetZDO] = rec;
 
+            GhostDestroyRetry.MaybeRetry(d.m_targetZDO, rec.Count,
+                                        RpcName(d.m_methodHash), d.m_senderPeerID);
+
             if (rec.Count == 2 || rec.Count % 5 == 0)
                 Plugin.Log.LogWarning(
                     $"[{Plugin.Stamp}] [Diag] GhostRPC rpc={RpcName(d.m_methodHash)} " +
@@ -7665,6 +7676,154 @@ namespace ServerZoneOwnership
                 who = $"{pf.name}@{Mathf.Sqrt(d):F1}m";
             }
             return who;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.80 FIX (bug #9): retry the destroy for a phantom object.
+    ///
+    /// THE BUG, captured 2026-10-26 on a hive harvest. `SendDestroyed` packs
+    /// the whole destroy list into ONE package, broadcasts it once with no
+    /// acknowledgement and no retry, and clears the list BEFORE the send. So a
+    /// single lost packet loses every destroy it carried. Measured that day:
+    /// ~60 honey picked up fine, four ghosts appearing together — one dropped
+    /// packet carrying four ids, which is why phantoms always arrive in
+    /// clusters rather than singly.
+    ///
+    /// The client keeps rendering an object whose ZDO we no longer have, so
+    /// every interaction with it dies at the ZDO-null check in
+    /// `ZRoutedRpc.HandleRoutedRPC` with no log and no reply. The item itself
+    /// did transfer; there is simply nothing left to pick up.
+    ///
+    /// THE FIX. A repeated RPC for a ZDO we do not hold is proof the sender
+    /// still believes in it, so re-broadcast the destroy. Safety rests on one
+    /// precise guard:
+    ///
+    ///     uid.UserID == ZDOMan.GetSessionID()
+    ///
+    /// `m_sessionID` is `Utils.GenerateUID()` per ZDOMan, i.e. fresh on every
+    /// server start, and ids come from `m_nextUid++` so they are never reused
+    /// within a session. Therefore a matching UserID means WE created it during
+    /// THIS run; since we no longer hold it, we destroyed it. It cannot be a
+    /// client-created ZDO (different UserID), cannot be an earlier session's
+    /// (different UserID), and cannot be live (GetZDO would have found it —
+    /// there is no transient-null path for a ZDO still in the world data).
+    /// Peers lacking the id ignore the message: `HandleDestroyedZDO` returns
+    /// immediately when `GetZDO(uid) == null`.
+    ///
+    /// ⚠️ WHY THIS LOGS LOUDLY. If the server ever destroys something in error,
+    /// this would make clients agree with the mistake instead of leaving a
+    /// visible phantom as evidence — curing a symptom while hiding its cause.
+    /// So every retry is a warning naming the prefab. An `RPC_RequestOwn` line
+    /// means a pickup ghost and the item should already be in that player's
+    /// inventory; any other rpc means a client was interacting with something
+    /// else we destroyed, where nothing transferred. We cannot verify the
+    /// inventory ourselves — player inventories are not in the ZDO.
+    /// </summary>
+    internal static class GhostDestroyRetry
+    {
+        // Three strikes: a benign race produces exactly one, so this cannot
+        // fire on a client acting a frame after a legitimate destroy.
+        private const int RetryAfterHits = 3;
+        private const float NameMemorySeconds = 120f;
+
+        private static readonly FieldInfo s_destroySendList =
+            AccessTools.Field(typeof(ZDOMan), "m_destroySendList");
+
+        private struct Gone { public string Prefab; public float At; }
+        private static readonly Dictionary<ZDOID, Gone> s_recentlyDestroyed =
+            new Dictionary<ZDOID, Gone>();
+        private static readonly HashSet<ZDOID> s_retried = new HashSet<ZDOID>();
+
+        internal static int s_retries;
+
+        /// <summary>
+        /// Once a ZDO is destroyed its prefab is unrecoverable, so the name is
+        /// captured at destroy time or the warning can only print an id.
+        /// </summary>
+        internal static void NoteDestroyed(ZDO zdo)
+        {
+            if (zdo == null) return;
+            if (s_recentlyDestroyed.Count > 4096) return;
+            string name = "?";
+            var scene = ZNetScene.instance;
+            if (scene != null)
+            {
+                var pf = scene.GetPrefab(zdo.GetPrefab());
+                if (pf != null) name = pf.name;
+            }
+            s_recentlyDestroyed[zdo.m_uid] = new Gone { Prefab = name, At = Time.time };
+        }
+
+        private static void Sweep()
+        {
+            if (s_recentlyDestroyed.Count == 0) return;
+            List<ZDOID> stale = null;
+            foreach (var kv in s_recentlyDestroyed)
+                if (Time.time - kv.Value.At > NameMemorySeconds)
+                    (stale ?? (stale = new List<ZDOID>())).Add(kv.Key);
+            if (stale == null) return;
+            foreach (var id in stale) { s_recentlyDestroyed.Remove(id); s_retried.Remove(id); }
+        }
+
+        /// <summary>
+        /// Called from the ghost path once a ZDOID has been asked for enough
+        /// times to rule out a race.
+        /// </summary>
+        internal static void MaybeRetry(ZDOID uid, int hits, string rpcName, long sender)
+        {
+            if (!Plugin.DebugGhostDestroyRetry) return;
+            if (hits < RetryAfterHits) return;
+            if (ZDOMan.instance == null) return;
+            if (uid.UserID != ZDOMan.GetSessionID()) return;   // not ours; never touch it
+            if (!s_retried.Add(uid)) return;                   // one retry per object
+
+            var list = s_destroySendList?.GetValue(ZDOMan.instance) as List<ZDOID>;
+            if (list == null)
+            {
+                Plugin.Log.LogError($"[{Plugin.Stamp}] [GhostFix] cannot reach the destroy "
+                                    + "list; retry skipped");
+                return;
+            }
+            list.Add(uid);
+            System.Threading.Interlocked.Increment(ref s_retries);
+
+            Gone gone;
+            string what = s_recentlyDestroyed.TryGetValue(uid, out gone) ? gone.Prefab : "?";
+            string age = s_recentlyDestroyed.TryGetValue(uid, out gone)
+                ? $"{Time.time - gone.At:F0}s ago" : "not seen destroyed";
+            Plugin.Log.LogWarning(
+                $"[{Plugin.Stamp}] [GhostFix] RE-SENT destroy for {what} zdo={uid} "
+                + $"rpc={rpcName} sender={sender} hits={hits} destroyed={age} "
+                + "— a phantom WOULD have persisted here"
+                + (rpcName == "RPC_RequestOwn"
+                    ? "; the item did transfer, so it should already be in that player's inventory"
+                    : "; this was not a pickup, so nothing transferred"));
+
+            Sweep();
+        }
+
+        internal static string Drain()
+        {
+            int n = System.Threading.Interlocked.Exchange(ref s_retries, 0);
+            if (n == 0) return null;
+            return $"ghostFix retries={n} namesHeld={s_recentlyDestroyed.Count}";
+        }
+    }
+
+    /// <summary>
+    /// v0.7.80: capture the prefab name at destroy time for the retry warning.
+    /// `ZDOMan.DestroyZDO` is where we still have the ZDO; by the time a client
+    /// asks about it, it is gone and unnameable.
+    /// </summary>
+    [HarmonyPatch(typeof(ZDOMan), "DestroyZDO")]
+    internal static class ZDOMan_DestroyZDO_GhostNames_Patch
+    {
+        static void Prefix(ZDO zdo)
+        {
+            if (!Plugin.DebugGhostDestroyRetry) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            GhostDestroyRetry.NoteDestroyed(zdo);
         }
     }
 }
