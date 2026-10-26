@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.65";
+        public const string PluginVersion = "0.7.66";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -683,6 +683,8 @@ namespace ServerZoneOwnership
             if (sea != null) Log.LogInfo($"[{Stamp}] [Diag] {sea}");
             var cch = ConsumerChainDiag.Drain();
             if (cch != null) Log.LogInfo($"[{Stamp}] [Diag] {cch}");
+            var srp = StatusEffectRpcWatch.Drain();
+            if (srp != null) Log.LogInfo($"[{Stamp}] [Diag] {srp}");
             MountSyncDiag.Flush();
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
@@ -6319,6 +6321,8 @@ namespace ServerZoneOwnership
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             if (__0.m_targetZDO.IsNone()) return;   // global RPC, not an object interaction
 
+            StatusEffectRpcWatch.Note(__0);
+
             var zdo = ZDOMan.instance?.GetZDO(__0.m_targetZDO);
             if (zdo == null) { s_noZdo++; NoteNoZdo(__0); return; }
 
@@ -7129,6 +7133,77 @@ namespace ServerZoneOwnership
             Plugin.Log.LogInfo(
                 $"[{Plugin.Stamp}] [Diag] consumableCensus items={db.m_items.Count} " +
                 $"withConsumeEffect={withEffect}");
+        }
+    }
+
+    /// <summary>
+    /// v0.7.66 (bug #11): is there ANY channel by which this server could learn
+    /// a player's active status effects?
+    ///
+    /// The consumer we found reads the player's LOCAL effect list, and no ZDO
+    /// field carries that state, so the server currently cannot know. Whether a
+    /// fix is possible at all comes down to one question: does the effect's
+    /// registration RPC transit this server?
+    ///
+    /// SEMan.AddStatusEffect applies locally under `if (m_nview.IsOwner())` and
+    /// then calls InvokeRPC("RPC_AddStatusEffect", ...), which targets the ZDO's
+    /// OWNER. For a player's own effect the caller IS the owner, so ZRoutedRpc
+    /// may well handle it locally and never put it on the wire — in which case
+    /// we never see it and no server-side fix exists through this route.
+    ///
+    /// Measuring rather than reasoning about it, because the answer decides the
+    /// whole approach:
+    ///
+    ///   seen>0 targeting a player -> we have a channel; mirror the effect into
+    ///                                our copy of that player's manager
+    ///   seen=0                    -> no channel; the only remaining levers are
+    ///                                handing creature ownership to the nearby
+    ///                                player (as for ships in v0.6.4 and mounts
+    ///                                in v0.7.47) or inferring it some other way
+    ///
+    /// Counts every routed RPC by name as well, so if the effect travels under
+    /// a different call than expected it still shows up.
+    /// </summary>
+    internal static class StatusEffectRpcWatch
+    {
+        private static readonly int s_addSeHash = "RPC_AddStatusEffect".GetStableHashCode();
+
+        private static int s_seen, s_onPlayer, s_total;
+        private static readonly Dictionary<int, int> s_allNames = new Dictionary<int, int>();
+
+        internal static void Note(ZRoutedRpc.RoutedRPCData d)
+        {
+            if (d == null) return;
+            s_total++;
+
+            if (s_allNames.TryGetValue(d.m_methodHash, out int c)) s_allNames[d.m_methodHash] = c + 1;
+            else if (s_allNames.Count < 64) s_allNames[d.m_methodHash] = 1;
+
+            if (d.m_methodHash != s_addSeHash) return;
+            s_seen++;
+
+            var zdo = ZDOMan.instance?.GetZDO(d.m_targetZDO);
+            bool onPlayer = false;
+            if (zdo != null && ZNetScene.instance != null)
+            {
+                var view = ZNetScene.instance.FindInstance(zdo);
+                onPlayer = view != null && view.GetComponent<Player>() != null;
+            }
+            if (onPlayer) s_onPlayer++;
+
+            Plugin.Log.LogWarning(
+                $"[{Plugin.Stamp}] [Diag] StatusEffectRPC seen sender={d.m_senderPeerID} " +
+                $"target={d.m_targetZDO} onPlayer={onPlayer} n={s_seen}");
+        }
+
+        internal static string Drain()
+        {
+            if (s_total == 0) return null;
+            string top = string.Join(" ", s_allNames.OrderByDescending(kv => kv.Value).Take(8)
+                .Select(kv => $"{ZRoutedRpc_HandleRoutedRPC_DeadWindow_Patch.RpcName(kv.Key)}x{kv.Value}"));
+            string s = $"routedRpc total={s_total} addStatusEffect={s_seen} onPlayer={s_onPlayer} | {top}";
+            s_total = 0; s_seen = 0; s_onPlayer = 0; s_allNames.Clear();
+            return s;
         }
     }
 }
