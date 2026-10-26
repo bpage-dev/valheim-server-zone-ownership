@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.58";
+        public const string PluginVersion = "0.7.59";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -662,6 +662,9 @@ namespace ServerZoneOwnership
             if (cs != null) Log.LogInfo($"[{Stamp}] [Diag] {cs}");
             var lp = Procreation_Diag_Patch.Drain();
             if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
+            StatusAttribWatch.Poll();
+            var sea = SEMan_HaveStatusAttribute_Diag_Patch.Drain();
+            if (sea != null) Log.LogInfo($"[{Stamp}] [Diag] {sea}");
             MountSyncDiag.Flush();
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
@@ -6775,6 +6778,141 @@ namespace ServerZoneOwnership
             var shown = string.Join(" ", ordered.Take(take).Select(kv => $"{kv.Key}×{kv.Value}"));
             int rest = ordered.Count - take;
             return rest > 0 ? $"{shown} (+{rest} more)" : shown;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.59 diagnostic (bug #11): does this server ever see a client's
+    /// active status-effect attributes?
+    ///
+    /// Vanilla replicates a BITMASK, not the effects themselves:
+    ///   SEMan.HaveStatusEffect(hash) reads m_statusEffectsHashSet, a purely
+    ///   LOCAL collection, so it is always false on a machine that does not
+    ///   own the character.
+    ///   SEMan.HaveStatusAttribute(attr) is the cross-machine path: when not
+    ///   the owner it falls back to ZDOVars.s_seAttrib on the ZDO.
+    /// That mask is written in SEMan.Update, which Character.CustomFixedUpdate
+    /// reaches only inside `if (zDO.IsOwner())` — so the owning client writes
+    /// it and every other machine reads it over ZDO sync.
+    ///
+    /// This matters because our server owns and simulates the world, so a
+    /// consumer that reacts to a player's active effect now evaluates HERE,
+    /// against a mask we never write and only receive. Four outcomes, each
+    /// pointing somewhere different:
+    ///
+    ///   never called              -> the consumer is not running server-side
+    ///                               at all; look at what gates it
+    ///   called, mask always 0     -> the attribute is not reaching us; the
+    ///                               replication path is the bug
+    ///   called, mask != 0, false  -> it arrives, but not the bit being tested
+    ///   called, result true       -> the check passes; the fault is downstream
+    ///
+    /// Deliberately patched on the GENERIC status API rather than on any
+    /// particular consumer, so it reports for every effect and hard-codes
+    /// nothing about which one is under investigation. Logs the raw numeric
+    /// bit rather than the enum name, so the output stays readable without
+    /// naming what is being tested.
+    /// </summary>
+    [HarmonyPatch(typeof(SEMan), "HaveStatusAttribute")]
+    internal static class SEMan_HaveStatusAttribute_Diag_Patch
+    {
+        private static readonly FieldInfo s_charField = AccessTools.Field(typeof(SEMan), "m_character");
+        private static readonly FieldInfo s_nviewField = AccessTools.Field(typeof(SEMan), "m_nview");
+
+        private struct Tally
+        {
+            public int True, False, MaskZero, MaskSet, LastMask;
+        }
+
+        private static readonly Dictionary<int, Tally> s_byAttr = new Dictionary<int, Tally>();
+        private static int s_onPlayers, s_onOthers;
+
+        static void Postfix(SEMan __instance, StatusEffect.StatusAttribute value, bool __result)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (__instance == null) return;
+
+            var ch = s_charField?.GetValue(__instance) as Character;
+            bool onPlayer = ch is Player;
+            if (onPlayer) s_onPlayers++; else s_onOthers++;
+            // Only the player side is in question: a creature's own attributes
+            // are written by us, since we own the creature.
+            if (!onPlayer) return;
+
+            int mask = 0;
+            var nview = s_nviewField?.GetValue(__instance) as ZNetView;
+            if (nview != null && nview.IsValid())
+            {
+                var zdo = nview.GetZDO();
+                if (zdo != null) mask = zdo.GetInt(ZDOVars.s_seAttrib, 0);
+            }
+
+            int key = (int)value;
+            bool known = s_byAttr.TryGetValue(key, out var t);
+            if (!known && s_byAttr.Count >= 32) return;
+            if (__result) t.True++; else t.False++;
+            if (mask == 0) t.MaskZero++; else { t.MaskSet++; t.LastMask = mask; }
+            s_byAttr[key] = t;
+        }
+
+        internal static string Drain()
+        {
+            if (s_onPlayers == 0 && s_onOthers == 0) return null;
+            string per = string.Join(" ", s_byAttr.OrderBy(kv => kv.Key).Select(kv =>
+                $"bit{kv.Key}[true={kv.Value.True} false={kv.Value.False} " +
+                $"mask0={kv.Value.MaskZero} maskSet={kv.Value.MaskSet} last={kv.Value.LastMask}]"));
+            string s = $"seAttrib onPlayers={s_onPlayers} onOthers={s_onOthers} {per}";
+            s_onPlayers = 0; s_onOthers = 0; s_byAttr.Clear();
+            return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.59: the other half of the same question, and the one that does not
+    /// depend on any consumer running at all. Reads the replicated attribute
+    /// mask straight off each connected player's own ZDO.
+    ///
+    /// A non-zero mask here proves the client->server path works and the
+    /// server can see that player's active effects. Zero while an effect is
+    /// known to be active proves it does not. Also reports the server-side
+    /// Player instance count, because every vanilla consumer finds its subject
+    /// through Player.GetAllPlayers(), which returns the static s_players list
+    /// filled in Player.Awake — if the server never instantiates Player
+    /// objects that list is empty and no consumer can ever find anybody,
+    /// whatever the mask says. See [[valheim-local-player-concept]].
+    /// </summary>
+    internal static class StatusAttribWatch
+    {
+        private static int s_sinceLast;
+
+        internal static void Poll()
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            // The flush tick is ~20s; every third keeps this cheap.
+            if (++s_sinceLast < 3) return;
+            s_sinceLast = 0;
+
+            var peers = ZNet.instance.GetPeers();
+            if (peers == null || peers.Count == 0) return;
+
+            var sb = new System.Text.StringBuilder();
+            int n = 0;
+            foreach (var peer in peers)
+            {
+                if (peer == null || peer.m_characterID.IsNone()) continue;
+                var zdo = ZDOMan.instance?.GetZDO(peer.m_characterID);
+                // -1 distinguishes "no ZDO at all" from a genuine mask of 0.
+                int mask = zdo != null ? zdo.GetInt(ZDOVars.s_seAttrib, 0) : -1;
+                bool inst = zdo != null && ZNetScene.instance != null
+                            && ZNetScene.instance.FindInstance(zdo) != null;
+                if (n++ > 0) sb.Append(" | ");
+                sb.Append($"{peer.m_playerName} mask={mask} inst={inst}");
+            }
+            if (n == 0) return;
+
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [Diag] seAttribWatch players={Player.GetAllPlayers().Count} " +
+                $"localPlayer={(Player.m_localPlayer == null ? "null" : "set")} | {sb}");
         }
     }
 }
