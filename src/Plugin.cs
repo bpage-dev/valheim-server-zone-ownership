@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.72";
+        public const string PluginVersion = "0.7.73";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -7803,6 +7803,7 @@ namespace ServerZoneOwnership
                 $"[{Plugin.Stamp}] [Pheromone] spawner '{spawner.m_name}' for {creature}: "
                 + $"spawnRadius {min}-{max}m, keepDistance={spawner.m_spawnDistance}m, "
                 + $"chance={spawner.m_spawnChance} max={spawner.m_maxSpawned} "
+                + $"interval={spawner.m_spawnInterval}s group={spawner.m_groupSizeMin}-{spawner.m_groupSizeMax} "
                 + $"level={spawner.m_minLevel}-{spawner.m_maxLevel} "
                 + $"(our radius={Plugin.PheromoneRadius}m)");
         }
