@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.75";
+        public const string PluginVersion = "0.7.76";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -7956,6 +7956,7 @@ namespace ServerZoneOwnership
         private static float s_bestDist = float.MaxValue;
         private static Vector3 s_bestPos;
         private static string s_bestPeer = "?";
+        private static Vector3 s_bestFrom;
 
         internal static void MaybeReportRange()
         {
@@ -8023,6 +8024,7 @@ namespace ServerZoneOwnership
                 s_bestDist = d;
                 s_bestPos = pos;
                 s_bestPeer = peer.m_playerName;
+                s_bestFrom = peer.m_refPos;
             }
         }
 
@@ -8039,12 +8041,24 @@ namespace ServerZoneOwnership
 
             var pos = s_bestPos;
             Plugin.Log.LogWarning(
-                $"[{Plugin.Stamp}] [WaterFX] NEAREST impact {s_bestDist:F0}m from {s_bestPeer} "
-                + $"at world({pos.x:F0},{pos.y:F1},{pos.z:F0}) "
+                $"[{Plugin.Stamp}] [WaterFX] NEAREST impact {s_bestDist:F0}m {Bearing(s_bestFrom, pos)} "
+                + $"of {s_bestPeer} | you=world({s_bestFrom.x:F0},{s_bestFrom.z:F0}) "
+                + $"log=world({pos.x:F0},{pos.y:F1},{pos.z:F0}) "
                 + $"source={NearestCulprit(pos)} totalSeen={s_seen}");
 
             s_bestDist = float.MaxValue;
             s_bestPeer = "?";
+        }
+
+        // v0.7.76: a distance alone cannot be walked. +Z is north, +X is east.
+        private static string Bearing(Vector3 from, Vector3 to)
+        {
+            float dx = to.x - from.x, dz = to.z - from.z;
+            string[] pts = { "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                             "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW" };
+            float deg = Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
+            if (deg < 0f) deg += 360f;
+            return pts[(int)((deg + 11.25f) / 22.5f) % 16];
         }
 
         // The thing making the splash should be the closest non-effect object.
