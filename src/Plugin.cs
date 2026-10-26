@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.70";
+        public const string PluginVersion = "0.7.71";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -123,6 +123,11 @@ namespace ServerZoneOwnership
         // a client is implicitly bounded because only nearby players exist. On
         // this server they all exist, so this restores that de facto bound.
         internal const float PheromoneRadius = 64f;
+
+        // v0.7.71 bug #11: implement the spawn/level values the asset authors
+        // and vanilla never reads. BEYOND vanilla, deliberately - independent
+        // of DebugPheromoneServerSide so it can be reverted on its own.
+        internal const bool DebugPheromoneSpawnBoost = true;
 
         // --- Distance-tiered send rate (v0.7.30) ---------------------------
         // THE PROBLEM: because the server owns every mob, every mob's motion
@@ -696,6 +701,8 @@ namespace ServerZoneOwnership
             if (srp != null) Log.LogInfo($"[{Stamp}] [Diag] {srp}");
             var phr = PheromoneServerSide.Drain();
             if (phr != null) Log.LogInfo($"[{Stamp}] [Diag] {phr}");
+            var phs = PheromoneSpawnOverride.Drain();
+            if (phs != null) Log.LogInfo($"[{Stamp}] [Diag] {phs}");
             MountSyncDiag.Flush();
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
@@ -1609,6 +1616,12 @@ namespace ServerZoneOwnership
             SpawnSystem instance, List<SpawnSystem.SpawnData> spawners, DateTime time,
             bool eventSpawners, string groupSalt)
         {
+            // v0.7.71: the pheromone spawn/level overrides are applied for the
+            // duration of this call only, and restored in the finally. These
+            // are shared, persistent SpawnData objects — leaving one modified
+            // would change the world permanently.
+            PheromoneSpawnOverride.Begin(
+                spawners, (instance != null) ? instance.transform.position : Vector3.zero);
             try
             {
                 UpdateSpawnListMethod.Invoke(
@@ -1617,6 +1630,10 @@ namespace ServerZoneOwnership
             catch (TargetInvocationException ex) when (ex.InnerException is NullReferenceException)
             {
                 System.Threading.Interlocked.Increment(ref s_suppressedNRECount);
+            }
+            finally
+            {
+                PheromoneSpawnOverride.End();
             }
         }
     }
@@ -7398,6 +7415,11 @@ namespace ServerZoneOwnership
             public bool Flee;
             public float Ttl;
             public string EffectName;   // diagnostics only
+            // v0.7.71: the four authored values vanilla never reads.
+            public float SpawnChance;
+            public int MinLevel;
+            public int MaxInstances;
+            public float LevelUpMult;
         }
 
         internal struct Window
@@ -7480,7 +7502,11 @@ namespace ServerZoneOwnership
                         TargetName = ch.m_name,
                         Flee = stats.m_pheromoneFlee,
                         Ttl = se.m_ttl,
-                        EffectName = se.name
+                        EffectName = se.name,
+                        SpawnChance = stats.m_pheromoneSpawnChanceOverride,
+                        MinLevel = stats.m_pheromoneSpawnMinLevel,
+                        MaxInstances = stats.m_pheromoneMaxInstanceOverride,
+                        LevelUpMult = stats.m_pheromoneLevelUpMultiplier
                     };
                 }
             }
@@ -7492,7 +7518,9 @@ namespace ServerZoneOwnership
                 s_markers[kv.Key] = kv.Value;
                 Plugin.Log.LogInfo(
                     $"[{Plugin.Stamp}] [Pheromone] marker registered effect={kv.Value.EffectName} " +
-                    $"target={kv.Value.TargetName} flee={kv.Value.Flee} ttl={kv.Value.Ttl}s");
+                    $"target={kv.Value.TargetName} flee={kv.Value.Flee} ttl={kv.Value.Ttl}s "
+                    + $"spawnChance={kv.Value.SpawnChance} minLevel={kv.Value.MinLevel} "
+                    + $"maxInstances={kv.Value.MaxInstances} levelUpMult={kv.Value.LevelUpMult}");
             }
             Plugin.Log.LogInfo(
                 $"[{Plugin.Stamp}] [Pheromone] scan complete: {s_markers.Count} usable marker(s) " +
@@ -7554,6 +7582,24 @@ namespace ServerZoneOwnership
                 if (w.Spec.Flee) continue;                 // flee is the AI predicate's job
                 if (w.Spec.TargetName != creatureName) continue;
                 if (Utils.DistanceSqr(w.Pos, creaturePos) > r2) continue;
+                return true;
+            }
+            return false;
+        }
+
+        // v0.7.71: spawn-side lookup. Unlike TryMatch this does not skip flee
+        // windows - a repellent authoring spawn values should honour them too -
+        // and it hands back the spec so the caller can apply them.
+        internal static bool TryMatchSpawn(string creatureName, Vector3 pos, out Spec spec)
+        {
+            spec = default(Spec);
+            if (s_windows.Count == 0 || string.IsNullOrEmpty(creatureName)) return false;
+            float r2 = Plugin.PheromoneRadius * Plugin.PheromoneRadius;
+            foreach (var w in s_windows)
+            {
+                if (w.Spec.TargetName != creatureName) continue;
+                if (Utils.DistanceSqr(w.Pos, pos) > r2) continue;
+                spec = w.Spec;
                 return true;
             }
             return false;
@@ -7662,6 +7708,162 @@ namespace ServerZoneOwnership
 
             __result = true;
             System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_fleeGrants);
+        }
+    }
+
+    /// <summary>
+    /// v0.7.71 (bug #11, second half): implement the spawn and level behaviour
+    /// the asset specifies and the game never reads.
+    ///
+    /// NOT a vanilla restoration — this is deliberately BEYOND vanilla, and the
+    /// distinction matters for future maintenance. The effect authors four
+    /// values (spawn chance, instance cap, minimum level, level-up multiplier)
+    /// and nothing consumes them. Verified at IL level against the running
+    /// assembly: 34 occurrences of "pheromone" in 637k lines of IL, and of the
+    /// four fields only their declarations plus one constructor store of a
+    /// default. No ldfld anywhere. The same search finds 4 and 2 references for
+    /// the two fields that DO work, so the method demonstrably finds reads.
+    ///
+    /// Consequence: if the developers ever implement these, our values will
+    /// stack with theirs and the result will be wrong rather than merely
+    /// duplicated. That is an accepted risk, taken knowingly — see the audit
+    /// note in [[valheim-vanilla-decompile-snapshot]]. The check is cheap: grep
+    /// the IL for a ldfld on any of the four.
+    ///
+    /// SCOPE. Applied only while a window is open AND only to spawn systems
+    /// within the pheromone radius of that window, so a potion affects spawning
+    /// near its drinker rather than world-wide. Same scoping approach as the
+    /// event-spawn work in v0.7.52.
+    ///
+    /// SAFETY. SpawnData objects are shared, persistent configuration loaded
+    /// from the spawn list. Mutating one and failing to restore it would alter
+    /// the world permanently, so the override is strictly scoped: applied
+    /// immediately before the vanilla call and restored in a finally, the same
+    /// pattern as the sort-origin override in v0.7.55. Interval bookkeeping is
+    /// keyed by prefab name in the ZDO rather than by SpawnData identity, so
+    /// touching these fields cannot disturb spawn timing.
+    ///
+    /// Each override takes the MAXIMUM of the authored value and what the
+    /// spawner already specifies. The fields are named "override", so
+    /// replacement is the authored intent, but a spawner whose chance already
+    /// exceeds 25 would then have its rate REDUCED by drinking a potion meant
+    /// to raise it. Max keeps the intent and removes that edge.
+    /// </summary>
+    internal static class PheromoneSpawnOverride
+    {
+        private struct Saved
+        {
+            public SpawnSystem.SpawnData Data;
+            public float Chance;
+            public int MaxSpawned;
+            public int MinLevel;
+        }
+
+        private static readonly List<Saved> s_saved = new List<Saved>();
+        private static readonly Dictionary<int, string> s_prefabCreatureName = new Dictionary<int, string>();
+
+        internal static int s_entriesBoosted, s_levelBoosts;
+
+        // SpawnData.m_prefab -> that creature's m_name, cached. Instance id is
+        // stable for a loaded prefab, so this is safe as a key.
+        private static string CreatureName(GameObject prefab)
+        {
+            if (prefab == null) return null;
+            int key = prefab.GetInstanceID();
+            string name;
+            if (s_prefabCreatureName.TryGetValue(key, out name)) return name;
+            var ch = prefab.GetComponent<Character>();
+            name = (ch != null) ? ch.m_name : null;
+            s_prefabCreatureName[key] = name;
+            return name;
+        }
+
+        internal static void Begin(List<SpawnSystem.SpawnData> spawners, Vector3 spawnSystemPos)
+        {
+            s_saved.Clear();
+            if (!Plugin.DebugPheromoneSpawnBoost) return;
+            if (spawners == null || spawners.Count == 0) return;
+
+            foreach (var spawner in spawners)
+            {
+                if (spawner == null || spawner.m_prefab == null) continue;
+                string creature = CreatureName(spawner.m_prefab);
+                if (string.IsNullOrEmpty(creature)) continue;
+
+                PheromoneServerSide.Spec spec;
+                if (!PheromoneServerSide.TryMatchSpawn(creature, spawnSystemPos, out spec)) continue;
+                if (spec.SpawnChance <= 0f && spec.MaxInstances <= 0 && spec.MinLevel <= 0) continue;
+
+                s_saved.Add(new Saved
+                {
+                    Data = spawner,
+                    Chance = spawner.m_spawnChance,
+                    MaxSpawned = spawner.m_maxSpawned,
+                    MinLevel = spawner.m_minLevel
+                });
+
+                if (spec.SpawnChance > 0f)
+                    spawner.m_spawnChance = Mathf.Max(spawner.m_spawnChance, spec.SpawnChance);
+                if (spec.MaxInstances > 0)
+                    spawner.m_maxSpawned = Mathf.Max(spawner.m_maxSpawned, spec.MaxInstances);
+                if (spec.MinLevel > 0)
+                {
+                    spawner.m_minLevel = Mathf.Max(spawner.m_minLevel, spec.MinLevel);
+                    // m_maxLevel below m_minLevel would make the level loop
+                    // never run, silently losing the star the override asks for.
+                    if (spawner.m_maxLevel < spawner.m_minLevel)
+                        spawner.m_maxLevel = spawner.m_minLevel;
+                }
+                System.Threading.Interlocked.Increment(ref s_entriesBoosted);
+            }
+        }
+
+        internal static void End()
+        {
+            for (int i = 0; i < s_saved.Count; i++)
+            {
+                var s = s_saved[i];
+                if (s.Data == null) continue;
+                s.Data.m_spawnChance = s.Chance;
+                s.Data.m_maxSpawned = s.MaxSpawned;
+                s.Data.m_minLevel = s.MinLevel;
+            }
+            s_saved.Clear();
+        }
+
+        internal static string Drain()
+        {
+            int e = System.Threading.Interlocked.Exchange(ref s_entriesBoosted, 0);
+            int l = System.Threading.Interlocked.Exchange(ref s_levelBoosts, 0);
+            if (e == 0 && l == 0) return null;
+            return $"pheromoneSpawn entriesBoosted={e} levelBoosts={l}";
+        }
+    }
+
+    /// <summary>
+    /// v0.7.71: the level-up multiplier, which has no SpawnData field to
+    /// override — vanilla computes the chance in this method instead. Scaling
+    /// the result is the only place it can be applied.
+    /// </summary>
+    [HarmonyPatch(typeof(SpawnSystem), "GetLevelUpChance",
+        new System.Type[] { typeof(Vector3), typeof(SpawnSystem.SpawnData) })]
+    internal static class SpawnSystem_GetLevelUpChance_Patch
+    {
+        static void Postfix(Vector3 position, SpawnSystem.SpawnData creature, ref float __result)
+        {
+            if (!Plugin.DebugPheromoneSpawnBoost) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (creature == null || creature.m_prefab == null) return;
+
+            var ch = creature.m_prefab.GetComponent<Character>();
+            if (ch == null) return;
+
+            PheromoneServerSide.Spec spec;
+            if (!PheromoneServerSide.TryMatchSpawn(ch.m_name, position, out spec)) return;
+            if (spec.LevelUpMult <= 1f) return;
+
+            __result *= spec.LevelUpMult;
+            System.Threading.Interlocked.Increment(ref PheromoneSpawnOverride.s_levelBoosts);
         }
     }
 }
