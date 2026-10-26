@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.73";
+        public const string PluginVersion = "0.7.74";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -1768,6 +1768,7 @@ namespace ServerZoneOwnership
             s_frame++;
             s_unionBuiltThisTick = false;
             PheromoneServerSide.MaybeScan();
+            WaterImpactDiag.MaybeReportRange();
 
             var simDist = ServerCoverage.GetSimulationDistance();
             var zdoMan = ZDOMan.instance;
@@ -1887,6 +1888,7 @@ namespace ServerZoneOwnership
                 {
                     if (!s_seenNear.Add(zdo)) continue;
                     PheromoneServerSide.Offer(zdo);
+                    WaterImpactDiag.Offer(zdo);
                     unionNear.Add(zdo);
                 }
                 foreach (var zdo in s_distantBuffer)
@@ -7913,6 +7915,138 @@ namespace ServerZoneOwnership
 
             __result *= spec.LevelUpMult;
             System.Threading.Interlocked.Increment(ref PheromoneSpawnOverride.s_levelBoosts);
+        }
+    }
+
+    /// <summary>
+    /// v0.7.74 diagnostic (bug #29): name the source of the repeating water
+    /// impact effect.
+    ///
+    /// Reported as an ocean-wave sound every ~20s with no visible cause. It is
+    /// a networked one-shot effect: the prefab carries a ZNetView, so each
+    /// instantiation creates a ZDO that replicates, which is why it reaches a
+    /// player who cannot see the source and why it appears in our send census
+    /// at all — a local-only effect never would.
+    ///
+    /// NOT caused by anything recent. 702 occurrences across ~400MB of log, the
+    /// earliest at 2026-10-02 01:11:51, which is as far back as the log retains.
+    /// Signature is one send per instance at 6 bytes with distinct == sends,
+    /// i.e. created, synced once, gone. Something is repeatedly entering water
+    /// 85-194m from the player.
+    ///
+    /// Cost is trivial in bandwidth. The reason it is worth identifying is that
+    /// a physics event repeating forever at the edge of the simulated area is
+    /// the kind of thing that quietly burns CPU, and since we now own every
+    /// object it runs whether or not anyone is nearby.
+    ///
+    /// Logs each occurrence's position, the nearest plausible culprit, and the
+    /// distance to each peer, rate-limited. Also reports the prefab's audio
+    /// rolloff once, which is the actual audible range.
+    /// </summary>
+    internal static class WaterImpactDiag
+    {
+        private const string PrefabName = "fx_WaterImpact_Big";
+        private const float ReportEverySeconds = 10f;
+
+        private static int s_prefabHash;
+        private static bool s_rangeReported;
+        private static float s_lastReport;
+        private static int s_seen;
+
+        internal static void MaybeReportRange()
+        {
+            if (s_rangeReported) return;
+            var scene = ZNetScene.instance;
+            if (scene == null) return;
+            if (s_prefabHash == 0) s_prefabHash = PrefabName.GetStableHashCode();
+            var prefab = scene.GetPrefab(s_prefabHash);
+            if (prefab == null) return;
+            s_rangeReported = true;
+
+            // AudioSource lives in UnityEngine.AudioModule, which this plugin
+            // does not reference and should not start referencing for one
+            // diagnostic. Read it reflectively instead.
+            var audioType = AccessTools.TypeByName("UnityEngine.AudioSource");
+            if (audioType == null)
+            {
+                Plugin.Log.LogInfo($"[{Plugin.Stamp}] [WaterFX] AudioSource type unavailable");
+                return;
+            }
+            var src = prefab.GetComponentInChildren(audioType, true);
+            if (src == null)
+            {
+                Plugin.Log.LogInfo($"[{Plugin.Stamp}] [WaterFX] {PrefabName} has no AudioSource "
+                                   + "- the sound must come from something else");
+                return;
+            }
+            string Read(string prop)
+            {
+                var pi = audioType.GetProperty(prop);
+                try { return (pi != null) ? pi.GetValue(src, null).ToString() : "?"; }
+                catch { return "?"; }
+            }
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [WaterFX] {PrefabName} audible range: "
+                + $"min={Read("minDistance")}m max={Read("maxDistance")}m "
+                + $"rolloff={Read("rolloffMode")} spatialBlend={Read("spatialBlend")} "
+                + $"volume={Read("volume")}");
+        }
+
+        /// <summary>
+        /// Offered every ZDO in the union walk, like the pheromone marker. Rate
+        /// limited because the point is to identify a source, not to count.
+        /// </summary>
+        internal static void Offer(ZDO zdo)
+        {
+            if (zdo == null) return;
+            if (s_prefabHash == 0) s_prefabHash = PrefabName.GetStableHashCode();
+            if (zdo.GetPrefab() != s_prefabHash) return;
+
+            s_seen++;
+            if (Time.time - s_lastReport < ReportEverySeconds) return;
+            s_lastReport = Time.time;
+
+            var pos = zdo.GetPosition();
+            string nearest = NearestCulprit(pos);
+            var sb = new System.Text.StringBuilder();
+            if (ZNet.instance != null)
+            {
+                foreach (var peer in ZNet.instance.GetPeers())
+                {
+                    if (peer == null) continue;
+                    sb.Append($" {peer.m_playerName}={Vector3.Distance(peer.m_refPos, pos):F0}m");
+                }
+            }
+            Plugin.Log.LogWarning(
+                $"[{Plugin.Stamp}] [WaterFX] impact at world({pos.x:F0},{pos.y:F1},{pos.z:F0}) "
+                + $"nearest={nearest} n={s_seen} peers:{sb}");
+        }
+
+        // The thing making the splash should be the closest non-effect object.
+        private static string NearestCulprit(Vector3 pos)
+        {
+            var scene = ZNetScene.instance;
+            var zdoMan = ZDOMan.instance;
+            if (scene == null || zdoMan == null) return "?";
+
+            var found = new List<ZDO>();
+            zdoMan.FindSectorObjects(ZoneSystem.GetZone(pos), new SimulationDistance(1, 0), found);
+            float best = 400f;   // 20m squared
+            string who = "none within 20m";
+            foreach (var z in found)
+            {
+                if (z == null || z.GetPrefab() == s_prefabHash) continue;
+                float d = Utils.DistanceSqr(z.GetPosition(), pos);
+                if (d >= best) continue;
+                var pf = scene.GetPrefab(z.GetPrefab());
+                if (pf == null) continue;
+                // Skip other pure effects; they are symptoms, not causes.
+                if (pf.name.StartsWith("fx_") || pf.name.StartsWith("sfx_")
+                    || pf.name.StartsWith("vfx_")) continue;
+                best = d;
+                who = $"{pf.name}@{Mathf.Sqrt(d):F1}m";
+            }
+            return who;
         }
     }
 }
