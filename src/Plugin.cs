@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.59";
+        public const string PluginVersion = "0.7.60";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -6906,7 +6906,9 @@ namespace ServerZoneOwnership
                 bool inst = zdo != null && ZNetScene.instance != null
                             && ZNetScene.instance.FindInstance(zdo) != null;
                 if (n++ > 0) sb.Append(" | ");
-                sb.Append($"{peer.m_playerName} mask={mask} inst={inst}");
+                sb.Append($"{peer.m_playerName} mask={mask} inst={inst} " +
+                          $"owner={(zdo != null ? zdo.GetOwner() : 0L)} " +
+                          $"ownedByUs={(zdo != null && zdo.GetOwner() == ZDOMan.GetSessionID())}");
             }
             if (n == 0) return;
 
