@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.68";
+        public const string PluginVersion = "0.7.69";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -114,6 +114,15 @@ namespace ServerZoneOwnership
         // the ~20s diagnostic flush, so a short in-game test does not need the
         // player standing still for a minute. 0 disables it.
         internal const float DebugStatusAttribWatchSeconds = 10f;
+
+        // v0.7.69 bug #11: run the pheromone mechanic server-side. False
+        // restores vanilla behaviour, which on this server is a silent no-op.
+        internal const bool DebugPheromoneServerSide = true;
+
+        // Vanilla applies NO distance test — it iterates every player, which on
+        // a client is implicitly bounded because only nearby players exist. On
+        // this server they all exist, so this restores that de facto bound.
+        internal const float PheromoneRadius = 64f;
 
         // --- Distance-tiered send rate (v0.7.30) ---------------------------
         // THE PROBLEM: because the server owns every mob, every mob's motion
@@ -685,6 +694,8 @@ namespace ServerZoneOwnership
             if (cch != null) Log.LogInfo($"[{Stamp}] [Diag] {cch}");
             var srp = StatusEffectRpcWatch.Drain();
             if (srp != null) Log.LogInfo($"[{Stamp}] [Diag] {srp}");
+            var phr = PheromoneServerSide.Drain();
+            if (phr != null) Log.LogInfo($"[{Stamp}] [Diag] {phr}");
             MountSyncDiag.Flush();
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
@@ -1730,6 +1741,7 @@ namespace ServerZoneOwnership
 
             s_frame++;
             s_unionBuiltThisTick = false;
+            PheromoneServerSide.MaybeScan();
 
             var simDist = ServerCoverage.GetSimulationDistance();
             var zdoMan = ZDOMan.instance;
@@ -1832,6 +1844,10 @@ namespace ServerZoneOwnership
             unionDistant = (List<ZDO>)ReflectionCache.ZNetScene_tempCurrentDistantObjects.GetValue(scene);
             unionNear.Clear();
             unionDistant.Clear();
+            // Rebuilt here rather than per tick: this is the only place the FULL
+            // set of near ZDOs is walked, so clearing per tick would leave the
+            // registry empty on every tick that does not rebuild the union.
+            PheromoneServerSide.BeginPass();
             s_seenNear.Clear();
             s_seenDistant.Clear();
 
@@ -1842,7 +1858,11 @@ namespace ServerZoneOwnership
                 zdoMan.FindSectorObjects(ZoneSystem.GetZone(pos), simDist,
                                          s_nearBuffer, s_distantBuffer);
                 foreach (var zdo in s_nearBuffer)
-                    if (s_seenNear.Add(zdo)) unionNear.Add(zdo);
+                {
+                    if (!s_seenNear.Add(zdo)) continue;
+                    PheromoneServerSide.Offer(zdo);
+                    unionNear.Add(zdo);
+                }
                 foreach (var zdo in s_distantBuffer)
                     if (s_seenDistant.Add(zdo)) unionDistant.Add(zdo);
             }
@@ -7325,6 +7345,285 @@ namespace ServerZoneOwnership
                         $"[{Plugin.Stamp}] [Diag]   {fi.Name} = {shown}");
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// v0.7.69 FIX (bug #11): run the pheromone mechanic server-side.
+    ///
+    /// THE BUG. Character.UpdatePheromones runs inside `if (zDO.IsOwner())`,
+    /// so on this server it runs for every creature we own. It then walks
+    /// Player.GetAllPlayers() and reads GetSEMan().GetStatusEffects() — a list
+    /// populated ONLY on the machine owning that player, because
+    /// AddStatusEffect applies locally under `if (m_nview.IsOwner())` and
+    /// otherwise RPCs to the owner. Our server owns the creature while the
+    /// client owns the player, so the list is always empty and the condition
+    /// can never be true. MonsterAI's flee predicate has the identical flaw.
+    /// Vanilla gets away with it because one machine normally owns both; we
+    /// split them, so it never fires.
+    ///
+    /// There is no replicated status-effect state to read: no ZDO field exists
+    /// (ZDOVars has none), the effects in this family declare no attribute bit,
+    /// the registration RPC is sent only in the !IsOwner() branch, the player
+    /// inventory is not in the player's ZDO, and ConsumeItem is entirely local.
+    /// All verified before settling on the signal below.
+    ///
+    /// THE SIGNAL. These effects' start-effect prefabs carry a ZNetView, so
+    /// drinking one creates a ZDO we receive through ordinary sync. Measured
+    /// against the log history: a single distinct ZDO, re-sent continuously
+    /// across consecutive census windows at a changing distance — one
+    /// persistent object that follows the player for the effect's duration.
+    ///
+    /// So the window is NOT a timer: it is that ZDO's lifetime. It appears when
+    /// the effect starts and is destroyed when the effect ends, however it ends
+    /// — expiry, death, or logout. Rebuilding the window list from live ZDOs
+    /// each pass therefore needs no expiry bookkeeping and cannot leak a
+    /// window. m_ttl is kept only as a sanity cap, because a lost destroy
+    /// broadcast is a real failure mode here (see bug 9).
+    ///
+    /// RANGE. Vanilla applies no distance test at all — it iterates every
+    /// player. On a client that is implicitly bounded, because only nearby
+    /// players are instantiated. On this server every player is instantiated,
+    /// so without a range check one potion would alert matching creatures
+    /// world-wide. The radius restores vanilla's de facto bound.
+    ///
+    /// Everything stays server-authoritative: no ownership is handed to any
+    /// client, so this cannot reintroduce the churn that caused bugs 2 and 8.
+    /// </summary>
+    internal static class PheromoneServerSide
+    {
+        internal struct Spec
+        {
+            public string TargetName;   // Character.m_name of the creature affected
+            public bool Flee;
+            public float Ttl;
+            public string EffectName;   // diagnostics only
+        }
+
+        internal struct Window
+        {
+            public Spec Spec;
+            public Vector3 Pos;
+            public ZDOID Player;
+        }
+
+        // marker prefab hash -> what drinking it means. Built from the asset
+        // database at startup, so a future potion in this family needs no code.
+        private static readonly Dictionary<int, Spec> s_markers = new Dictionary<int, Spec>();
+        private static readonly List<Window> s_windows = new List<Window>();
+        private static bool s_scanned;
+
+        internal static int s_alerts, s_fleeGrants;
+
+        /// <summary>
+        /// Marker prefabs shared with unrelated effects are useless as a signal
+        /// — one of them is the generic potion sound, which every health potion
+        /// plays. Only prefabs unique to a single pheromone effect are kept.
+        /// </summary>
+        internal static void MaybeScan()
+        {
+            if (s_scanned) return;
+            var db = ObjectDB.instance;
+            if (db == null || db.m_StatusEffects == null || db.m_StatusEffects.Count == 0) return;
+            s_scanned = true;
+
+            var pheromoneUses = new Dictionary<int, int>();   // hash -> how many pheromone effects use it
+            var otherUses = new HashSet<int>();               // used by a non-pheromone effect
+            var candidate = new Dictionary<int, Spec>();
+
+            foreach (var se in db.m_StatusEffects)
+            {
+                if (se == null) continue;
+                var stats = se as SE_Stats;
+                var target = (stats != null) ? stats.m_pheromoneTarget : null;
+                bool isPheromone = target != null;
+
+                var list = (se.m_startEffects != null) ? se.m_startEffects.m_effectPrefabs : null;
+                if (list == null) continue;
+
+                foreach (var ed in list)
+                {
+                    if (ed == null || ed.m_prefab == null) continue;
+                    if (ed.m_prefab.GetComponent<ZNetView>() == null) continue;   // invisible to us
+                    int hash = ed.m_prefab.name.GetStableHashCode();
+
+                    if (!isPheromone) { otherUses.Add(hash); continue; }
+
+                    int n;
+                    pheromoneUses.TryGetValue(hash, out n);
+                    pheromoneUses[hash] = n + 1;
+
+                    var ch = target.GetComponent<Character>();
+                    if (ch == null) continue;
+                    candidate[hash] = new Spec
+                    {
+                        TargetName = ch.m_name,
+                        Flee = stats.m_pheromoneFlee,
+                        Ttl = se.m_ttl,
+                        EffectName = se.name
+                    };
+                }
+            }
+
+            foreach (var kv in candidate)
+            {
+                if (otherUses.Contains(kv.Key)) continue;          // shared with unrelated effects
+                if (pheromoneUses[kv.Key] != 1) continue;          // ambiguous between two effects
+                s_markers[kv.Key] = kv.Value;
+                Plugin.Log.LogInfo(
+                    $"[{Plugin.Stamp}] [Pheromone] marker registered effect={kv.Value.EffectName} " +
+                    $"target={kv.Value.TargetName} flee={kv.Value.Flee} ttl={kv.Value.Ttl}s");
+            }
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [Pheromone] scan complete: {s_markers.Count} usable marker(s) " +
+                $"of {candidate.Count} candidate(s)");
+        }
+
+        /// <summary>
+        /// Rebuilt from scratch each pass, so a window exists exactly while its
+        /// marker ZDO does. Fed from the create/destroy pass, which already
+        /// walks every sector ZDO near a player.
+        /// </summary>
+        internal static void BeginPass()
+        {
+            s_windows.Clear();
+        }
+
+        internal static void Offer(ZDO zdo)
+        {
+            if (zdo == null || s_markers.Count == 0) return;
+            Spec spec;
+            if (!s_markers.TryGetValue(zdo.GetPrefab(), out spec)) return;
+
+            // Sanity cap: a marker whose destroy broadcast was lost would
+            // otherwise hold a window open forever.
+            long created = ZDOExtraData.GetTimeCreated(zdo.m_uid);
+            if (created > 0L && ZNet.instance != null)
+            {
+                double age = ZNet.instance.GetTimeSeconds() - created;
+                if (age > spec.Ttl + 30.0) return;
+            }
+
+            var pos = zdo.GetPosition();
+            s_windows.Add(new Window { Spec = spec, Pos = pos, Player = NearestPlayer(pos) });
+        }
+
+        // The marker follows its drinker, so the closest player owns the
+        // window. Generous radius: the object may lag the player slightly.
+        private static ZDOID NearestPlayer(Vector3 pos)
+        {
+            var players = Player.GetAllPlayers();
+            if (players == null) return ZDOID.None;
+            float best = 36f;
+            ZDOID who = ZDOID.None;
+            foreach (var p in players)
+            {
+                if (p == null) continue;
+                float d = Utils.DistanceSqr(p.transform.position, pos);
+                if (d < best) { best = d; who = p.GetZDOID(); }
+            }
+            return who;
+        }
+
+        internal static bool TryMatch(string creatureName, Vector3 creaturePos)
+        {
+            if (s_windows.Count == 0 || string.IsNullOrEmpty(creatureName)) return false;
+            float r2 = Plugin.PheromoneRadius * Plugin.PheromoneRadius;
+            foreach (var w in s_windows)
+            {
+                if (w.Spec.Flee) continue;                 // flee is the AI predicate's job
+                if (w.Spec.TargetName != creatureName) continue;
+                if (Utils.DistanceSqr(w.Pos, creaturePos) > r2) continue;
+                return true;
+            }
+            return false;
+        }
+
+        internal static bool HasFleeWindow(ZDOID player, string creatureName)
+        {
+            if (s_windows.Count == 0 || player.IsNone()) return false;
+            foreach (var w in s_windows)
+            {
+                if (!w.Spec.Flee) continue;
+                if (w.Spec.TargetName != creatureName) continue;
+                if (w.Player == player) return true;
+            }
+            return false;
+        }
+
+        internal static string Drain()
+        {
+            if (s_markers.Count == 0) return null;
+            if (s_windows.Count == 0 && s_alerts == 0 && s_fleeGrants == 0) return null;
+            string s = $"pheromone markers={s_markers.Count} windows={s_windows.Count} " +
+                       $"alerts={System.Threading.Interlocked.Exchange(ref s_alerts, 0)} " +
+                       $"fleeGrants={System.Threading.Interlocked.Exchange(ref s_fleeGrants, 0)}";
+            return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.69: replaces the vanilla body, which is provably a no-op here — it
+    /// reads a status-effect list that is always empty on this machine — and
+    /// reproduces it against our window registry instead. Vanilla's own
+    /// per-creature timer field is reused so the cadence stays identical, and
+    /// m_pheromoneLoveEffect.HasEffects() is still the gate, so only creature
+    /// prefabs authored for this do any work.
+    /// </summary>
+    [HarmonyPatch(typeof(Character), "UpdatePheromones")]
+    internal static class Character_UpdatePheromones_Patch
+    {
+        private static readonly FieldInfo s_timerField =
+            AccessTools.Field(typeof(Character), "m_pheromoneTimer");
+
+        static bool Prefix(Character __instance, float dt)
+        {
+            if (!Plugin.DebugPheromoneServerSide) return true;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
+            if (__instance == null || s_timerField == null) return true;
+            if (!__instance.m_pheromoneLoveEffect.HasEffects()) return false;
+
+            float timer = (float)s_timerField.GetValue(__instance);
+            if (timer < 0f) return false;
+            timer -= dt;
+            if (timer > 0f) { s_timerField.SetValue(__instance, timer); return false; }
+            s_timerField.SetValue(__instance, 5f);
+
+            if (!PheromoneServerSide.TryMatch(__instance.m_name, __instance.transform.position))
+                return false;
+
+            __instance.m_pheromoneLoveEffect.Create(
+                __instance.transform.position, __instance.transform.rotation);
+            var ai = __instance.GetBaseAI() as MonsterAI;
+            if (ai != null)
+            {
+                ai.Alert();
+                System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_alerts);
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.69: the flee half. Additive rather than a replacement — vanilla's
+    /// answer still wins if it ever manages to find something, so this can only
+    /// turn a false into a true.
+    /// </summary>
+    [HarmonyPatch(typeof(MonsterAI), "PheromoneFleeCheck")]
+    internal static class MonsterAI_PheromoneFleeCheck_Patch
+    {
+        static void Postfix(MonsterAI __instance, Character target, ref bool __result)
+        {
+            if (__result || !Plugin.DebugPheromoneServerSide) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (__instance == null || !(target is Player)) return;
+
+            var self = __instance.GetComponent<Character>();
+            if (self == null) return;
+            if (!PheromoneServerSide.HasFleeWindow(target.GetZDOID(), self.m_name)) return;
+
+            __result = true;
+            System.Threading.Interlocked.Increment(ref PheromoneServerSide.s_fleeGrants);
         }
     }
 }
