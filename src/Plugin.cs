@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.76";
+        public const string PluginVersion = "0.7.77";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -1895,6 +1895,7 @@ namespace ServerZoneOwnership
                     if (s_seenDistant.Add(zdo)) unionDistant.Add(zdo);
             }
             WaterImpactDiag.ReportNearest();
+            WaterImpactDiag.ReportNearestKnown();
             s_unionBuiltThisTick = true;
         }
 
@@ -7957,6 +7958,7 @@ namespace ServerZoneOwnership
         private static Vector3 s_bestPos;
         private static string s_bestPeer = "?";
         private static Vector3 s_bestFrom;
+        private static float s_lastKnownReport;
 
         internal static void MaybeReportRange()
         {
@@ -8026,6 +8028,7 @@ namespace ServerZoneOwnership
                 s_bestPeer = peer.m_playerName;
                 s_bestFrom = peer.m_refPos;
             }
+            RememberSite(pos);
         }
 
         /// <summary>
@@ -8033,6 +8036,72 @@ namespace ServerZoneOwnership
         /// last report, then resets — so each line is the best fix available in
         /// that window rather than a sample.
         /// </summary>
+
+        // v0.7.77: remember WHERE splashes have happened, so the report can
+        // name the nearest KNOWN site even while every log is momentarily
+        // quiet. Two earlier versions only ever reported a log that splashed
+        // inside the report window, which meant standing 4m from one while
+        // being directed 186m the other way. Keyed by position rounded to 4m
+        // so a drifting log collapses to one entry instead of hundreds.
+        private static readonly Dictionary<long, float> s_sites = new Dictionary<long, float>();
+        private static readonly Dictionary<long, Vector3> s_sitePos = new Dictionary<long, Vector3>();
+        private const float SiteExpirySeconds = 900f;
+
+        private static long SiteKey(Vector3 p)
+        {
+            long gx = (long)Mathf.Floor(p.x / 4f);
+            long gz = (long)Mathf.Floor(p.z / 4f);
+            return (gx << 24) ^ gz;
+        }
+
+        private static void RememberSite(Vector3 pos)
+        {
+            long k = SiteKey(pos);
+            if (!s_sites.ContainsKey(k) && s_sites.Count >= 512) return;
+            s_sites[k] = Time.time;
+            s_sitePos[k] = pos;
+        }
+
+        /// <summary>
+        /// Emits a bearing to the nearest remembered splash site for each peer,
+        /// on a fixed cadence and independent of whether anything splashed in
+        /// this window. This is the part that makes the output navigable.
+        /// </summary>
+        internal static void ReportNearestKnown()
+        {
+            if (ZNet.instance == null || s_sites.Count == 0) return;
+            if (Time.time - s_lastKnownReport < ReportEverySeconds) return;
+            s_lastKnownReport = Time.time;
+
+            // Expire stale sites; a log that stopped splashing 15 minutes ago
+            // has probably drifted or been collected.
+            List<long> stale = null;
+            foreach (var kv in s_sites)
+                if (Time.time - kv.Value > SiteExpirySeconds)
+                    (stale ?? (stale = new List<long>())).Add(kv.Key);
+            if (stale != null)
+                foreach (var k in stale) { s_sites.Remove(k); s_sitePos.Remove(k); }
+
+            foreach (var peer in ZNet.instance.GetPeers())
+            {
+                if (peer == null) continue;
+                float best = float.MaxValue;
+                Vector3 bestPos = Vector3.zero;
+                foreach (var kv in s_sitePos)
+                {
+                    float d = Vector3.Distance(peer.m_refPos, kv.Value);
+                    if (d < best) { best = d; bestPos = kv.Value; }
+                }
+                if (best >= float.MaxValue) continue;
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [WaterFX] nearest KNOWN site {best:F0}m "
+                    + $"{Bearing(peer.m_refPos, bestPos)} of {peer.m_playerName} | "
+                    + $"you=world({peer.m_refPos.x:F0},{peer.m_refPos.z:F0}) "
+                    + $"site=world({bestPos.x:F0},{bestPos.z:F0}) "
+                    + $"knownSites={s_sites.Count} totalSeen={s_seen}");
+            }
+        }
+
         internal static void ReportNearest()
         {
             if (s_bestDist >= float.MaxValue) return;
