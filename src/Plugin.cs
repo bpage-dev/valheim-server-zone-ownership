@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.66";
+        public const string PluginVersion = "0.7.67";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -6910,6 +6910,7 @@ namespace ServerZoneOwnership
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             StatusAttributeCensus.MaybeReport();
             ConsumableEffectCensus.MaybeReport();
+            PheromoneEffectDump.MaybeReport();
             var peers = ZNet.instance.GetPeers();
             if (peers == null || peers.Count == 0) return;
 
@@ -7204,6 +7205,93 @@ namespace ServerZoneOwnership
             string s = $"routedRpc total={s_total} addStatusEffect={s_seen} onPlayer={s_onPlayer} | {top}";
             s_total = 0; s_seen = 0; s_onPlayer = 0; s_allNames.Clear();
             return s;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.67 (bug #11): dump the serialised fields of the effects that drive
+    /// the mechanism, since asset values cannot be read from the decompile.
+    ///
+    /// Two questions this answers:
+    ///   1. which pheromone fields the effect actually sets — four of the six
+    ///      are declared in SE_Stats and read NOWHERE in assembly_valheim, so
+    ///      if the effect relies on those it relies on dead data;
+    ///   2. whether it perturbs any REPLICATED stat (health, max health,
+    ///      stamina, eitr all have ZDO fields), which would give this server an
+    ///      indirect fingerprint for when the effect is active.
+    ///
+    /// Scoped to consumables whose effect sets at least one pheromone field, so
+    /// the output stays a handful of lines rather than the whole catalogue.
+    /// Non-default values only, for the same reason.
+    /// </summary>
+    internal static class PheromoneEffectDump
+    {
+        private static bool s_done;
+
+        private static readonly string[] s_pheromoneFields =
+        {
+            "m_pheromoneTarget", "m_pheromoneFlee", "m_pheromoneSpawnChanceOverride",
+            "m_pheromoneSpawnMinLevel", "m_pheromoneLevelUpMultiplier",
+            "m_pheromoneMaxInstanceOverride"
+        };
+
+        private static bool IsDefault(object v)
+        {
+            if (v == null) return true;
+            if (v is bool b) return !b;
+            if (v is int i) return i == 0;
+            if (v is float f) return Mathf.Approximately(f, 0f);
+            if (v is string s) return string.IsNullOrEmpty(s);
+            return false;
+        }
+
+        private static bool SetsAnyPheromoneField(StatusEffect se)
+        {
+            var t = se.GetType();
+            foreach (var name in s_pheromoneFields)
+            {
+                var fi = AccessTools.Field(t, name);
+                if (fi == null) continue;
+                object v = fi.GetValue(se);
+                // The level-up multiplier defaults to 1f, so treat that as unset.
+                if (name == "m_pheromoneLevelUpMultiplier" && v is float lm
+                    && Mathf.Approximately(lm, 1f)) continue;
+                if (!IsDefault(v)) return true;
+            }
+            return false;
+        }
+
+        internal static void MaybeReport()
+        {
+            if (s_done) return;
+            var db = ObjectDB.instance;
+            if (db == null || db.m_items == null || db.m_items.Count == 0) return;
+            s_done = true;
+
+            foreach (var go in db.m_items)
+            {
+                if (go == null) continue;
+                var shared = go.GetComponent<ItemDrop>()?.m_itemData?.m_shared;
+                var se = shared?.m_consumeStatusEffect;
+                if (se == null || !SetsAnyPheromoneField(se)) continue;
+
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [Diag] pheromoneItem item={go.name} " +
+                    $"effect={se.name} type={se.GetType().Name} " +
+                    $"ttl={se.m_ttl} attributes={(int)se.m_attributes}");
+
+                foreach (var fi in se.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    object v;
+                    try { v = fi.GetValue(se); } catch { continue; }
+                    if (IsDefault(v)) continue;
+                    // Unity objects print their name; that is what we want here.
+                    string shown = v is UnityEngine.Object uo ? uo.name : v.ToString();
+                    if (shown.Length > 48) shown = shown.Substring(0, 48);
+                    Plugin.Log.LogWarning(
+                        $"[{Plugin.Stamp}] [Diag]   {fi.Name} = {shown}");
+                }
+            }
         }
     }
 }
