@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.71";
+        public const string PluginVersion = "0.7.72";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -121,8 +121,17 @@ namespace ServerZoneOwnership
 
         // Vanilla applies NO distance test — it iterates every player, which on
         // a client is implicitly bounded because only nearby players exist. On
-        // this server they all exist, so this restores that de facto bound.
-        internal const float PheromoneRadius = 64f;
+        // this server they all exist, so a bound is required.
+        //
+        // v0.7.72: set to the distance mobs can spawn from a player, so the
+        // effect reaches every matching creature that could have spawned for
+        // them. SpawnSystem uses a 40-80m ring (m_spawnDistanceMin/Max, and
+        // per-spawner radii defaulting to the same), so 80 is the outer edge.
+        // For comparison the loaded area at simulationdistance 1 is a 3x3 block
+        // of 64m zones, about 96m to the corner — spawn range is the tighter
+        // and more meaningful bound. ObservedSpawnRadius logs what spawners
+        // actually declare, so this can be corrected from data.
+        internal const float PheromoneRadius = 80f;
 
         // v0.7.71 bug #11: implement the spawn/level values the asset authors
         // and vanilla never reads. BEYOND vanilla, deliberately - independent
@@ -7590,6 +7599,16 @@ namespace ServerZoneOwnership
         // v0.7.71: spawn-side lookup. Unlike TryMatch this does not skip flee
         // windows - a repellent authoring spawn values should honour them too -
         // and it hands back the spec so the caller can apply them.
+        // v0.7.72: is this creature the target of ANY registered effect,
+        // regardless of whether a window is currently open?
+        internal static bool IsTargetCreature(string creatureName)
+        {
+            if (string.IsNullOrEmpty(creatureName)) return false;
+            foreach (var kv in s_markers)
+                if (kv.Value.TargetName == creatureName) return true;
+            return false;
+        }
+
         internal static bool TryMatchSpawn(string creatureName, Vector3 pos, out Spec spec)
         {
             spec = default(Spec);
@@ -7764,6 +7783,30 @@ namespace ServerZoneOwnership
 
         internal static int s_entriesBoosted, s_levelBoosts;
 
+        private static readonly HashSet<string> s_radiusNoted = new HashSet<string>();
+
+        /// <summary>
+        /// v0.7.72: PheromoneRadius is set to vanilla's 80m outer spawn ring,
+        /// but a spawner may declare its own radii. Reporting what they really
+        /// are, once per creature, so the constant can be corrected from data
+        /// rather than left on an assumption.
+        /// </summary>
+        private static void NoteSpawnRadius(string creature, SpawnSystem.SpawnData spawner)
+        {
+            if (!PheromoneServerSide.IsTargetCreature(creature)) return;
+            string key = creature + "|" + spawner.m_name;
+            if (s_radiusNoted.Count > 64 || !s_radiusNoted.Add(key)) return;
+
+            float min = (spawner.m_spawnRadiusMin > 0f) ? spawner.m_spawnRadiusMin : 40f;
+            float max = (spawner.m_spawnRadiusMax > 0f) ? spawner.m_spawnRadiusMax : 80f;
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [Pheromone] spawner '{spawner.m_name}' for {creature}: "
+                + $"spawnRadius {min}-{max}m, keepDistance={spawner.m_spawnDistance}m, "
+                + $"chance={spawner.m_spawnChance} max={spawner.m_maxSpawned} "
+                + $"level={spawner.m_minLevel}-{spawner.m_maxLevel} "
+                + $"(our radius={Plugin.PheromoneRadius}m)");
+        }
+
         // SpawnData.m_prefab -> that creature's m_name, cached. Instance id is
         // stable for a loaded prefab, so this is safe as a key.
         private static string CreatureName(GameObject prefab)
@@ -7789,6 +7832,11 @@ namespace ServerZoneOwnership
                 if (spawner == null || spawner.m_prefab == null) continue;
                 string creature = CreatureName(spawner.m_prefab);
                 if (string.IsNullOrEmpty(creature)) continue;
+
+                // v0.7.72: report what this spawner actually declares, so
+                // PheromoneRadius can be checked against data rather than
+                // assumed from vanilla defaults.
+                NoteSpawnRadius(creature, spawner);
 
                 PheromoneServerSide.Spec spec;
                 if (!PheromoneServerSide.TryMatchSpawn(creature, spawnSystemPos, out spec)) continue;
