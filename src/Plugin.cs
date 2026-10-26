@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.67";
+        public const string PluginVersion = "0.7.68";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -7261,6 +7261,36 @@ namespace ServerZoneOwnership
             return false;
         }
 
+
+        /// <summary>
+        /// v0.7.68: the last candidate for an ACTIVE-ONLY trigger.
+        ///
+        /// The server cannot read a player's effects, but it can see ZDOs. When
+        /// a status effect starts it instantiates everything in its start-effect
+        /// list; any of those prefabs carrying a ZNetView creates a ZDO, which
+        /// reaches us through ordinary sync. That would be an exact signal — it
+        /// exists only while the effect is being applied, which is precisely the
+        /// scoping the carve-out needs.
+        ///
+        /// Most vanilla effect prefabs are local-only visuals with no ZNetView,
+        /// so this probably finds nothing. Reporting it either way: a negative
+        /// closes the last avenue, and closing it is worth as much as finding it.
+        /// </summary>
+        private static void ReportEffectPrefabs(string label, StatusEffect se, EffectList list)
+        {
+            if (list?.m_effectPrefabs == null || list.m_effectPrefabs.Length == 0) return;
+            foreach (var ed in list.m_effectPrefabs)
+            {
+                if (ed?.m_prefab == null) continue;
+                var nview = ed.m_prefab.GetComponent<ZNetView>();
+                bool networked = nview != null;
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [Diag]   {label} prefab={ed.m_prefab.name} " +
+                    $"enabled={ed.m_enabled} NETWORKED={networked}" +
+                    (networked ? "  <-- SERVER-VISIBLE TRIGGER" : ""));
+            }
+        }
+
         internal static void MaybeReport()
         {
             if (s_done) return;
@@ -7279,6 +7309,9 @@ namespace ServerZoneOwnership
                     $"[{Plugin.Stamp}] [Diag] pheromoneItem item={go.name} " +
                     $"effect={se.name} type={se.GetType().Name} " +
                     $"ttl={se.m_ttl} attributes={(int)se.m_attributes}");
+
+                ReportEffectPrefabs("startEffect", se, se.m_startEffects);
+                ReportEffectPrefabs("stopEffect", se, se.m_stopEffects);
 
                 foreach (var fi in se.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance))
                 {
