@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.57";
+        public const string PluginVersion = "0.7.58";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -6141,6 +6141,155 @@ namespace ServerZoneOwnership
         private static readonly Dictionary<int, int> s_byHash = new Dictionary<int, int>();
         private static readonly Dictionary<string, int> s_byPrefab = new Dictionary<string, int>();
 
+        // ---- v0.7.58: identify the silently-dropped RPCs -------------------
+        //
+        // Added 2026-10-25 after a phantom item on the ground. The server log
+        // proved the drop happened (noZdo=4 at 19:44:07, seconds after the
+        // pickup that emptied the stand) but could not say WHICH rpc or which
+        // object, because the counter carried no identity. Closing that gap is
+        // the whole point of this block — behaviour is unchanged.
+
+        // RoutedRPCData carries only m_methodHash, and vanilla keeps no reverse
+        // map: ZNetView.Register discards the name after hashing it. So an
+        // unexplained drop meant brute-forcing the hash offline against the
+        // decompile, which is how 1130726949 was identified as RPC_Damage.
+        // Harvested once from build 25730807 — every string literal and
+        // nameof() handed to Register/Invoke/InvokeRPC, plus every RPC_* method
+        // name. Registration style varies by call site (some pass "Damage",
+        // some nameof(RPC_Damage)), so both forms are kept. An unknown hash
+        // still prints raw, so a name missing here costs nothing but clarity,
+        // and a new game build only needs the list re-harvested.
+        private static readonly string[] s_rpcNames = {
+            
+"AddSaddle", "AdminList", "Alert", "Backward", "Ban", "CharacterID", 
+            "ChatMessage", "CheckMaterial", "CheckSpawn", "ClientHandshake", "ClosedCaptions", "CollectResources", 
+            "Command", "Controls", "DelayedAttachEffects_Step1", "DelayedAttachEffects_Step2", "DelayedAttachEffects_Step3", "DelayedCrossFadeStart", 
+            "DelayedPowerActivation", "DelayedSpawnBoss", "DelayedTap", "DelayedTriggerContinous", "DepthOfField", "DestroyZDO", 
+            "DirectionalSoundIndicators", "DisableForcefield", "Disconnect", "EatUpdate", "EnableDamage", "Error", 
+            "Explode", "FadeIn", "FallUpdate", "FlashShield", "Forward", "Hide", 
+            "HideDreamText", "HideMarker", "HideZZZ", "HistoricalPlayerList", "Hit", "HitTerrain", 
+            "IdleEffect", "InvertMouse", "Kick", "Kicked", "Leave", "LoadMainSceneIfBackendSelected", 
+            "LocationIcons", "MapData", "Message", "MotionBlur", "NetTime", "OnDeath", 
+            "OnNearProjectileHit", "OnTargeted", "PeerInfo", "Pick", "Pickup", "PickupUpdate", 
+            "PlayerID", "PlayerList", "PrintBanned", "RPC_AddAdrenaline", "RPC_AddAmmo", "RPC_AddFuel", 
+            "RPC_AddFuelAmount", "RPC_AddItem", "RPC_AddNoise", "RPC_AddOre", "RPC_AddSaddle", "RPC_AddStatusEffect", 
+            "RPC_AdminList", "RPC_Alert", "RPC_AnimateLever", "RPC_AnimateLeverReturn", "RPC_ApplyOperation", "RPC_Attach", 
+            "RPC_Attack", "RPC_Backward", "RPC_Ban", "RPC_BossSpawnInitiated", "RPC_CharacterID", "RPC_ChatMessage", 
+            "RPC_ClearCachedSupport", "RPC_ClientHandshake", "RPC_Command", "RPC_ConsoleResetRandomEvent", "RPC_ConsoleStartRandomEvent", "RPC_Controls", 
+            "RPC_CreateFragments", "RPC_Damage", "RPC_DamageText", "RPC_DestroyAttachment", "RPC_DestroyZDO", "RPC_Disconnect", 
+            "RPC_DiscoverClosestLocation", "RPC_DiscoverLocationResponse", "RPC_Discovered", "RPC_Drain", "RPC_DropArrows", "RPC_DropItem", 
+            "RPC_DropItemByName", "RPC_EatConfirmation", "RPC_EmptyProcessed", "RPC_Error", "RPC_Extract", "RPC_FlashShield", 
+            "RPC_Forward", "RPC_FreezeFrame", "RPC_GlobalKeys", "RPC_Grow", "RPC_Heal", "RPC_HealthChanged", 
+            "RPC_Hide", "RPC_HistoricalPlayerList", "RPC_Hit", "RPC_HitNow", "RPC_HitWhileDodging", "RPC_IncinerateRespons", 
+            "RPC_Kick", "RPC_Kicked", "RPC_Left", "RPC_LocationIcons", "RPC_MakePiece", "RPC_MapData", 
+            "RPC_Message", "RPC_NetTime", "RPC_Nibble", "RPC_OnDeath", "RPC_OnEat", "RPC_OnHit", 
+            "RPC_OnLegUse", "RPC_OnNearProjectileHit", "RPC_OnStateChanged", "RPC_OnTargeted", "RPC_OpenResponse", "RPC_PeerInfo", 
+            "RPC_PeerRealtimeMultiplaying", "RPC_Pick", "RPC_Pickup", "RPC_Ping", "RPC_PlayMusic", "RPC_PlayerID", 
+            "RPC_PlayerList", "RPC_Pong", "RPC_PrintBanned", "RPC_ProjectileHit", "RPC_RegisterKill", "RPC_ReleaseControl", 
+            "RPC_RemoteCommand", "RPC_RemotePrint", "RPC_Remove", "RPC_RemoveBossSpawnInventoryItems", "RPC_RemoveDoneItem", "RPC_RemoveGlobalKey", 
+            "RPC_RemoveSaddle", "RPC_Repair", "RPC_RequestActiveEventsList", "RPC_RequestControl", "RPC_RequestDenied", "RPC_RequestIncinerate", 
+            "RPC_RequestOpen", "RPC_RequestOwn", "RPC_RequestPickup", "RPC_RequestRespons", "RPC_RequestStack", "RPC_RequestStartEvent", 
+            "RPC_RequestStateChange", "RPC_RequestStopEvent", "RPC_RequestTakeAll", "RPC_RequestValidSimulationDistance", "RPC_RequestZDO", "RPC_ResetCloth", 
+            "RPC_RoutedRPC", "RPC_Rudder", "RPC_Save", "RPC_SavePlayerProfile", "RPC_Say", "RPC_ServerHandshake", 
+            "RPC_ServerList", "RPC_ServerSyncedPlayerData", "RPC_SetAggravated", "RPC_SetAreaHealth", "RPC_SetConnected", "RPC_SetConnection", 
+            "RPC_SetDreamCinematic", "RPC_SetEvent", "RPC_SetFuel", "RPC_SetFuelAmount", "RPC_SetGlobalKey", "RPC_SetLoadedVisual", 
+            "RPC_SetName", "RPC_SetOwner", "RPC_SetPicked", "RPC_SetPose", "RPC_SetSaddle", "RPC_SetSlotVisual", 
+            "RPC_SetSnow", "RPC_SetStayTTL", "RPC_SetTag", "RPC_SetTamed", "RPC_SetTarget", "RPC_SetTrigger", 
+            "RPC_SetVisualItem", "RPC_Shake", "RPC_Shoot", "RPC_ShowMessage", "RPC_Sleep", "RPC_SpawnBoss", 
+            "RPC_SpawnObject", "RPC_StackResponse", "RPC_Stagger", "RPC_StateChanged", "RPC_Step", "RPC_Stop", 
+            "RPC_TakeAllResponse", "RPC_Tap", "RPC_TeleportPlayer", "RPC_TeleportTo", "RPC_ToggleEnabled", "RPC_ToggleOn", 
+            "RPC_TogglePermitted", "RPC_Trigger", "RPC_TryEat", "RPC_UnSummon", "RPC_Unban", "RPC_UpdateClientEventsList", 
+            "RPC_UpdateEffects", "RPC_UpdateMaterial", "RPC_UpdateVisual", "RPC_UseDoor", "RPC_UseEitr", "RPC_UseStamina", 
+            "RPC_ValidatedSimulationDistance", "RPC_Wakeup", "RPC_ZDOData", "RegisterServer2", "ReleaseControl", "RemotePrint", 
+            "RemoveGlobalKey", "RemoveInitVel", "RemoveSaddle", "RequestControl", "RequestPickup", "RequestRespons", 
+            "RequestServerlist2", "RequestZDO", "ResetHighlight", "ResetHitTimer", "RoutedRPC", "Rudder", 
+            "Save", "SavePlayerProfile", "Say", "ServerHandshake", "ServerSyncedPlayerData", "SetAggravated", 
+            "SetEvent", "SetGlobalKey", "SetName", "SetOwner", "SetPlayed", "SetSaddle", 
+            "SetTrigger", "SetVisualItem", "Shoot", "ShowDreamText", "ShowMessage", "SleepStart", 
+            "SleepStop", "SpawnObject", "Speak", "Stats", "Step", "Stop", 
+            "StopAOE", "StopConnectionEffect", "StopConnectionEffects", "StopInRangeEffect", "StopListeningToLogMsgs", "ToggleEnabled", 
+            "TogglePermitted", "ToggleRun", "Trigger", "TrySpawn", "Unban", "UnregisterServer", 
+            "UpdateAttach", "UpdateAttachments", "UpdateOrientation", "UseDoor", "UseEitr", "UseStamina", 
+            "ZDOData", "_RequestRespawn", "discovered", 
+        };
+
+        private static Dictionary<int, string> s_hashNames;
+
+        internal static string RpcName(int hash)
+        {
+            if (s_hashNames == null)
+            {
+                s_hashNames = new Dictionary<int, string>(s_rpcNames.Length);
+                foreach (var n in s_rpcNames) s_hashNames[n.GetStableHashCode()] = n;
+            }
+            return s_hashNames.TryGetValue(hash, out string name) ? name : hash.ToString();
+        }
+
+        // Keyed by ZDOID, which is a struct with value equality — safe to hold
+        // across ticks, unlike a ZDO reference, which ZDOPool recycles.
+        private struct GhostRec { public int Count; public long FirstAt; public int Hash; }
+        private static readonly Dictionary<ZDOID, GhostRec> s_ghosts = new Dictionary<ZDOID, GhostRec>();
+        private static readonly Dictionary<int, int> s_noZdoByHash = new Dictionary<int, int>();
+        private const long GhostExpiryMs = 600000;
+
+        /// <summary>
+        /// The target ZDO does not exist on the server, so HandleRoutedRPC is
+        /// about to drop this with no log, no error and no reply — the sender
+        /// waits forever. Benign races do happen (a client acting on something
+        /// destroyed a frame earlier), and they produce exactly ONE of these,
+        /// so a single occurrence stays quiet. A phantom the player keeps
+        /// clicking repeats against the same ZDOID, which is the signature
+        /// worth a line: the repeat count and age are what separate the two.
+        /// </summary>
+        private static void NoteNoZdo(ZRoutedRpc.RoutedRPCData d)
+        {
+            if (s_noZdoByHash.TryGetValue(d.m_methodHash, out int hc)) s_noZdoByHash[d.m_methodHash] = hc + 1;
+            else if (s_noZdoByHash.Count < 32) s_noZdoByHash[d.m_methodHash] = 1;
+
+            long now = NowMs;
+            bool known = s_ghosts.TryGetValue(d.m_targetZDO, out var rec);
+            if (!known)
+            {
+                if (s_ghosts.Count >= 4096) return;   // counted above either way
+                rec.FirstAt = now;
+            }
+            rec.Count++;
+            rec.Hash = d.m_methodHash;
+            s_ghosts[d.m_targetZDO] = rec;
+
+            if (rec.Count == 2 || rec.Count % 5 == 0)
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [Diag] GhostRPC rpc={RpcName(d.m_methodHash)} " +
+                    $"zdo={d.m_targetZDO} sender={d.m_senderPeerID} n={rec.Count} " +
+                    $"age={(now - rec.FirstAt) / 1000}s — server holds no ZDO, dropped silently");
+        }
+
+        // A ghost the player gives up on would otherwise sit here forever.
+        private static string DrainGhosts()
+        {
+            if (s_ghosts.Count == 0) return "";
+            long now = NowMs;
+            int worstN = 0; long worstAge = 0; int worstHash = 0;
+            List<ZDOID> stale = null;
+            foreach (var kv in s_ghosts)
+            {
+                if (now - kv.Value.FirstAt > GhostExpiryMs)
+                {
+                    (stale ?? (stale = new List<ZDOID>())).Add(kv.Key);
+                    continue;
+                }
+                if (kv.Value.Count > worstN)
+                {
+                    worstN = kv.Value.Count;
+                    worstAge = now - kv.Value.FirstAt;
+                    worstHash = kv.Value.Hash;
+                }
+            }
+            if (stale != null) foreach (var id in stale) s_ghosts.Remove(id);
+            if (worstN < 2) return $" ghosts={s_ghosts.Count}";
+            return $" ghosts={s_ghosts.Count} worst={worstN}x{worstAge / 1000}s({RpcName(worstHash)})";
+        }
+
         private static long NowMs => (long)(Time.realtimeSinceStartup * 1000f);
 
         static void Prefix(ZRoutedRpc.RoutedRPCData __0)
@@ -6150,7 +6299,7 @@ namespace ServerZoneOwnership
             if (__0.m_targetZDO.IsNone()) return;   // global RPC, not an object interaction
 
             var zdo = ZDOMan.instance?.GetZDO(__0.m_targetZDO);
-            if (zdo == null) { s_noZdo++; return; }
+            if (zdo == null) { s_noZdo++; NoteNoZdo(__0); return; }
 
             var scene = ZNetScene.instance;
             var view = scene?.FindInstance(zdo);
@@ -6177,7 +6326,7 @@ namespace ServerZoneOwnership
                             $"uncreated={ZNetScene_CreateObjectsSorted_Diag_Patch.s_lastUncreated} " +
                             $"budget={ZNetScene_CreateObjectsSorted_Diag_Patch.s_lastBudget} " +
                             $"handed={ZNetScene_CreateObjectsSorted_Diag_Patch.s_lastHanded} " +
-                            $"hash={__0.m_methodHash} zdo={__0.m_targetZDO}");
+                            $"rpc={RpcName(__0.m_methodHash)} zdo={__0.m_targetZDO}");
                     }
                 }
                 return;
@@ -6227,15 +6376,22 @@ namespace ServerZoneOwnership
             if (s_noInstance == 0 && s_noZdo == 0) return null;
             string top = string.Join(" ", s_byPrefab.OrderByDescending(kv => kv.Value)
                 .Take(5).Select(kv => $"{kv.Key}x{kv.Value}"));
+            // v0.7.58: names, not raw hashes, and the two failure modes are
+            // reported separately — they mean different things. noInstance is
+            // "we have the object but never built it"; noZdo is "we have no
+            // record of it at all, yet a client is still interacting with it".
             string hashes = string.Join(" ", s_byHash.OrderByDescending(kv => kv.Value)
-                .Take(4).Select(kv => $"{kv.Key}x{kv.Value}"));
+                .Take(4).Select(kv => $"{RpcName(kv.Key)}x{kv.Value}"));
+            string ghostHashes = string.Join(" ", s_noZdoByHash.OrderByDescending(kv => kv.Value)
+                .Take(4).Select(kv => $"{RpcName(kv.Key)}x{kv.Value}"));
             string s = $"deadRPC noInstance={s_noInstance} noZdo={s_noZdo} ok={s_ok} " +
                        $"spans={s_spans} spanMs(mean/max)=" +
                        $"{(s_spans > 0 ? s_spanMsSum / s_spans : 0)}/{s_spanMsMax} " +
-                       $"pending={s_firstFail.Count} | {top} | hash {hashes}";
+                       $"pending={s_firstFail.Count}{DrainGhosts()} | {top} | " +
+                       $"noInstance rpc {hashes} | noZdo rpc {ghostHashes}";
             s_noZdo = 0; s_noInstance = 0; s_ok = 0;
             s_spans = 0; s_spanMsSum = 0; s_spanMsMax = 0;
-            s_byHash.Clear(); s_byPrefab.Clear();
+            s_byHash.Clear(); s_byPrefab.Clear(); s_noZdoByHash.Clear();
             return s;
         }
     }
