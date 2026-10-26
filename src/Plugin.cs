@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.74";
+        public const string PluginVersion = "0.7.75";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -1894,6 +1894,7 @@ namespace ServerZoneOwnership
                 foreach (var zdo in s_distantBuffer)
                     if (s_seenDistant.Add(zdo)) unionDistant.Add(zdo);
             }
+            WaterImpactDiag.ReportNearest();
             s_unionBuiltThisTick = true;
         }
 
@@ -7946,12 +7947,15 @@ namespace ServerZoneOwnership
     internal static class WaterImpactDiag
     {
         private const string PrefabName = "fx_WaterImpact_Big";
-        private const float ReportEverySeconds = 10f;
+        private const float ReportEverySeconds = 5f;
 
         private static int s_prefabHash;
         private static bool s_rangeReported;
         private static float s_lastReport;
         private static int s_seen;
+        private static float s_bestDist = float.MaxValue;
+        private static Vector3 s_bestPos;
+        private static string s_bestPeer = "?";
 
         internal static void MaybeReportRange()
         {
@@ -7993,8 +7997,13 @@ namespace ServerZoneOwnership
         }
 
         /// <summary>
-        /// Offered every ZDO in the union walk, like the pheromone marker. Rate
-        /// limited because the point is to identify a source, not to count.
+        /// v0.7.75: reports the NEAREST impact to a player rather than whichever
+        /// one happened to fire when the rate limit expired. The original
+        /// sampled at random, which made the distances useless for navigation —
+        /// a quoted 120m could sit next to an unreported log 10m away. Now every
+        /// impact is measured against every peer and only the closest in each
+        /// window is logged, so the number falls as you approach and the
+        /// coordinates lead somewhere.
         /// </summary>
         internal static void Offer(ZDO zdo)
         {
@@ -8003,23 +8012,39 @@ namespace ServerZoneOwnership
             if (zdo.GetPrefab() != s_prefabHash) return;
 
             s_seen++;
+            if (ZNet.instance == null) return;
+
+            var pos = zdo.GetPosition();
+            foreach (var peer in ZNet.instance.GetPeers())
+            {
+                if (peer == null) continue;
+                float d = Vector3.Distance(peer.m_refPos, pos);
+                if (d >= s_bestDist) continue;
+                s_bestDist = d;
+                s_bestPos = pos;
+                s_bestPeer = peer.m_playerName;
+            }
+        }
+
+        /// <summary>
+        /// Called once per union walk. Emits the closest impact seen since the
+        /// last report, then resets — so each line is the best fix available in
+        /// that window rather than a sample.
+        /// </summary>
+        internal static void ReportNearest()
+        {
+            if (s_bestDist >= float.MaxValue) return;
             if (Time.time - s_lastReport < ReportEverySeconds) return;
             s_lastReport = Time.time;
 
-            var pos = zdo.GetPosition();
-            string nearest = NearestCulprit(pos);
-            var sb = new System.Text.StringBuilder();
-            if (ZNet.instance != null)
-            {
-                foreach (var peer in ZNet.instance.GetPeers())
-                {
-                    if (peer == null) continue;
-                    sb.Append($" {peer.m_playerName}={Vector3.Distance(peer.m_refPos, pos):F0}m");
-                }
-            }
+            var pos = s_bestPos;
             Plugin.Log.LogWarning(
-                $"[{Plugin.Stamp}] [WaterFX] impact at world({pos.x:F0},{pos.y:F1},{pos.z:F0}) "
-                + $"nearest={nearest} n={s_seen} peers:{sb}");
+                $"[{Plugin.Stamp}] [WaterFX] NEAREST impact {s_bestDist:F0}m from {s_bestPeer} "
+                + $"at world({pos.x:F0},{pos.y:F1},{pos.z:F0}) "
+                + $"source={NearestCulprit(pos)} totalSeen={s_seen}");
+
+            s_bestDist = float.MaxValue;
+            s_bestPeer = "?";
         }
 
         // The thing making the splash should be the closest non-effect object.
