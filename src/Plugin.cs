@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.77";
+        public const string PluginVersion = "0.7.78";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -8049,9 +8049,16 @@ namespace ServerZoneOwnership
 
         private static long SiteKey(Vector3 p)
         {
-            long gx = (long)Mathf.Floor(p.x / 4f);
-            long gz = (long)Mathf.Floor(p.z / 4f);
-            return (gx << 24) ^ gz;
+            // v0.7.78: the previous key was (gx << 24) ^ gz, which is broken for
+            // negative coordinates: gz sign-extends to all ones through the high
+            // bits and corrupts gx, so unrelated cells collapse onto one key and
+            // overwrite each other. Measured: 100 splashes across a 500m field
+            // produced 5 sites, and the reported position belonged to a
+            // different place than the distance was computed for. Mask instead
+            // of XOR so the halves cannot bleed into each other.
+            long gx = (long)Mathf.Floor(p.x / 4f) + 2097152L;   // bias to unsigned
+            long gz = (long)Mathf.Floor(p.z / 4f) + 2097152L;
+            return ((gx & 0x3FFFFFL) << 22) | (gz & 0x3FFFFFL);
         }
 
         private static void RememberSite(Vector3 pos)
@@ -8087,10 +8094,14 @@ namespace ServerZoneOwnership
                 if (peer == null) continue;
                 float best = float.MaxValue;
                 Vector3 bestPos = Vector3.zero;
+                float bestAge = 0f;
                 foreach (var kv in s_sitePos)
                 {
                     float d = Vector3.Distance(peer.m_refPos, kv.Value);
-                    if (d < best) { best = d; bestPos = kv.Value; }
+                    if (d >= best) continue;
+                    best = d; bestPos = kv.Value;
+                    float stamp;
+                    bestAge = s_sites.TryGetValue(kv.Key, out stamp) ? Time.time - stamp : -1f;
                 }
                 if (best >= float.MaxValue) continue;
                 Plugin.Log.LogWarning(
@@ -8098,7 +8109,7 @@ namespace ServerZoneOwnership
                     + $"{Bearing(peer.m_refPos, bestPos)} of {peer.m_playerName} | "
                     + $"you=world({peer.m_refPos.x:F0},{peer.m_refPos.z:F0}) "
                     + $"site=world({bestPos.x:F0},{bestPos.z:F0}) "
-                    + $"knownSites={s_sites.Count} totalSeen={s_seen}");
+                    + $"age={bestAge:F0}s knownSites={s_sites.Count} totalSeen={s_seen}");
             }
         }
 
