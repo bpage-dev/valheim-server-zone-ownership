@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.63";
+        public const string PluginVersion = "0.7.64";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -6904,6 +6904,7 @@ namespace ServerZoneOwnership
         internal static void Poll()
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            StatusAttributeCensus.MaybeReport();
             var peers = ZNet.instance.GetPeers();
             if (peers == null || peers.Count == 0) return;
 
@@ -7007,6 +7008,65 @@ namespace ServerZoneOwnership
         {
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             ConsumerChainDiag.s_inner++;
+        }
+    }
+
+    /// <summary>
+    /// v0.7.64 (bug #11): is the attribute path even in play?
+    ///
+    /// StatusEffect.m_attributes is a [BitMask] public field set per asset in
+    /// the editor, so it is PREFAB-SERIALISED and invisible in the decompile —
+    /// the same trap as the per-prefab ZDO flags, see [[valheim-prefab-flags]].
+    /// Reading the source therefore cannot tell us whether any given effect
+    /// declares the attribute a consumer tests, which makes a mask of 0 on a
+    /// player ambiguous: either replication is broken, or the effect genuinely
+    /// declares nothing and the whole attribute path is a red herring.
+    ///
+    /// Settled from the live asset database instead: count how many status
+    /// effects declare each bit. If a bit is declared by nothing at all, then
+    /// any consumer gated on it can never fire for anyone on any server, and
+    /// our ownership changes are not the cause.
+    ///
+    /// Counts only, never names, so this reports nothing about which effect is
+    /// which. Runs once, from the watch poll rather than Awake, because
+    /// ObjectDB is not populated that early.
+    /// </summary>
+    internal static class StatusAttributeCensus
+    {
+        private static bool s_done;
+
+        internal static void MaybeReport()
+        {
+            if (s_done) return;
+            var db = ObjectDB.instance;
+            if (db == null || db.m_StatusEffects == null || db.m_StatusEffects.Count == 0) return;
+            s_done = true;
+
+            int total = 0, withAny = 0;
+            var perBit = new Dictionary<int, int>();
+            foreach (var se in db.m_StatusEffects)
+            {
+                if (se == null) continue;
+                total++;
+                int a = (int)se.m_attributes;
+                if (a == 0) continue;
+                withAny++;
+                for (int b = 0; b < 32; b++)
+                {
+                    int bit = 1 << b;
+                    if ((a & bit) == 0) continue;
+                    perBit.TryGetValue(bit, out int c);
+                    perBit[bit] = c + 1;
+                }
+            }
+
+            string bits = perBit.Count == 0
+                ? "none"
+                : string.Join(" ", perBit.OrderBy(kv => kv.Key)
+                    .Select(kv => $"bit{kv.Key}x{kv.Value}"));
+            Plugin.Log.LogInfo(
+                $"[{Plugin.Stamp}] [Diag] seAttribCensus effects={total} " +
+                $"withAttributes={withAny} | {bits}");
         }
     }
 }
