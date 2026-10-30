@@ -19,7 +19,7 @@ namespace ServerZoneOwnership
         // subsystem was refactored (Vector2i→Vector2s zones, m_activeArea →
         // SimulationDistance, private Find*Objects → public FindSectorObjects),
         // so this is a breaking-compat release: it will NOT run on older builds.
-        public const string PluginVersion = "0.7.81";
+        public const string PluginVersion = "0.7.92";
 
         // Debug knob: when true, emits the periodic [Coverage] lines (sector
         // ownership + per-peer positions) every StatsLogIntervalSeconds.
@@ -40,7 +40,7 @@ namespace ServerZoneOwnership
         internal const bool DebugDisableRaids = false;
         private const float StatsLogIntervalSeconds = 20f;
         private const float PopulationLogIntervalSeconds = 90f;
-        private const float NRESummaryIntervalSeconds = 30f;
+        private const float NRESummaryIntervalSeconds = 60f;
         private const float PeerAwareSummaryIntervalSeconds = 60f;
         // --- createDestroy stride (v0.7.10) -------------------------------
         // 1 = vanilla behaviour (every tick). >1 skips the object create/destroy
@@ -107,7 +107,7 @@ namespace ServerZoneOwnership
         // actually written into an outgoing packet, by hooking ZDO.Serialize —
         // the call vanilla makes once per ZDO that fits inside the byte budget.
         // So these are real sends, with real byte counts, not offers.
-        internal const float DebugSendCensusSeconds = 5f;
+        internal const float DebugSendCensusSeconds = 0f;   // v0.7.85: 0 = off (was 5s, ~274 lines a pop)
 
         // v0.7.69 bug #11: run the pheromone mechanic server-side. False
         // restores vanilla behaviour, which on this server is a silent no-op.
@@ -142,6 +142,29 @@ namespace ServerZoneOwnership
         // single lost packet no longer leaves a cluster of phantoms. Loss on
         // separate sends is independent, so this squares the failure rate.
         internal const bool DebugDuplicateDestroySend = true;
+
+        // v0.7.83 (bug #7): ask vanilla IsAreaReady about a teleport destination
+        // from the server and name the ZDO that fails it.
+        internal const bool DebugTeleportAreaProbe = true;
+
+        // v0.7.83 (bug #7): poll whether the server has a GameObject for each
+        // player, rather than waiting for an RPC to reveal that it does not.
+        internal const bool DebugPlayerInstanceWatch = true;
+
+        // v0.7.83 (bug #7): watch the zone-loading registry for an entry that
+        // never unsets, which blocks every lower-ranked object in that zone.
+        internal const bool DebugZoneLoadingWatch = true;
+
+        // v0.7.84: time DungeonGenerator.Spawn, the synchronous interior rebuild
+        // that 64% of this session's hitches correlate with. Reports ms, room
+        // count, how many times that same dungeon has been rebuilt, and the
+        // horizontal distance to the nearest peer.
+        internal const bool DebugDungeonSpawnTimer = true;
+
+        // v0.7.91 (bug #31): do not build a dungeon interior until a player is
+        // in its active area (3x3 zones) rather than anywhere in our 5x5
+        // coverage box. Gates the generator AND its contents together.
+        internal const bool DebugGateDungeonInteriors = true;
 
         // --- Distance-tiered send rate (v0.7.30) ---------------------------
         // THE PROBLEM: because the server owns every mob, every mob's motion
@@ -194,7 +217,7 @@ namespace ServerZoneOwnership
         // 5s for a short capture (an hour gives ~720 points, good chart
         // resolution). Raise to 20f for long unattended runs — at 8 players this
         // is 32 lines per window, so 5s means ~6.4 lines/sec.
-        internal const float DebugSendTierSeconds = 5f;
+        internal const float DebugSendTierSeconds = 0f;   // v0.7.85: 0 = prune only, no print; pruning still runs every 30s
 
         // Promote projectiles above Default in the send order (v0.7.42). Pure
         // ordering — projectiles still pass the same distance stride as
@@ -217,11 +240,6 @@ namespace ServerZoneOwnership
         // event spawner list — see the isolation proof in the bug table.
         internal const bool DebugScopeEventSpawns = true;
 
-        // How often the [Nav] navmesh gauge prints. Ours, no vanilla default.
-        // Raise it if the log gets noisy; the numbers are instantaneous
-        // readings plus per-window counters, so the window length only changes
-        // the resolution, never the meaning.
-        private const float NavStatsIntervalSeconds = 20f;
 
         // --- Navmesh tile pressure knobs (v0.7.0) --------------------------
         // Mob pathfinding builds 32m navmesh tiles on demand, one layer per
@@ -300,7 +318,7 @@ namespace ServerZoneOwnership
         private float _populationTimer;
         private float _nreTimer;
         private float _peerAwareTimer;
-        private float _navStatsTimer;
+        private float _probeTimer;
         // Date the digest last fired, so it emits once per day and not once per
         // frame for the whole minute.
         private DateTime _lastDigestDate = DateTime.MinValue;
@@ -358,7 +376,6 @@ namespace ServerZoneOwnership
             // Count engine-side navmesh link-pool exhaustion. The message is
             // emitted by native Unity code, so there is nothing to patch — we
             // observe the log stream instead and report a count every 20s.
-            Application.logMessageReceived += NavMeshPressure.OnUnityLog;
             Log.LogInfo($"{PluginName} v{PluginVersion} patches applied.");
             var dirtyMarker = BuildInfo.GitDirty ? " (dirty)" : "";
             Log.LogInfo($"Build: git {BuildInfo.GitShortSha}{dirtyMarker} · {BuildInfo.BuildTimestamp} UTC");
@@ -480,7 +497,6 @@ namespace ServerZoneOwnership
             // Flush whatever the day accumulated so a clean shutdown doesn't
             // silently discard it. A hard kill still loses the counts.
             if (_harmony != null) DailyDigest.Emit("shutdown");
-            Application.logMessageReceived -= NavMeshPressure.OnUnityLog;
             _harmony?.UnpatchSelf();
         }
 
@@ -503,7 +519,6 @@ namespace ServerZoneOwnership
             _populationTimer += Time.deltaTime;
             _nreTimer += Time.deltaTime;
             _peerAwareTimer += Time.deltaTime;
-            _navStatsTimer += Time.deltaTime;
             _perfTimer += Time.deltaTime;
 
             // Sample this tick's duration. unscaledDeltaTime so a timeScale
@@ -527,6 +542,15 @@ namespace ServerZoneOwnership
             }
 
             DuplicateDestroySend.Poll();
+
+            _probeTimer += Time.deltaTime;
+            if (_probeTimer >= 1f)
+            {
+                _probeTimer = 0f;
+                TeleportAreaProbe.Poll();
+                PlayerInstanceWatch.Poll();
+                ZoneLoadingWatch.Poll();
+            }
 
             if (DebugSendCensusSeconds > 0f)
             {
@@ -554,11 +578,6 @@ namespace ServerZoneOwnership
                 }
             }
 
-            if (_navStatsTimer >= NavStatsIntervalSeconds)
-            {
-                _navStatsTimer = 0f;
-                NavMeshPressure.LogStats();
-            }
             if (_statsTimer >= StatsLogIntervalSeconds)
             {
                 _statsTimer = 0f;
@@ -688,27 +707,24 @@ namespace ServerZoneOwnership
             var rpcd = ZNetView_HandleRoutedRPC_Diag_Patch.Drain();
             var cdp = CreateDestroyPhases.Drain();
             if (cdp != null) Log.LogInfo($"[{Stamp}] [Diag] {cdp}");
-            Incinerator_Diag_Patch.Poll();
-            IncineratorOwnerWatch.Poll();
+            var dsp = DungeonSpawnTimer.Drain();
+            if (dsp != null) Log.LogInfo($"[{Stamp}] [Diag] {dsp}");
             var zb = ZoneSystem_IsZoneReadyForType_Diag_Patch.Drain();
             if (zb != null) Log.LogWarning($"[{Stamp}] [Diag] {zb}");
             var dw = ZRoutedRpc_HandleRoutedRPC_DeadWindow_Patch.Drain();
             if (dw != null) Log.LogWarning($"[{Stamp}] [Diag] {dw}");
             var cs = ZNetScene_CreateObjectsSorted_Diag_Patch.Drain();
             if (cs != null) Log.LogInfo($"[{Stamp}] [Diag] {cs}");
-            var lp = Procreation_Diag_Patch.Drain();
-            if (lp != null) Log.LogInfo($"[{Stamp}] [Diag] {lp}");
-            var srp = StatusEffectRpcWatch.Drain();
-            if (srp != null) Log.LogInfo($"[{Stamp}] [Diag] {srp}");
             var dds = DuplicateDestroySend.Drain();
             if (dds != null) Log.LogInfo($"[{Stamp}] [Diag] {dds}");
             var gfx = GhostDestroyRetry.Drain();
             if (gfx != null) Log.LogWarning($"[{Stamp}] [Diag] {gfx}");
-            var phr = PheromoneServerSide.Drain();
-            if (phr != null) Log.LogInfo($"[{Stamp}] [Diag] {phr}");
-            var phs = PheromoneSpawnOverride.Drain();
-            if (phs != null) Log.LogInfo($"[{Stamp}] [Diag] {phs}");
-            MountSyncDiag.Flush();
+            var tap = TeleportAreaProbe.Drain();
+            if (tap != null) Log.LogInfo($"[{Stamp}] [Diag] {tap}");
+            var nob = PlayerInstanceWatch.Drain();
+            if (nob != null) Log.LogWarning($"[{Stamp}] [Diag] {nob}");
+            var zlw = ZoneLoadingWatch.Drain();
+            if (zlw != null) Log.LogInfo($"[{Stamp}] [Diag] {zlw}");
             if (passes != null || reclaims != null || sync != null || terrain != null || proj != null || rpcd != null)
                 Log.LogInfo($"[{Stamp}] [Pass] {passes} | {reclaims} | {sync}" +
                             (terrain != null ? $" | {terrain}" : "") +
@@ -1764,7 +1780,6 @@ namespace ServerZoneOwnership
             s_frame++;
             s_unionBuiltThisTick = false;
             PheromoneServerSide.MaybeScan();
-            WaterImpactDiag.MaybeReportRange();
 
             var simDist = ServerCoverage.GetSimulationDistance();
             var zdoMan = ZDOMan.instance;
@@ -1816,11 +1831,12 @@ namespace ServerZoneOwnership
                 // Sort creation by distance to THIS peer, not the centroid.
                 // finally is load-bearing: leaving the override set would feed a
                 // single peer's position to every reference-position consumer.
+                var gatedNear = GateInteriors(__instance, s_sliceNear, pos);
                 ZNet_GetReferencePosition_Patch.BeginOverride(pos);
                 try
                 {
                     ReflectionCache.ZNetScene_CreateObjects.Invoke(
-                        __instance, new object[] { s_sliceNear, s_sliceDistant });
+                        __instance, new object[] { gatedNear, s_sliceDistant });
                 }
                 finally
                 {
@@ -1849,6 +1865,97 @@ namespace ServerZoneOwnership
                     CreateDestroyPhases.LiveInstances(__instance));
             }
             return false;
+        }
+
+
+        // ---- v0.7.91: interior creation gate (bug #31) -------------------
+        // Prefab hash -> does this prefab carry a DungeonGenerator. Populated
+        // lazily; the set is tiny but the slice is thousands of ZDOs a tick,
+        // so the lookup has to be O(1) and must not call GetComponent twice.
+        private static readonly Dictionary<int, bool> s_isDungeonPrefab =
+            new Dictionary<int, bool>();
+        // Per-tick memo of "is this zone covered by the peer we are slicing
+        // for". Decided ONCE PER ZONE, never per ZDO: a dungeon's contents are
+        // spread across the interior radius and would otherwise straddle the
+        // boundary, creating some mobs with no floor under them.
+        private static readonly Dictionary<Vector2s, bool> s_zoneCovered =
+            new Dictionary<Vector2s, bool>();
+        private static readonly List<ZDO> s_gatedSlice = new List<ZDO>();
+
+        private static bool HasDungeonGenerator(ZNetScene scene, int prefabHash)
+        {
+            if (s_isDungeonPrefab.TryGetValue(prefabHash, out bool known)) return known;
+            var pf = scene.GetPrefab(prefabHash);
+            bool has = pf != null && pf.GetComponent<DungeonGenerator>() != null;
+            s_isDungeonPrefab[prefabHash] = has;
+            return has;
+        }
+
+        /// <summary>
+        /// Drop dungeon interiors from ONE peer's creation slice when that peer
+        /// is not in the interior's active area.
+        ///
+        /// Measured over two sessions: 75-85% of DungeonGenerator.Spawn calls
+        /// were for dungeons no player was in area of, each costing a flat
+        /// ~450ms of blocked tick with no warm-asset discount on repeats. One
+        /// rebuild cost 419ms for an interior that lived 7 seconds and was never
+        /// closer than 138m to anybody.
+        ///
+        /// WHY THE WHOLE INTERIOR AND NOT JUST THE GENERATOR: the generator is
+        /// what calls ZoneSystem.SetLoadingInZone during LoadRoomPrefabsAsync,
+        /// and that registration is what makes IsZoneReadyForType refuse every
+        /// lower-ranked ZDO in the zone until the rooms exist. Gate only the
+        /// generator and nothing holds the Default-type contents back, so mobs
+        /// and chests get created into empty space 5000m up. Both are gated on
+        /// the identical per-zone condition, so they can never disagree.
+        ///
+        /// Interior membership is Character.InInterior's own test (y > 3000),
+        /// plus a DungeonGenerator component check because the generator's own
+        /// altitude VARIES - measured at y=34 for one location and y=5092 for
+        /// another, decided by Location.m_useCustomInteriorTransform, which
+        /// forces the generator to the location origin. Altitude alone would
+        /// miss half of them.
+        ///
+        /// REMOVAL IS DELIBERATELY NOT FILTERED. RemoveObjects is a whitelist;
+        /// a short list there destroys everything absent from it. Leaving the
+        /// union alone also buys hysteresis for free: creation stops at
+        /// InActiveArea (~112m) while destruction still happens at the coverage
+        /// box (160m per axis), so an interior already built survives the player
+        /// wandering out and back without a rebuild.
+        /// </summary>
+        private static List<ZDO> GateInteriors(ZNetScene scene, List<ZDO> slice, Vector3 peerPos)
+        {
+            if (!Plugin.DebugGateDungeonInteriors) return slice;
+
+            s_gatedSlice.Clear();
+            s_zoneCovered.Clear();
+            bool droppedAny = false;
+
+            for (int i = 0; i < slice.Count; i++)
+            {
+                var zdo = slice[i];
+                if (zdo == null) continue;
+
+                bool interior = zdo.GetPosition().y > 3000f;
+                if (!interior && !HasDungeonGenerator(scene, zdo.GetPrefab()))
+                {
+                    s_gatedSlice.Add(zdo);
+                    continue;
+                }
+
+                var zone = zdo.GetSector();
+                if (!s_zoneCovered.TryGetValue(zone, out bool covered))
+                {
+                    // Tested at the ZONE CENTRE so every ZDO in the zone gets
+                    // the same answer, matching how IsZoneReadyForType works.
+                    covered = ZNetScene.InActiveArea(ZoneSystem.GetZonePos(zone), peerPos);
+                    s_zoneCovered[zone] = covered;
+                }
+                if (covered) s_gatedSlice.Add(zdo);
+                else droppedAny = true;
+            }
+
+            return droppedAny ? s_gatedSlice : slice;
         }
 
         /// <summary>
@@ -1884,14 +1991,11 @@ namespace ServerZoneOwnership
                 {
                     if (!s_seenNear.Add(zdo)) continue;
                     PheromoneServerSide.Offer(zdo);
-                    WaterImpactDiag.Offer(zdo);
                     unionNear.Add(zdo);
                 }
                 foreach (var zdo in s_distantBuffer)
                     if (s_seenDistant.Add(zdo)) unionDistant.Add(zdo);
             }
-            WaterImpactDiag.ReportNearest();
-            WaterImpactDiag.ReportNearestKnown();
             s_unionBuiltThisTick = true;
         }
 
@@ -1983,10 +2087,6 @@ namespace ServerZoneOwnership
             if (prev != desired)
             {
                 zdo.SetOwner(desired);
-                var pos = zdo.GetPosition();
-                Plugin.Log.LogInfo(
-                    $"[{Plugin.Stamp}] [Diag] Ship ownership → peer {desired} (was {prev}) " +
-                    $"prefab={prefab.name} pos=world({pos.x:F0},{pos.z:F0})");
             }
             return true;
         }
@@ -2158,9 +2258,6 @@ namespace ServerZoneOwnership
         // ahead. Keyed by prefab hash because the Sadle component is only
         // discoverable via GetComponent on the prefab.
         private static readonly Dictionary<int, bool> s_sadlePrefabCache = new Dictionary<int, bool>();
-        internal static int s_mountReclaimLivePeer;
-        internal static int s_mountLeftWithRider;
-        internal static int s_mountReclaimOther;
 
         internal static bool IsSaddlePrefab(int prefabHash) => PrefabHasSadle(prefabHash);
 
@@ -2187,9 +2284,6 @@ namespace ServerZoneOwnership
                 has = tameable != null && tameable.m_saddle != null;
             }
             s_sadlePrefabCache[prefabHash] = has;
-            if (has)
-                Plugin.Log.LogInfo(
-                    $"[{Plugin.Stamp}] [Diag] Saddle-capable prefab detected: {prefab.name}");
             return has;
         }
 
@@ -2266,22 +2360,6 @@ namespace ServerZoneOwnership
                     // mount is the expected shape, not continuous churn. If
                     // the mount still skips while this reads stable, ownership
                     // is not the cause and the send rate is the next suspect.
-                    if (PrefabHasSadle(zdo.GetPrefab()))
-                    {
-                        long mountRider = zdo.GetLong(ZDOVars.s_user, 0L);
-                        if (mountRider != 0L)
-                        {
-                            long mountOwner = zdo.GetOwner();
-                            var mPrefab = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
-                            var mPos = zdo.GetPosition();
-                            Plugin.Log.LogInfo(
-                                $"[{Plugin.Stamp}] [Diag] Mount seen prefab={(mPrefab != null ? mPrefab.name : "?")} " +
-                                $"rider={mountRider} owner={mountOwner} ownerIsUs={(mountOwner == sessionId)} " +
-                                $"ownerLive={ServerCoverage.IsLivePeer(mountOwner)} " +
-                                $"ownerRev={zdo.OwnerRevision} dataRev={zdo.DataRevision} " +
-                                $"pos=world({mPos.x:F0},{mPos.z:F0})");
-                        }
-                    }
                     // v0.7.47 FIX (bug #1): leave a ridden mount owned by its
                     // rider, the way vanilla does.
                     //
@@ -2325,14 +2403,7 @@ namespace ServerZoneOwnership
                             if (mountPrev != mountRider)
                             {
                                 zdo.SetOwner(mountRider);
-                                var mPos2 = zdo.GetPosition();
-                                var mPf2 = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
-                                Plugin.Log.LogInfo(
-                                    $"[{Plugin.Stamp}] [Diag] Mount ownership → rider {mountRider} " +
-                                    $"(was {mountPrev}) prefab={(mPf2 != null ? mPf2.name : "?")} " +
-                                    $"pos=world({mPos2.x:F0},{mPos2.z:F0})");
                             }
-                            System.Threading.Interlocked.Increment(ref s_mountLeftWithRider);
                             continue;
                         }
                     }
@@ -2445,6 +2516,21 @@ namespace ServerZoneOwnership
                                     break;
                                 }
                             }
+                            // v0.7.88 TRIED letting the server claim TerrainComps that no
+                            // peer is in area for (assignTo==0 falling through instead of
+                            // hitting this continue), to stop RPC_ApplyOperation dying on
+                            // unowned comps. REVERTED in v0.7.89: it caused a CLIENT-side
+                            // duplicate storm. 7,218 "Removed duplicate terrain compiler"
+                            // lines in the client log, ALL after the v0.7.88 restart and
+                            // ZERO in the 29 minutes before it, peaking at 6,300 in one
+                            // minute. TerrainComp.TryCleanInvalidTCs ends each one with
+                            // ZNetScene.Destroy, a NETWORKED destroy, so bulk-claiming 250
+                            // comps at once on arrival fed a create/destroy loop. The lag
+                            // was far worse than the dropped RPCs it fixed, which are loud
+                            // but harmless.
+                            //
+                            // DO NOT retry this as a bulk claim. Any retry must be LAZY:
+                            // claim one comp at the moment an op actually targets it.
                             if (assignTo != 0 && zdo.GetOwner() != assignTo)
                                 zdo.SetOwner(assignTo);
                             continue;
@@ -2493,23 +2579,6 @@ namespace ServerZoneOwnership
                     // warning rather than a digest counter: this only happens
                     // while somebody is mounted, so the volume is bounded, and
                     // the per-event timing is the whole point.
-                    if (PrefabHasSadle(zdo.GetPrefab()))
-                    {
-                        long rider = zdo.GetLong(ZDOVars.s_user, 0L);
-                        if (rider != 0L)
-                        {
-                            var mountPos = zdo.GetPosition();
-                            var mountPrefab = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
-                            bool liveOwner = ServerCoverage.IsLivePeer(prevOwner);
-                            if (liveOwner) System.Threading.Interlocked.Increment(ref s_mountReclaimLivePeer);
-                            else System.Threading.Interlocked.Increment(ref s_mountReclaimOther);
-                            Plugin.Log.LogWarning(
-                                $"[{Plugin.Stamp}] [Diag] Mount reclaimed prefab={(mountPrefab != null ? mountPrefab.name : "?")} " +
-                                $"rider={rider} prevOwner={prevOwner} live={liveOwner} " +
-                                $"pos=world({mountPos.x:F0},{mountPos.z:F0}) " +
-                                $"ownerRev={zdo.OwnerRevision} dataRev={zdo.DataRevision}");
-                        }
-                    }
 
                     // v0.7.11: every SetOwner bumps OwnerRevision, and vanilla's
                     // ZDOPeer.ShouldSend returns true unconditionally when a
@@ -3157,196 +3226,9 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// v0.6.2 diagnostic: sample a ship's server-side state every ~2s — owner,
-    /// players aboard, speed, rudder, water level, whether the buoyancy block
-    /// would run, and velocity.
-    ///
-    /// CAVEAT: this is a Postfix, and a Postfix does not run when the original
-    /// method throws. While Ship.UpdateSailSize was crashing (fixed in v0.6.6),
-    /// every crashing tick was invisible here — which is exactly why this
-    /// diagnostic reported "water found, physics ran" while the hull was
-    /// free-falling. Check the log for exceptions from CustomFixedUpdate before
-    /// trusting a clean-looking sample.
-    ///
-    /// While a client owns the ship (v0.6.4+), these samples describe the
-    /// server's network-driven copy, not the physics actually running.
-    /// </summary>
-    [HarmonyPatch(typeof(Ship), nameof(Ship.CustomFixedUpdate))]
-    internal static class Ship_CustomFixedUpdate_Diag_Patch
-    {
-        private static readonly FieldInfo s_nviewField = AccessTools.Field(typeof(Ship), "m_nview");
-        private static readonly FieldInfo s_bodyField = AccessTools.Field(typeof(Ship), "m_body");
-        private static readonly FieldInfo s_playersField = AccessTools.Field(typeof(Ship), "m_players");
-        private static readonly FieldInfo s_speedField = AccessTools.Field(typeof(Ship), "m_speed");
-        private static readonly FieldInfo s_rudderField = AccessTools.Field(typeof(Ship), "m_rudderValue");
 
-        private static readonly Dictionary<int, float> s_lastLog = new Dictionary<int, float>();
-        private const float ThrottleSeconds = 2f;
 
-        static void Postfix(Ship __instance)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
 
-            int key = __instance.GetInstanceID();
-            float now = Time.time;
-            if (s_lastLog.TryGetValue(key, out float last) && now - last < ThrottleSeconds) return;
-            s_lastLog[key] = now;
-
-            var nview = (ZNetView)s_nviewField.GetValue(__instance);
-            var body = (Rigidbody)s_bodyField.GetValue(__instance);
-            if (nview == null || body == null) return;
-
-            bool isOwner = nview.IsOwner();
-            long owner = nview.GetZDO()?.GetOwner() ?? 0;
-            var players = (List<Player>)s_playersField.GetValue(__instance);
-            int playerCount = players?.Count ?? -1;
-            var speed = s_speedField.GetValue(__instance);
-            float rudder = (float)s_rudderField.GetValue(__instance);
-
-            // Recompute the water check the same way Ship does, but with our own
-            // WaterVolume cache slot so we don't disturb the ship's cached one.
-            var com = body.worldCenterOfMass;
-            WaterVolume probe = null;
-            float waterLevel = Floating.GetWaterLevel(com, ref probe);
-            float heightAboveWater = com.y - waterLevel - __instance.m_waterLevelOffset;
-            bool physicsRan = !(heightAboveWater > __instance.m_disableLevel);
-            bool waterFound = waterLevel > -9000f;
-
-            // v0.7.2: the boat investigation is closed (v0.6.4 carve-out +
-            // v0.6.6 sail fix), so we no longer need a line per tick. Two
-            // numbers still guard against regressions: the server owning a
-            // crewed boat (it should hand off within ~2s), and hull depth —
-            // the lunge showed as 3.9-5.4m below water versus 1.37m healthy.
-            if (waterFound)
-                DailyDigest.RecordShipSample(isOwner && playerCount > 0, -heightAboveWater);
-        }
-    }
-
-    /// <summary>
-    /// Cart (Vagon) diagnostics — v0.5.23, reworked in v0.6.6.
-    ///
-    /// Symptom: a cart disconnects easily while being pulled. Two theories:
-    ///
-    ///  A. (original) The server owns the cart and runs its joint against the
-    ///     puller's network-positioned stand-in, so lag trips the detach-distance
-    ///     check or the joint's break force.
-    ///
-    ///  B. (from reading Vagon in build 25390671) The joint actually lives on
-    ///     the puller's client: Vagon.Interact asks the owner for the cart, and
-    ///     RPC_RequestOwn hands ZDO ownership to the requester, whose client then
-    ///     runs AttachTo. Our ReleaseZDOS then reclaims the cart within ~2s —
-    ///     carts don't set s_inUse, so nothing tells it the cart is busy. The
-    ///     client is no longer the owner, so its own Vagon.Update runs
-    ///     `else if (IsAttached()) Detach();` and drops the cart itself.
-    ///
-    /// Theory B signature, in order:
-    ///   [Diag] Cart RPC_RequestOwn … outcome=GRANT → peer P
-    ///   [Diag] Cart reclaimed by server from peer P … attachJoint=True   (≤2s later)
-    ///   [Diag] Vagon.Detach … serverOwns=True …   (server clearing the stale flag)
-    /// Theory A signature: Vagon.AttachTo on the server, then Vagon.Detach with
-    /// serverOwns=True and reason=DISTANCE_EXCEEDED or joint_broke.
-    ///
-    /// Result (2026-09-18, v0.6.6 in-game test): theory B confirmed — GRANT,
-    /// then reclaim with attachJoint=True every ~2s, then stale_attach_flag
-    /// detaches. Fixed in v0.6.7 by skipping hitched carts with a live owner
-    /// in ZDOMan_ReleaseZDOS_Patch.
-    ///
-    /// Only logs detaches that matter. When a peer owns an attached cart,
-    /// vanilla's non-owner branch calls Detach() on the server's copy EVERY
-    /// FRAME (it just clears local state; only the owner can clear the ZDO
-    /// flag) — logging those would flood the log with non-events.
-    /// </summary>
-    [HarmonyPatch(typeof(Vagon), "Detach")]
-    internal static class Vagon_Detach_Diag_Patch
-    {
-        private static readonly FieldInfo s_attachJoinField = AccessTools.Field(
-            typeof(Vagon), "m_attachJoin");
-        private static readonly FieldInfo s_attachedObjectField = AccessTools.Field(
-            typeof(Vagon), "m_attachedObject");
-        private static readonly FieldInfo s_nviewField = AccessTools.Field(
-            typeof(Vagon), "m_nview");
-
-        static void Prefix(Vagon __instance)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            var joint = (ConfigurableJoint)s_attachJoinField.GetValue(__instance);
-            var attachedObj = (GameObject)s_attachedObjectField.GetValue(__instance);
-            var nview = (ZNetView)s_nviewField.GetValue(__instance);
-            bool serverOwns = nview != null && nview.IsValid() && nview.IsOwner();
-            if (!serverOwns && joint == null && attachedObj == null) return;
-
-            var zdo = nview?.GetZDO();
-            long owner = zdo?.GetOwner() ?? 0;
-            bool attachFlag = zdo != null && zdo.GetBool(ZDOVars.s_attachJointHash);
-            var pos = __instance.transform.position;
-
-            string reason;
-            float dist = -1f;
-            if (attachedObj == null)
-            {
-                reason = joint == null && attachFlag
-                    ? "stale_attach_flag (a previous owner attached it; the joint was never on the server)"
-                    : "no_attached_object";
-            }
-            else
-            {
-                dist = Vector3.Distance(
-                    attachedObj.transform.position + __instance.m_attachOffset,
-                    __instance.m_attachPoint.position);
-                reason = dist >= __instance.m_detachDistance
-                    ? $"DISTANCE_EXCEEDED ({dist:F2}m >= {__instance.m_detachDistance:F2}m)"
-                    : joint == null ? "joint_broke" : "requested_or_owner_changed";
-            }
-
-            // v0.7.2: counted by reason. The reason histogram is what told
-            // theory B from theory A, and it still would.
-            DailyDigest.RecordCartDetach(reason);
-        }
-    }
-
-    /// <summary>
-    /// v0.6.6 diagnostic: the server's answer when a player grabs a cart it
-    /// owns. See Vagon_Detach_Diag_Patch for how this fits theory B.
-    /// </summary>
-    [HarmonyPatch(typeof(Vagon), nameof(Vagon.RPC_RequestOwn))]
-    internal static class Vagon_RPC_RequestOwn_Diag_Patch
-    {
-        private static readonly FieldInfo s_nviewField = AccessTools.Field(typeof(Vagon), "m_nview");
-
-        static void Prefix(Vagon __instance, long sender)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            var nview = (ZNetView)s_nviewField.GetValue(__instance);
-            if (nview == null || !nview.IsValid()) return;
-            bool serverOwns = nview.IsOwner();
-            bool inUse = serverOwns && __instance.InUse();
-            // GRANT = handed to the grabber (vanilla), DENY = someone else has
-            // it, IGNORED = the server wasn't the owner so vanilla stays quiet.
-            string outcome = !serverOwns ? "IGNORED" : inUse ? "DENY" : "GRANT";
-            DailyDigest.RecordCartRequestOwn(outcome);
-        }
-    }
-
-    /// <summary>
-    /// v0.5.23 diagnostic: log every successful Vagon attach so we can pair it
-    /// with the Detach line and measure how long the cart stayed attached.
-    /// </summary>
-    [HarmonyPatch(typeof(Vagon), "AttachTo")]
-    internal static class Vagon_AttachTo_Diag_Patch
-    {
-        private static readonly FieldInfo s_nviewField = AccessTools.Field(
-            typeof(Vagon), "m_nview");
-
-        static void Postfix(Vagon __instance, GameObject go)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            // Server-side attaches should be rare now: vanilla puts the joint on
-            // the puller's client. A high count next to the detach reasons would
-            // mean theory A is back.
-            DailyDigest.RecordCartAttach();
-        }
-    }
 
     /// <summary>
     /// v0.5.15 diagnostic: trace TerrainComp lifecycle on the server. Hypothesis:
@@ -3467,38 +3349,6 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// v0.5.13 diagnostic: log every ItemStand.RPC_DropItem the server receives.
-    /// User reports items are not coming off stands when hold-interacting.
-    /// If the client short-circuits (m_canBeRemoved=false on that stand type or a
-    /// ward blocks the interaction), the RPC never arrives and no log line appears.
-    /// If the RPC arrives, we log what the server saw and decided so we know why
-    /// the DropItem() body did or didn't fire.
-    /// </summary>
-    [HarmonyPatch(typeof(ItemStand), "RPC_DropItem")]
-    internal static class ItemStand_RPC_DropItem_Diag_Patch
-    {
-        private static readonly FieldInfo s_nviewField = AccessTools.Field(
-            typeof(ItemStand), "m_nview");
-
-        static void Prefix(ItemStand __instance, long sender)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            var nview = (ZNetView)s_nviewField.GetValue(__instance);
-            bool isOwner = nview != null && nview.IsOwner();
-            bool haveAttachment = __instance.HaveAttachment();
-            bool canBeRemoved = __instance.m_canBeRemoved;
-            var pos = __instance.transform.position;
-            long ownerId = nview?.GetZDO()?.GetOwner() ?? 0;
-            string attachedItem = nview?.GetZDO()?.GetString(ZDOVars.s_item) ?? "";
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Diag] ItemStand RPC_DropItem received: sender={sender} " +
-                $"pos=world({pos.x:F0},{pos.z:F0}) prefab={__instance.gameObject.name.Replace("(Clone)","")} " +
-                $"isOwner={isOwner} owner={ownerId} canBeRemoved={canBeRemoved} " +
-                $"haveAttachment={haveAttachment} attachedItem='{attachedItem}' " +
-                $"willDrop={isOwner && canBeRemoved}");
-        }
-    }
 
     /// <summary>
     /// v0.5.9 diagnostic: log every Wet/Tar application to a non-player character.
@@ -3513,75 +3363,16 @@ namespace ServerZoneOwnership
     // can't resolve the target and throws out of PatchAll.
     [HarmonyPatch(typeof(SEMan), nameof(SEMan.AddStatusEffect),
                   new[] { typeof(int), typeof(bool), typeof(int), typeof(float), typeof(short) })]
-    internal static class SEMan_AddStatusEffect_WetTarDiag_Patch
-    {
-        private static readonly int s_wetHash = "Wet".GetStableHashCode();
-        private static readonly int s_tarHash = "Tared".GetStableHashCode();
-        private static readonly Dictionary<long, float> s_lastLogTime =
-            new Dictionary<long, float>();
-        private static readonly FieldInfo s_characterField = AccessTools.Field(
-            typeof(SEMan), "m_character");
-        private static readonly FieldInfo s_waterLevelField = AccessTools.Field(
-            typeof(Character), "m_waterLevel");
-        private static readonly FieldInfo s_tarLevelField = AccessTools.Field(
-            typeof(Character), "m_tarLevel");
-        private const float ThrottleSeconds = 30f;
 
-        static void Postfix(SEMan __instance, int nameHash, StatusEffect __result)
-        {
-            if (__result == null) return;
-            if (nameHash != s_wetHash && nameHash != s_tarHash) return;
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-
-            var character = (Character)s_characterField.GetValue(__instance);
-            if (character == null) return;
-            if (character is Player) return;
-
-            long key = (long)character.GetInstanceID() * 3L + (nameHash == s_wetHash ? 0 : 1);
-            var now = Time.time;
-            if (s_lastLogTime.TryGetValue(key, out float last) && now - last < ThrottleSeconds)
-                return;
-            s_lastLogTime[key] = now;
-
-            var pos = character.transform.position;
-            bool isWet = nameHash == s_wetHash;
-            string prefab = character.gameObject.name.Replace("(Clone)", "");
-            float waterLevel = (float)s_waterLevelField.GetValue(character);
-            float tarLevel = (float)s_tarLevelField.GetValue(character);
-            float liquidLevel = isWet ? waterLevel : tarLevel;
-            float depthBelow = liquidLevel - pos.y;
-            // The original question was "why is this mob wet when it shouldn't
-            // be?" — only the mob being ABOVE the liquid answers that, so the
-            // digest counts those separately from ordinary in-water wetness.
-            bool suspicious = depthBelow < -0.5f;
-            DailyDigest.RecordStatusEffect(isWet, prefab, liquidLevel, suspicious);
-        }
-    }
 
     /// <summary>
-    /// v0.7.0 — navmesh tile pressure gauge (group-play lag).
+    /// Reflection handles and the engine's link-pool size, shared by the two
+    /// Pathfinding patches that cap and sweep navmesh tiles (bug 25's fix).
     ///
-    /// Mob pathfinding works off 32m navmesh tiles, built on demand by any
-    /// moving creature (a path request pokes a 3x3 tile block) and kept per
-    /// agent size, so one patch of ground can hold several tiles. Neighbouring
-    /// tiles are stitched with NavMesh links at ~1m spacing — ~64 links per
-    /// tile — drawn from ONE engine-wide pool of 65535. Exhaust it and
-    /// NavMesh.AddLink silently returns an invalid handle: mobs can no longer
-    /// cross tile boundaries, so they stall and rubber-band. That is what
-    /// group combat felt like on 2026-09-22 (8 peers, 6337 allocation errors
-    /// in 2.5 minutes).
-    ///
-    /// Our design concentrates this: the server owns every mob for every peer
-    /// (deliberately — a laggy client must not own simulation), so all of the
-    /// pathfinding for all peers lands on one machine, where vanilla would
-    /// have spread it across clients.
-    ///
-    /// Emits one line every 20s:
-    ///   [Nav] tiles=N (stale=N) stitches=N/65535 (N%) top: Humanoid×N … |
-    ///         built=N freed=N linkFails=N peers=N
-    /// Warning level once the pool is 80% used or any allocation failed.
-    /// stale = tiles past the timeout still waiting to be swept; a non-trivial
-    /// stale count means the sweep can't keep up and the knobs need revisiting.
+    /// The [Nav] gauge that lived here was removed once bug 25 closed — the
+    /// pool pressure it measured was real but turned out not to be the cause
+    /// of the stutter, so the numbers were no longer worth the log volume.
+    /// Only the members the fix itself needs are kept.
     /// </summary>
     internal static class NavMeshPressure
     {
@@ -3592,97 +3383,7 @@ namespace ServerZoneOwnership
         internal static readonly MethodInfo TimeoutTilesMethod =
             AccessTools.Method(typeof(Pathfinding), "TimeoutTiles");
 
-        private static readonly Type s_tileType =
-            typeof(Pathfinding).GetNestedType("NavMeshTile", BindingFlags.NonPublic);
-        private static readonly FieldInfo s_pokeTimeField =
-            s_tileType != null ? AccessTools.Field(s_tileType, "m_pokeTime") : null;
-        private static readonly FieldInfo s_links1Field =
-            s_tileType != null ? AccessTools.Field(s_tileType, "m_links1") : null;
-        private static readonly FieldInfo s_links2Field =
-            s_tileType != null ? AccessTools.Field(s_tileType, "m_links2") : null;
-
-        internal static int s_linkAllocFailures;
-        internal static int s_tilesBuilt;
         internal static int s_tilesFreed;
-        private static int s_lastTileCount;
-
-        /// <summary>
-        /// The link-pool-exhausted message comes from native engine code, so
-        /// there is no method to patch. Observe the Unity log stream, count,
-        /// and report per window instead of letting it spam the log.
-        /// </summary>
-        internal static void OnUnityLog(string condition, string stackTrace, LogType type)
-        {
-            if (type != LogType.Error || string.IsNullOrEmpty(condition)) return;
-            if (condition.IndexOf("NavMeshLink", StringComparison.Ordinal) >= 0)
-                System.Threading.Interlocked.Increment(ref s_linkAllocFailures);
-        }
-
-        internal static void LogStats()
-        {
-            var pathfinding = Pathfinding.instance;
-            if (pathfinding == null || TilesField == null || s_pokeTimeField == null) return;
-            if (!(TilesField.GetValue(pathfinding) is System.Collections.IDictionary tiles)) return;
-
-            int tileCount = 0, stale = 0, stitches = 0, unbuilt = 0;
-            float now = Time.time;
-            var perAgentType = new Dictionary<int, int>();
-            foreach (System.Collections.DictionaryEntry entry in tiles)
-            {
-                tileCount++;
-                int agentType = ((Vector3Int)entry.Key).z;
-                perAgentType.TryGetValue(agentType, out int seen);
-                perAgentType[agentType] = seen + 1;
-
-                var tile = entry.Value;
-                // Measure staleness against the timeout actually in force, not
-                // our knob — the knob may be disabled (<= 0 = leave vanilla's).
-                if (now - (float)s_pokeTimeField.GetValue(tile) > pathfinding.m_tileTimeout) stale++;
-                int links = CountLinks(s_links1Field, tile) + CountLinks(s_links2Field, tile);
-                stitches += links;
-                // Zero links = queued but never built. Vanilla builds ONE tile
-                // per maintenance pass (measured ~4.5/sec), so when creation
-                // outruns that the backlog grows and mobs in those tiles have no
-                // navmesh at all. This is the number that says whether the whole
-                // tile set is even worth keeping.
-                if (links == 0) unbuilt++;
-            }
-
-            int built = System.Threading.Interlocked.Exchange(ref s_tilesBuilt, 0);
-            int freed = System.Threading.Interlocked.Exchange(ref s_tilesFreed, 0);
-            int fails = System.Threading.Interlocked.Exchange(ref s_linkAllocFailures, 0);
-            int peers = ZNet.instance != null ? ZNet.instance.GetPeers().Count : 0;
-            if (tileCount == 0 && fails == 0 && peers == 0) return;
-
-            var top = string.Join(" ", perAgentType
-                .OrderByDescending(kv => kv.Value)
-                .Take(3)
-                .Select(kv => $"{(Pathfinding.AgentType)kv.Key}×{kv.Value}"));
-
-            // Creation rate for the window: everything freed, plus net growth.
-            // Compare against `built` to see how oversubscribed the pipeline is.
-            int created = Mathf.Max(0, freed + (tileCount - s_lastTileCount));
-            s_lastTileCount = tileCount;
-
-            string line =
-                $"[{Plugin.Stamp}] [Nav] tiles={tileCount} (stale={stale}, " +
-                $"unbuilt={unbuilt} {(tileCount > 0 ? unbuilt * 100 / tileCount : 0)}%) " +
-                $"created={created} " +
-                $"stitches={stitches}/{EngineLinkBudget} ({stitches * 100f / EngineLinkBudget:F0}%) " +
-                $"top: {top} | built={built} freed={freed} linkFails={fails} peers={peers}" +
-                // Mark load-test readings so they can never be mistaken for a
-                // real-world baseline when we compare sessions later.
-                (SyntheticPeers.Count > 0 ? $" +synth={SyntheticPeers.Count} (LOAD TEST)" : "");
-
-            if (fails > 0 || stitches > EngineLinkBudget * 0.8f) Plugin.Log.LogWarning(line);
-            else Plugin.Log.LogInfo(line);
-        }
-
-        private static int CountLinks(FieldInfo field, object tile)
-        {
-            if (field == null) return 0;
-            return (field.GetValue(tile) as System.Collections.ICollection)?.Count ?? 0;
-        }
     }
 
     /// <summary>
@@ -3784,20 +3485,6 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// Counts tile builds for the [Nav] gauge. Builds are the expensive half of
-    /// the pipeline (one per pass, async), so a high built count next to a high
-    /// freed count means tiles are thrashing — i.e. NavTileTimeoutSeconds is
-    /// too aggressive and should go back up.
-    /// </summary>
-    [HarmonyPatch(typeof(Pathfinding), "BuildTile")]
-    internal static class Pathfinding_BuildTile_Diag_Patch
-    {
-        static void Postfix()
-        {
-            System.Threading.Interlocked.Increment(ref NavMeshPressure.s_tilesBuilt);
-        }
-    }
 
     /// <summary>
     /// v0.7.5: per-pass timing. The 2026-09-25 synthetic 8-peer test degraded
@@ -4214,7 +3901,7 @@ namespace ServerZoneOwnership
             int forcedSends = s_ownerChanges * Mathf.Max(peers, 1);
             string s = $"reclaims={s_ownerChanges}/{s_passes}pass (max {s_maxInPass}/pass) " +
                        $"scanned={s_scanned} forcedZdoSends~{forcedSends}" +
-                       $" containerGrace={System.Threading.Interlocked.Exchange(ref ZDOMan_ReleaseZDOS_Patch.s_containerGraceSkips, 0)} mountWithRider={System.Threading.Interlocked.Exchange(ref ZDOMan_ReleaseZDOS_Patch.s_mountLeftWithRider, 0)}";
+                       $" containerGrace={System.Threading.Interlocked.Exchange(ref ZDOMan_ReleaseZDOS_Patch.s_containerGraceSkips, 0)}";
             s_passes = 0; s_scanned = 0; s_ownerChanges = 0; s_maxInPass = 0;
             return s;
         }
@@ -4644,276 +4331,7 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// Which peer the server is mid-send to. ZDOMan.ServerSortSendZDOS and
-    /// ZDO.Serialize both run inside one SendZDOs call but neither can see the
-    /// peer — ZDOPeer is a private nested type, so it cannot be bound as a
-    /// patch parameter. The send-rate replacement already holds the ZNetPeer,
-    /// so it parks the identity here for the duration of the call.
-    ///
-    /// Deliberately separate from SendCensus.Capturing: that flag is gated on
-    /// DebugSendCensusSeconds, which is documented to be switched off after a
-    /// capture. Riding the throttle on it would silently turn the throttle into
-    /// a no-op (every ZDO would look never-sent, so everything would be exempt)
-    /// with nothing in the log saying so.
-    /// </summary>
-    /// <summary>
-    /// v0.7.45 diagnostic (bug #1): measure the client-side extrapolation
-    /// window for a ridden mount, which is what option 1 (hand mount ownership
-    /// to the rider) would eliminate outright.
-    ///
-    /// ZSyncTransform.SyncPosition, on a NON-owner:
-    ///     if (zdo.DataRevision != m_posRevision) { m_posRevision = ...; m_targetPosTimer = 0f; }
-    ///     if (zdo.HasOwner()) {
-    ///         m_targetPosTimer += dt;  m_targetPosTimer = Min(m_targetPosTimer, 2f);
-    ///         position += zdo.GetVec3(s_velHash) * m_targetPosTimer;
-    ///     }
-    ///     transform.position = (dist &lt; 5f) ? Lerp(..., 0.2f) : position;   // SNAP past 5m
-    ///
-    /// So the rider's own client dead-reckons the thing it is sitting on, by
-    /// velocity x time-since-the-last-DataRevision-change, and hard-snaps once
-    /// that lands more than 5m from where it had it. That is the reported
-    /// "accelerates wildly, never properly on the ground".
-    ///
-    /// The timer resets on a DataRevision CHANGE, not on any send, so a resend
-    /// carrying an unchanged revision does not help the client at all — hence
-    /// we only count gaps between sends whose revision actually moved.
-    ///
-    /// extrap = vel * gap is the distance the rider's client projects ahead.
-    /// over5m counting above zero means real snaps, which is the visible skip.
-    /// If option 1 is right, this whole measurement becomes moot for the rider:
-    /// an owner runs OwnerSync and never extrapolates.
-    /// </summary>
-    /// <summary>
-    /// v0.7.48 diagnostic, requested 2026-10-18. Deliberately opaque.
-    ///
-    /// The user wants to know whether a particular consumable's intended effect
-    /// is firing, WITHOUT being told what that effect is. So this logs under the
-    /// neutral tag `[Diag] LP`, reports a prefab HASH rather than a name (the
-    /// creature involved would hint at the mechanic), and uses numeric codes in
-    /// place of descriptive field names. The user reads their own server log, so
-    /// the log itself must not spoil anything either.
-    ///
-    /// DO NOT record the code legend in memory — the user reads those files.
-    /// Re-derive it from the gate order in the patched method if needed.
-    ///
-    /// Method: snapshot the relevant ZDO state in a Prefix, re-read it in a
-    /// Postfix, and report the transition. That avoids having to know which
-    /// internal branch ran, and avoids reimplementing vanilla's logic.
-    ///
-    /// One gate is a random roll and is deliberately NOT evaluated here:
-    /// sampling UnityEngine.Random in our patch would consume a value from the
-    /// shared generator and change vanilla's own outcomes. So `b=9` means every
-    /// checkable precondition passed and the roll or an instance-count cap
-    /// decided it — not that something is broken.
-    ///
-    /// Relevance to this plugin: the patched method early-returns unless
-    /// `m_nview.IsOwner()`, and our server ownership means the SERVER now runs
-    /// it where vanilla ran it on a client. There is no Player.m_localPlayer
-    /// reference in that class, so no Pattern C hazard, but `o=F` appearing
-    /// would mean it is running nowhere at all, which is the silent-failure
-    /// case worth catching.
-    /// </summary>
-    [HarmonyPatch(typeof(Procreation), "Procreate")]
-    internal static class Procreation_Diag_Patch
-    {
-        private static readonly FieldInfo s_nview = AccessTools.Field(typeof(Procreation), "m_nview");
-        private static readonly FieldInfo s_tameable = AccessTools.Field(typeof(Procreation), "m_tameable");
-        private static readonly FieldInfo s_baseAI = AccessTools.Field(typeof(Procreation), "m_baseAI");
 
-        private static int s_calls, s_advanced, s_fired, s_completed;
-        private static readonly Dictionary<int, int> s_blocks = new Dictionary<int, int>();
-
-        private struct Snap
-        {
-            public bool Valid;
-            public int Points;
-            public long Stage2;
-            public bool Owner;
-            public bool Enabled;
-            public int Block;
-        }
-
-        private static Snap Read(Procreation p)
-        {
-            var snap = default(Snap);
-            var nview = s_nview?.GetValue(p) as ZNetView;
-            if (nview == null || !nview.IsValid()) return snap;
-            var zdo = nview.GetZDO();
-            if (zdo == null) return snap;
-
-            snap.Valid = true;
-            snap.Owner = nview.IsOwner();
-            snap.Points = zdo.GetInt(ZDOVars.s_lovePoints);
-            snap.Stage2 = zdo.GetLong(ZDOVars.s_pregnant, 0L);
-
-            var tam = s_tameable?.GetValue(p) as Tameable;
-            var ai = s_baseAI?.GetValue(p) as BaseAI;
-            snap.Enabled = tam != null && tam.IsTamed();
-
-            // Checkable gates, in the order vanilla evaluates them. 9 = all
-            // checkable ones passed; the undetermined roll decides from there.
-            if (!snap.Owner) snap.Block = 1;
-            else if (!snap.Enabled) snap.Block = 2;
-            else if (snap.Stage2 != 0L) snap.Block = 3;
-            else if (ai != null && ai.IsAlerted()) snap.Block = 4;
-            else if (tam != null && tam.IsHungry()) snap.Block = 5;
-            else snap.Block = 9;
-            return snap;
-        }
-
-        static void Prefix(Procreation __instance, out Snap __state)
-        {
-            __state = (ZNet.instance != null && ZNet.instance.IsServer())
-                ? Read(__instance) : default(Snap);
-        }
-
-        static void Postfix(Procreation __instance, Snap __state)
-        {
-            if (!__state.Valid) return;
-            var after = Read(__instance);
-            if (!after.Valid) return;
-
-            s_calls++;
-            string what = null;
-            if (after.Points > __state.Points) { s_advanced++; what = "adv"; }
-            else if (__state.Stage2 == 0L && after.Stage2 != 0L) { s_fired++; what = "FIRED"; }
-            else if (__state.Stage2 != 0L && after.Stage2 == 0L) { s_completed++; what = "DONE"; }
-            else
-            {
-                s_blocks.TryGetValue(__state.Block, out int c);
-                s_blocks[__state.Block] = c + 1;
-                return;   // uninteresting; counted and drained in the summary
-            }
-
-            var nview = s_nview?.GetValue(__instance) as ZNetView;
-            var zdo = nview?.GetZDO();
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Diag] LP {what} z={(zdo != null ? zdo.m_uid.ToString() : "?")} " +
-                $"p={(zdo != null ? zdo.GetPrefab() : 0)} o={(__state.Owner ? "T" : "F")} " +
-                $"n={__state.Points}->{after.Points}/{__instance.m_requiredLovePoints} " +
-                $"s2={(__state.Stage2 != 0L ? 1 : 0)}->{(after.Stage2 != 0L ? 1 : 0)} b={__state.Block}");
-        }
-
-        internal static string Drain()
-        {
-            if (s_calls == 0 && s_blocks.Count == 0) return null;
-            string blocks = string.Join(" ", s_blocks.OrderBy(kv => kv.Key)
-                .Select(kv => $"{kv.Key}:{kv.Value}"));
-            string s = $"LP calls={s_calls} adv={s_advanced} fired={s_fired} done={s_completed} b[{blocks}]";
-            s_calls = 0; s_advanced = 0; s_fired = 0; s_completed = 0;
-            s_blocks.Clear();
-            return s;
-        }
-    }
-
-    internal static class MountSyncDiag
-    {
-        private struct Key
-        {
-            public long Peer;
-            public ZDOID Zdo;
-        }
-
-        private sealed class KeyCmp : IEqualityComparer<Key>
-        {
-            public bool Equals(Key a, Key b) => a.Peer == b.Peer && a.Zdo == b.Zdo;
-            public int GetHashCode(Key k) => k.Peer.GetHashCode() ^ k.Zdo.GetHashCode();
-        }
-
-        private sealed class Track
-        {
-            public float LastRevSendTime;
-            public uint LastDataRev;
-            public bool Primed;
-            public int Sends;
-            public int RevSends;
-            public float GapSum, GapMax;
-            public float VelSum, VelMax;
-            public float ExtrapSum, ExtrapMax;
-            public int Over5m;
-            public long Rider;
-            public string Prefab;
-        }
-
-        private static readonly Dictionary<Key, Track> s_tracks =
-            new Dictionary<Key, Track>(new KeyCmp());
-
-        // Called from SendTiers.RecordPacked, i.e. on an ACTUAL pack into a
-        // packet for SendTarget.Uid — not on a send attempt.
-        internal static void OnPacked(ZDO zdo, long peerUid)
-        {
-            if (zdo == null) return;
-            long rider = zdo.GetLong(ZDOVars.s_user, 0L);
-            if (rider == 0L) return;
-            if (!ZDOMan_ReleaseZDOS_Patch.IsSaddlePrefab(zdo.GetPrefab())) return;
-
-            var key = new Key { Peer = peerUid, Zdo = zdo.m_uid };
-            if (!s_tracks.TryGetValue(key, out var t))
-            {
-                t = new Track();
-                s_tracks[key] = t;
-            }
-            t.Rider = rider;
-            t.Sends++;
-            if (t.Prefab == null)
-            {
-                var p = ZNetScene.instance?.GetPrefab(zdo.GetPrefab());
-                t.Prefab = p != null ? p.name : "?";
-            }
-
-            uint rev = zdo.DataRevision;
-            if (!t.Primed)
-            {
-                t.Primed = true;
-                t.LastDataRev = rev;
-                t.LastRevSendTime = Time.time;
-                return;
-            }
-            if (rev == t.LastDataRev) return;   // carries nothing new; client's timer keeps running
-
-            float gap = Time.time - t.LastRevSendTime;
-            t.LastDataRev = rev;
-            t.LastRevSendTime = Time.time;
-
-            float vel = zdo.GetVec3(ZDOVars.s_velHash, Vector3.zero).magnitude;
-            float extrap = vel * Mathf.Min(gap, 2f);   // the client clamps its timer at 2s
-
-            t.RevSends++;
-            t.GapSum += gap; if (gap > t.GapMax) t.GapMax = gap;
-            t.VelSum += vel; if (vel > t.VelMax) t.VelMax = vel;
-            t.ExtrapSum += extrap; if (extrap > t.ExtrapMax) t.ExtrapMax = extrap;
-            if (extrap > 5f) t.Over5m++;
-        }
-
-        internal static void Flush()
-        {
-            if (s_tracks.Count == 0) return;
-            foreach (var kv in s_tracks)
-            {
-                var t = kv.Value;
-                if (t.RevSends == 0) continue;
-                Plugin.Log.LogInfo(
-                    $"[{Plugin.Stamp}] [Diag] MountSync peer={kv.Key.Peer} prefab={t.Prefab} " +
-                    $"rider={t.Rider} sends={t.Sends} revSends={t.RevSends} " +
-                    $"gapMs mean={(t.GapSum / t.RevSends) * 1000f:F0} max={t.GapMax * 1000f:F0} " +
-                    $"vel mean={t.VelSum / t.RevSends:F1} max={t.VelMax:F1} " +
-                    $"extrapM mean={t.ExtrapSum / t.RevSends:F2} max={t.ExtrapMax:F2} " +
-                    $"over5m={t.Over5m}");
-            }
-            // Keep the per-key timing anchors, reset only the accumulators, so
-            // a gap spanning a flush boundary is not silently dropped.
-            foreach (var kv in s_tracks)
-            {
-                var t = kv.Value;
-                t.Sends = 0; t.RevSends = 0;
-                t.GapSum = 0f; t.GapMax = 0f;
-                t.VelSum = 0f; t.VelMax = 0f;
-                t.ExtrapSum = 0f; t.ExtrapMax = 0f;
-                t.Over5m = 0;
-            }
-        }
-    }
 
     internal static class SendTarget
     {
@@ -5141,7 +4559,6 @@ namespace ServerZoneOwnership
             s.Tier = (byte)t;
             if (s.InWindow < ushort.MaxValue) s.InWindow++;
             map[zdo.m_uid] = s;
-            MountSyncDiag.OnPacked(zdo, SendTarget.Uid);
         }
 
         internal static void DropZdo(ZDOID id)
@@ -5596,15 +5013,25 @@ namespace ServerZoneOwnership
         private static int s_drops, s_noHandlers, s_hasHandlers, s_serverOwned, s_peerOwned, s_unowned;
         private static readonly Dictionary<string, int> s_byPrefab = new Dictionary<string, int>();
         private static readonly Dictionary<int, int> s_byHash = new Dictionary<int, int>();
+        // v0.7.87: WHERE the drops are. Aggregated by zone with a peer-distance,
+        // because at 30/s a line per drop would be its own flood — and the
+        // question is which zones, not which packets.
+        private static readonly Dictionary<Vector2s, int> s_byZone =
+            new Dictionary<Vector2s, int>();
+        private static readonly Dictionary<Vector2s, float> s_zoneDist =
+            new Dictionary<Vector2s, float>();
+        // v0.7.90: one sample per distinct prefab+hash, so a new drop still
+        // shows up immediately while a known one stays quiet forever.
+        private static readonly HashSet<long> s_sampled = new HashSet<long>();
 
-        static void Prefix(ZNetView __instance, ZRoutedRpc.RoutedRPCData __0)
+        static bool Prefix(ZNetView __instance, ZRoutedRpc.RoutedRPCData __0)
         {
-            if (__instance == null || __0 == null) return;
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (__instance == null || __0 == null) return true;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return true;
 
             // Only interested in the ones vanilla is about to drop.
             var fns = s_functions?.GetValue(__instance) as System.Collections.IDictionary;
-            if (fns == null || fns.Contains(__0.m_methodHash)) return;
+            if (fns == null || fns.Contains(__0.m_methodHash)) return true;
 
             s_drops++;
             if (fns.Count == 0) s_noHandlers++; else s_hasHandlers++;
@@ -5630,6 +5057,47 @@ namespace ServerZoneOwnership
             }
             if (s_byPrefab.TryGetValue(name, out int pc)) s_byPrefab[name] = pc + 1;
             else if (s_byPrefab.Count < 24) s_byPrefab[name] = 1;
+
+            if (zdo != null)
+            {
+                var z = zdo.GetSector();
+                s_byZone.TryGetValue(z, out int zc);
+                if (zc > 0 || s_byZone.Count < 24) s_byZone[z] = zc + 1;
+                if (!s_zoneDist.ContainsKey(z) && ZNet.instance != null)
+                {
+                    var zp = zdo.GetPosition();
+                    float nearest = -1f;
+                    foreach (var peer in ZNet.instance.GetPeers())
+                    {
+                        if (peer == null) continue;
+                        var d = peer.m_refPos - zp; d.y = 0f;
+                        float flat = d.magnitude;
+                        if (nearest < 0f || flat < nearest) nearest = flat;
+                    }
+                    s_zoneDist[z] = nearest;
+                }
+            }
+
+            // v0.7.90: SUPPRESS vanilla's per-drop warning.
+            // HandleRoutedRPC's else branch does nothing but
+            // ZLog.LogWarning("Failed to find rpc method " + hash), so
+            // returning false loses no behaviour at all - only the line. At
+            // 30/s it made the log unreadable and it carries less information
+            // than our own rpcDrops summary already does.
+            //
+            // A NEW kind of drop must never be hidden, so the first sighting
+            // of each distinct prefab+hash pair still logs once, with detail.
+            // After that the 20s rpcDrops line carries the volume.
+            long sampleKey = ((long)__0.m_methodHash << 24) ^ (long)name.GetHashCode();
+            if (s_sampled.Add(sampleKey))
+            {
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [Diag] rpcDrop FIRST SEEN prefab={name} " +
+                    $"hash={__0.m_methodHash} owner={(zdo != null ? zdo.GetOwner() : 0L)} " +
+                    $"handlers={fns.Count} - further copies of this pair are suppressed; " +
+                    $"see the rpcDrops summary for volume");
+            }
+            return false;
         }
 
         internal static string Drain()
@@ -5639,12 +5107,17 @@ namespace ServerZoneOwnership
                 .Take(5).Select(kv => $"{kv.Key}×{kv.Value}"));
             string hashes = string.Join(" ", s_byHash.OrderByDescending(kv => kv.Value)
                 .Take(3).Select(kv => $"{kv.Key}×{kv.Value}"));
+            string zones = string.Join(" ", s_byZone.OrderByDescending(kv => kv.Value)
+                .Take(4).Select(kv => $"{kv.Key.x},{kv.Key.y}" +
+                    (s_zoneDist.TryGetValue(kv.Key, out float dd) && dd >= 0f
+                        ? $"@{dd:F0}m" : "") + $"×{kv.Value}"));
             string s = $"rpcDrops={s_drops} (noHandlers={s_noHandlers} hasHandlers={s_hasHandlers}) " +
                        $"owner[server={s_serverOwned} peer={s_peerOwned} none={s_unowned}] " +
-                       $"| {top} | hash {hashes}";
+                       $"| {top} | hash {hashes} | zones {zones}";
             s_drops = 0; s_noHandlers = 0; s_hasHandlers = 0;
             s_serverOwned = 0; s_peerOwned = 0; s_unowned = 0;
             s_byPrefab.Clear(); s_byHash.Clear();
+            s_byZone.Clear(); s_zoneDist.Clear();
             return s;
         }
     }
@@ -5707,118 +5180,6 @@ namespace ServerZoneOwnership
         static void Postfix(long __state) { PassTimer.Record(PassTimer.ZoneLoad, __state); }
     }
 
-    /// <summary>
-    /// v0.7.53 diagnostic (bug #8): why the Obliterator sometimes animates and
-    /// burns nothing.
-    ///
-    /// Narrowed by elimination 2026-10-21: 32 incinerate requests were logged
-    /// and vanilla's three refusal messages ("but im not the owner", "but it's
-    /// in use", "but it's empty") fired ZERO times. So every request passed the
-    /// RPC_RequestIncinerate gate and started the coroutine.
-    ///
-    /// Which leaves the one abort path with no logging — the re-check AFTER the
-    /// delay, in Incinerate():
-    ///     isInUse = true;
-    ///     InvokeRPC(Everybody, "RPC_AnimateLever");                 // animates FIRST
-    ///     yield return new WaitForSeconds(Random(m_effectDelayMin, m_effectDelayMax));
-    ///     InvokeRPC(Everybody, "RPC_AnimateLeverReturn");
-    ///     if (!m_nview.IsValid() || !m_nview.IsOwner() || m_container.IsInUse())
-    ///     { isInUse = false; yield break; }                         // silent
-    /// The lever has already played both ways by then, so an abort here is
-    /// indistinguishable from "pulled it, nothing happened".
-    ///
-    /// The coroutine body lives in a compiler-generated class, so rather than
-    /// patch mid-iterator this samples the three conditions across the delay
-    /// window and uses StopAOE as the success marker — `Invoke("StopAOE", 4f)`
-    /// sits immediately after the guard and runs on no other path.
-    ///
-    /// Suspect: our own 2s reclaim flipping container ownership, or m_inUse
-    /// going stale, during the delay. Same field as bug #2.
-    /// </summary>
-    [HarmonyPatch(typeof(Incinerator))]
-    internal static class Incinerator_Diag_Patch
-    {
-        private static readonly FieldInfo s_container =
-            AccessTools.Field(typeof(Incinerator), "m_container");
-        private static readonly FieldInfo s_nview =
-            AccessTools.Field(typeof(Incinerator), "m_nview");
-
-        private sealed class Watch
-        {
-            public float Started;
-            public bool Succeeded;
-            public string Worst;      // first bad state seen during the window
-        }
-
-        private static readonly Dictionary<Incinerator, Watch> s_watch =
-            new Dictionary<Incinerator, Watch>();
-
-        [HarmonyPostfix]
-        [HarmonyPatch("RPC_RequestIncinerate")]
-        static void AfterRequest(Incinerator __instance, long uid)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            s_watch[__instance] = new Watch { Started = Time.time };
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Diag] Obliterator request uid={uid} " +
-                $"state={Describe(__instance)}");
-        }
-
-        // Invoke("StopAOE", 4f) sits immediately after the post-delay guard, so
-        // reaching it means the burn proceeded. Nothing else calls it.
-        [HarmonyPrefix]
-        [HarmonyPatch("StopAOE")]
-        static void OnStopAOE(Incinerator __instance)
-        {
-            if (s_watch.TryGetValue(__instance, out var w)) w.Succeeded = true;
-        }
-
-        internal static string Describe(Incinerator inc)
-        {
-            var nview = s_nview?.GetValue(inc) as ZNetView;
-            var cont = s_container?.GetValue(inc) as Container;
-            bool valid = nview != null && nview.IsValid();
-            bool owner = valid && nview.IsOwner();
-            bool inUse = cont != null && cont.IsInUse();
-            long own = (valid && nview.GetZDO() != null) ? nview.GetZDO().GetOwner() : 0L;
-            return $"valid={valid} owner={owner} ownerUid={own} containerInUse={inUse}";
-        }
-
-        // Called from the stats tick. Samples open windows so a condition that
-        // flips mid-delay is caught, and reports the outcome once the coroutine
-        // has had time to finish.
-        internal static void Poll()
-        {
-            if (s_watch.Count == 0) return;
-            List<Incinerator> done = null;
-            float now = Time.time;
-            foreach (var kv in s_watch)
-            {
-                var inc = kv.Key; var w = kv.Value;
-                if (inc == null) { (done ?? (done = new List<Incinerator>())).Add(inc); continue; }
-
-                if (w.Worst == null)
-                {
-                    string s = Describe(inc);
-                    if (s.Contains("owner=False") || s.Contains("containerInUse=True")
-                        || s.Contains("valid=False"))
-                        w.Worst = s;
-                }
-
-                // m_effectDelayMax is small; 10s is generous cover for the
-                // coroutine plus the 4s StopAOE delay.
-                if (now - w.Started < 10f) continue;
-                if (w.Succeeded)
-                    Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Diag] Obliterator BURNED ok");
-                else
-                    Plugin.Log.LogWarning(
-                        $"[{Plugin.Stamp}] [Diag] Obliterator ABORTED after animating — " +
-                        $"no StopAOE. badStateSeen={(w.Worst ?? "none(!)")} nowState={Describe(inc)}");
-                (done ?? (done = new List<Incinerator>())).Add(inc);
-            }
-            if (done != null) foreach (var k in done) s_watch.Remove(k);
-        }
-    }
 
     /// <summary>
     /// v0.7.54: split our CreateDestroyObjects pass into its three phases.
@@ -5905,127 +5266,7 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// v0.7.56 diagnostic (bug #8): trace ownership on the Obliterator's ZDO.
-    ///
-    /// 2026-10-25 narrowed this by elimination. The user pulled the lever twice:
-    /// the first burned (request 15:37:48, StopAOE 15:38:06), the second did
-    /// nothing. The second produced NO server log at all — not our
-    /// "Obliterator request", not vanilla's "wants to incinerate", and no
-    /// dropped RPC (deadRPC activity stopped at 15:11). So it is NOT the
-    /// post-delay abort at Incinerate():186 that was suspected, and the request
-    /// never crossed the wire.
-    ///
-    /// By then the server state was clean: StopAOE had cleared isInUse, we owned
-    /// the ZDO, and the container was not in use. A request arriving would have
-    /// been accepted. So the refusal happened CLIENT-side, in OnIncinerate:
-    ///     if (!m_nview.IsValid() || !m_nview.HasOwner()) return false;
-    ///     if (!PrivateArea.CheckAccess(base.transform.position)) return false;
-    /// Ward access cannot change between two pulls seconds apart, which leaves
-    /// HasOwner() reading false on the client — i.e. its copy of the ZDO
-    /// believed nobody owned it.
-    ///
-    /// HasOwner() is ZDO.Owned, set by SetOwnerInternal, which on a client is
-    /// driven entirely by the ZDO sync:
-    ///     if (uid == 0L) { ReleaseOwner(...); Owned = false; Owner = false; }
-    ///     else           { SetOwner(...);     Owned = true;  ... }
-    /// So either we released ownership (uid 0) and the client learned of it, or
-    /// we did not and the client's view is stale. This diagnostic distinguishes
-    /// those two, which is as far as a SERVER-ONLY plugin can go — clients run
-    /// vanilla and cannot be instrumented.
-    ///
-    ///   owner=0 appearing          -> we really did release it. Our bug, fixable here.
-    ///   owner stable as the server -> the client's view is stale, so the fault
-    ///                                 is in ownership DELIVERY, and the next
-    ///                                 question is whether that ZDO was being
-    ///                                 sent to that peer at all.
-    ///
-    /// Logs every ownership change plus a periodic snapshot, because a stable
-    /// owner is the informative result here and silence would be ambiguous.
-    /// </summary>
-    [HarmonyPatch(typeof(ZDO), "SetOwner")]
-    internal static class ZDO_SetOwner_IncineratorDiag_Patch
-    {
-        private static readonly Dictionary<int, bool> s_isIncinerator = new Dictionary<int, bool>();
 
-        internal static bool PrefabIsIncinerator(int prefabHash)
-        {
-            if (s_isIncinerator.TryGetValue(prefabHash, out bool known)) return known;
-            var prefab = ZNetScene.instance?.GetPrefab(prefabHash);
-            // Do not cache a negative when the lookup itself failed - the scene
-            // may not be ready yet. Same trap as PrefabHasSadle in v0.7.46.
-            if (prefab == null) return false;
-            bool has = prefab.GetComponent<Incinerator>() != null;
-            s_isIncinerator[prefabHash] = has;
-            return has;
-        }
-
-        static void Prefix(ZDO __instance, long uid)
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            if (__instance == null) return;
-            if (!PrefabIsIncinerator(__instance.GetPrefab())) return;
-
-            long prev = __instance.GetOwner();
-            if (prev == uid) return;   // vanilla SetOwner no-ops here anyway
-
-            var pos = __instance.GetPosition();
-            Plugin.Log.LogWarning(
-                $"[{Plugin.Stamp}] [Diag] Obliterator OWNER {prev} -> {uid} " +
-                $"(us={ZDOMan.GetSessionID()}) released={(uid == 0L)} " +
-                $"ownerRev={__instance.OwnerRevision} dataRev={__instance.DataRevision} " +
-                $"pos=world({pos.x:F0},{pos.z:F0})");
-        }
-    }
-
-    /// <summary>
-    /// v0.7.56: periodic owner snapshot for every Obliterator in the loaded
-    /// scene. A STABLE owner is the informative outcome for bug #8 - it would
-    /// mean the client's view is stale rather than the server churning - so
-    /// silence from the SetOwner trace must be distinguishable from the
-    /// diagnostic simply not running.
-    /// </summary>
-    internal static class IncineratorOwnerWatch
-    {
-        private static readonly FieldInfo s_instancesField =
-            AccessTools.Field(typeof(ZNetScene), "m_instances");
-
-        private static int s_sinceLast;
-
-        internal static void Poll()
-        {
-            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
-            // The stats tick is already ~20s; sample every third one.
-            if (++s_sinceLast < 3) return;
-            s_sinceLast = 0;
-
-            var scene = ZNetScene.instance;
-            if (scene == null) return;
-            var map = s_instancesField?.GetValue(scene) as System.Collections.IDictionary;
-            if (map == null) return;
-
-            int found = 0;
-            var sb = new System.Text.StringBuilder();
-            foreach (System.Collections.DictionaryEntry entry in map)
-            {
-                var view = entry.Value as ZNetView;
-                if (view == null || !view.IsValid()) continue;
-                var zdo = view.GetZDO();
-                if (zdo == null) continue;
-                if (!ZDO_SetOwner_IncineratorDiag_Patch.PrefabIsIncinerator(zdo.GetPrefab())) continue;
-
-                long owner = zdo.GetOwner();
-                var p = zdo.GetPosition();
-                if (found > 0) sb.Append(" | ");
-                sb.Append($"owner={owner} hasOwner={(owner != 0L)} isUs={(owner == ZDOMan.GetSessionID())} " +
-                          $"ownerRev={zdo.OwnerRevision} pos=world({p.x:F0},{p.z:F0})");
-                found++;
-                if (found >= 4) break;
-            }
-            if (found == 0) return;
-            Plugin.Log.LogInfo($"[{Plugin.Stamp}] [Diag] ObliteratorWatch n={found} {sb}");
-        }
-    }
 
     /// <summary>
     /// v0.7.51 diagnostic (bug #6): name the zone and the object that is
@@ -6159,6 +5400,7 @@ namespace ServerZoneOwnership
                             $"[{Plugin.Stamp}] [Diag] Teleport peer={peer.m_playerName} " +
                             $"from=world({prev.x:F0},{prev.z:F0}) to=world({now.x:F0},{now.z:F0}) " +
                             $"dist={d:F0}m zone={ZoneSystem.GetZone(now).x},{ZoneSystem.GetZone(now).y}");
+                        TeleportAreaProbe.Arm(peer.m_uid, peer.m_playerName, now);
                     }
                 }
                 s_lastPos[peer.m_uid] = now;
@@ -6370,10 +5612,19 @@ namespace ServerZoneOwnership
             if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
             if (__0.m_targetZDO.IsNone()) return;   // global RPC, not an object interaction
 
-            StatusEffectRpcWatch.Note(__0);
 
             var zdo = ZDOMan.instance?.GetZDO(__0.m_targetZDO);
-            if (zdo == null) { s_noZdo++; NoteNoZdo(__0); return; }
+            if (zdo == null)
+            {
+                s_noZdo++;
+                // Before the generic ghost bookkeeping: if the replay for this
+                // id is still queued, the first destroy demonstrably missed
+                // this peer and the second copy is the one that matters.
+                DuplicateDestroySend.NoteGhostWhilePending(
+                    __0.m_targetZDO, RpcName(__0.m_methodHash), __0.m_senderPeerID);
+                NoteNoZdo(__0);
+                return;
+            }
 
             var scene = ZNetScene.instance;
             var view = scene?.FindInstance(zdo);
@@ -6601,14 +5852,6 @@ namespace ServerZoneOwnership
         static void Postfix(long __state) { PassTimer.Record(PassTimer.ReleaseZDOS, __state); }
     }
 
-    [HarmonyPatch(typeof(Pathfinding), "TimeoutTiles")]
-    internal static class Pathfinding_TimeoutTiles_Timing_Patch
-    {
-        [HarmonyPriority(Priority.First)]
-        static void Prefix(out long __state) { __state = PassTimer.Now; }
-        [HarmonyPriority(Priority.Last)]
-        static void Postfix(long __state) { PassTimer.Record(PassTimer.NavSweep, __state); }
-    }
 
     /// <summary>
     /// v0.7.2: daily digest. The per-event diagnostics were drowning the log —
@@ -6859,76 +6102,6 @@ namespace ServerZoneOwnership
 
 
 
-    /// <summary>
-    /// v0.7.66 (bug #11): is there ANY channel by which this server could learn
-    /// a player's active status effects?
-    ///
-    /// The consumer we found reads the player's LOCAL effect list, and no ZDO
-    /// field carries that state, so the server currently cannot know. Whether a
-    /// fix is possible at all comes down to one question: does the effect's
-    /// registration RPC transit this server?
-    ///
-    /// SEMan.AddStatusEffect applies locally under `if (m_nview.IsOwner())` and
-    /// then calls InvokeRPC("RPC_AddStatusEffect", ...), which targets the ZDO's
-    /// OWNER. For a player's own effect the caller IS the owner, so ZRoutedRpc
-    /// may well handle it locally and never put it on the wire — in which case
-    /// we never see it and no server-side fix exists through this route.
-    ///
-    /// Measuring rather than reasoning about it, because the answer decides the
-    /// whole approach:
-    ///
-    ///   seen>0 targeting a player -> we have a channel; mirror the effect into
-    ///                                our copy of that player's manager
-    ///   seen=0                    -> no channel; the only remaining levers are
-    ///                                handing creature ownership to the nearby
-    ///                                player (as for ships in v0.6.4 and mounts
-    ///                                in v0.7.47) or inferring it some other way
-    ///
-    /// Counts every routed RPC by name as well, so if the effect travels under
-    /// a different call than expected it still shows up.
-    /// </summary>
-    internal static class StatusEffectRpcWatch
-    {
-        private static readonly int s_addSeHash = "RPC_AddStatusEffect".GetStableHashCode();
-
-        private static int s_seen, s_onPlayer, s_total;
-        private static readonly Dictionary<int, int> s_allNames = new Dictionary<int, int>();
-
-        internal static void Note(ZRoutedRpc.RoutedRPCData d)
-        {
-            if (d == null) return;
-            s_total++;
-
-            if (s_allNames.TryGetValue(d.m_methodHash, out int c)) s_allNames[d.m_methodHash] = c + 1;
-            else if (s_allNames.Count < 64) s_allNames[d.m_methodHash] = 1;
-
-            if (d.m_methodHash != s_addSeHash) return;
-            s_seen++;
-
-            var zdo = ZDOMan.instance?.GetZDO(d.m_targetZDO);
-            bool onPlayer = false;
-            if (zdo != null && ZNetScene.instance != null)
-            {
-                var view = ZNetScene.instance.FindInstance(zdo);
-                onPlayer = view != null && view.GetComponent<Player>() != null;
-            }
-            if (onPlayer) s_onPlayer++;
-
-            Plugin.Log.LogWarning(
-                $"[{Plugin.Stamp}] [Diag] StatusEffectRPC seen sender={d.m_senderPeerID} " +
-                $"target={d.m_targetZDO} onPlayer={onPlayer} n={s_seen}");
-        }
-
-        internal static string Drain()
-        {
-            if (s_total == 0) return null;
-            string top = string.Join(" ", s_allNames.OrderByDescending(kv => kv.Value).Take(8)
-                .Select(kv => $"{ZRoutedRpc_HandleRoutedRPC_DeadWindow_Patch.RpcName(kv.Key)}x{kv.Value}"));
-            string s = $"routedRpc total={s_total} addStatusEffect={s_seen} onPlayer={s_onPlayer} | {top}";
-            s_total = 0; s_seen = 0; s_onPlayer = 0; s_allNames.Clear();
-            return s;
-        }
-    }
 
 
     /// <summary>
@@ -7063,15 +6236,7 @@ namespace ServerZoneOwnership
                 if (otherUses.Contains(kv.Key)) continue;          // shared with unrelated effects
                 if (pheromoneUses[kv.Key] != 1) continue;          // ambiguous between two effects
                 s_markers[kv.Key] = kv.Value;
-                Plugin.Log.LogInfo(
-                    $"[{Plugin.Stamp}] [Pheromone] marker registered effect={kv.Value.EffectName} " +
-                    $"target={kv.Value.TargetName} flee={kv.Value.Flee} ttl={kv.Value.Ttl}s "
-                    + $"spawnChance={kv.Value.SpawnChance} minLevel={kv.Value.MinLevel} "
-                    + $"maxInstances={kv.Value.MaxInstances} levelUpMult={kv.Value.LevelUpMult}");
             }
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Pheromone] scan complete: {s_markers.Count} usable marker(s) " +
-                $"of {candidate.Count} candidate(s)");
         }
 
         /// <summary>
@@ -7320,15 +6485,6 @@ namespace ServerZoneOwnership
             string key = creature + "|" + spawner.m_name;
             if (s_radiusNoted.Count > 64 || !s_radiusNoted.Add(key)) return;
 
-            float min = (spawner.m_spawnRadiusMin > 0f) ? spawner.m_spawnRadiusMin : 40f;
-            float max = (spawner.m_spawnRadiusMax > 0f) ? spawner.m_spawnRadiusMax : 80f;
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [Pheromone] spawner '{spawner.m_name}' for {creature}: "
-                + $"spawnRadius {min}-{max}m, keepDistance={spawner.m_spawnDistance}m, "
-                + $"chance={spawner.m_spawnChance} max={spawner.m_maxSpawned} "
-                + $"interval={spawner.m_spawnInterval}s group={spawner.m_groupSizeMin}-{spawner.m_groupSizeMax} "
-                + $"level={spawner.m_minLevel}-{spawner.m_maxLevel} "
-                + $"(our radius={Plugin.PheromoneRadius}m)");
         }
 
         // SpawnData.m_prefab -> that creature's m_name, cached. Instance id is
@@ -7439,254 +6595,6 @@ namespace ServerZoneOwnership
         }
     }
 
-    /// <summary>
-    /// v0.7.74 diagnostic (bug #29): name the source of the repeating water
-    /// impact effect.
-    ///
-    /// Reported as an ocean-wave sound every ~20s with no visible cause. It is
-    /// a networked one-shot effect: the prefab carries a ZNetView, so each
-    /// instantiation creates a ZDO that replicates, which is why it reaches a
-    /// player who cannot see the source and why it appears in our send census
-    /// at all — a local-only effect never would.
-    ///
-    /// NOT caused by anything recent. 702 occurrences across ~400MB of log, the
-    /// earliest at 2026-10-02 01:11:51, which is as far back as the log retains.
-    /// Signature is one send per instance at 6 bytes with distinct == sends,
-    /// i.e. created, synced once, gone. Something is repeatedly entering water
-    /// 85-194m from the player.
-    ///
-    /// Cost is trivial in bandwidth. The reason it is worth identifying is that
-    /// a physics event repeating forever at the edge of the simulated area is
-    /// the kind of thing that quietly burns CPU, and since we now own every
-    /// object it runs whether or not anyone is nearby.
-    ///
-    /// Logs each occurrence's position, the nearest plausible culprit, and the
-    /// distance to each peer, rate-limited. Also reports the prefab's audio
-    /// rolloff once, which is the actual audible range.
-    /// </summary>
-    internal static class WaterImpactDiag
-    {
-        private const string PrefabName = "fx_WaterImpact_Big";
-        private const float ReportEverySeconds = 5f;
-
-        private static int s_prefabHash;
-        private static bool s_rangeReported;
-        private static float s_lastReport;
-        private static int s_seen;
-        private static float s_bestDist = float.MaxValue;
-        private static Vector3 s_bestPos;
-        private static string s_bestPeer = "?";
-        private static Vector3 s_bestFrom;
-        private static float s_lastKnownReport;
-
-        internal static void MaybeReportRange()
-        {
-            if (s_rangeReported) return;
-            var scene = ZNetScene.instance;
-            if (scene == null) return;
-            if (s_prefabHash == 0) s_prefabHash = PrefabName.GetStableHashCode();
-            var prefab = scene.GetPrefab(s_prefabHash);
-            if (prefab == null) return;
-            s_rangeReported = true;
-
-            // AudioSource lives in UnityEngine.AudioModule, which this plugin
-            // does not reference and should not start referencing for one
-            // diagnostic. Read it reflectively instead.
-            var audioType = AccessTools.TypeByName("UnityEngine.AudioSource");
-            if (audioType == null)
-            {
-                Plugin.Log.LogInfo($"[{Plugin.Stamp}] [WaterFX] AudioSource type unavailable");
-                return;
-            }
-            var src = prefab.GetComponentInChildren(audioType, true);
-            if (src == null)
-            {
-                Plugin.Log.LogInfo($"[{Plugin.Stamp}] [WaterFX] {PrefabName} has no AudioSource "
-                                   + "- the sound must come from something else");
-                return;
-            }
-            string Read(string prop)
-            {
-                var pi = audioType.GetProperty(prop);
-                try { return (pi != null) ? pi.GetValue(src, null).ToString() : "?"; }
-                catch { return "?"; }
-            }
-            Plugin.Log.LogInfo(
-                $"[{Plugin.Stamp}] [WaterFX] {PrefabName} audible range: "
-                + $"min={Read("minDistance")}m max={Read("maxDistance")}m "
-                + $"rolloff={Read("rolloffMode")} spatialBlend={Read("spatialBlend")} "
-                + $"volume={Read("volume")}");
-        }
-
-        /// <summary>
-        /// v0.7.75: reports the NEAREST impact to a player rather than whichever
-        /// one happened to fire when the rate limit expired. The original
-        /// sampled at random, which made the distances useless for navigation —
-        /// a quoted 120m could sit next to an unreported log 10m away. Now every
-        /// impact is measured against every peer and only the closest in each
-        /// window is logged, so the number falls as you approach and the
-        /// coordinates lead somewhere.
-        /// </summary>
-        internal static void Offer(ZDO zdo)
-        {
-            if (zdo == null) return;
-            if (s_prefabHash == 0) s_prefabHash = PrefabName.GetStableHashCode();
-            if (zdo.GetPrefab() != s_prefabHash) return;
-
-            s_seen++;
-            if (ZNet.instance == null) return;
-
-            var pos = zdo.GetPosition();
-            foreach (var peer in ZNet.instance.GetPeers())
-            {
-                if (peer == null) continue;
-                float d = Vector3.Distance(peer.m_refPos, pos);
-                if (d >= s_bestDist) continue;
-                s_bestDist = d;
-                s_bestPos = pos;
-                s_bestPeer = peer.m_playerName;
-                s_bestFrom = peer.m_refPos;
-            }
-            RememberSite(pos);
-        }
-
-        /// <summary>
-        /// Called once per union walk. Emits the closest impact seen since the
-        /// last report, then resets — so each line is the best fix available in
-        /// that window rather than a sample.
-        /// </summary>
-
-        // v0.7.77: remember WHERE splashes have happened, so the report can
-        // name the nearest KNOWN site even while every log is momentarily
-        // quiet. Two earlier versions only ever reported a log that splashed
-        // inside the report window, which meant standing 4m from one while
-        // being directed 186m the other way. Keyed by position rounded to 4m
-        // so a drifting log collapses to one entry instead of hundreds.
-        private static readonly Dictionary<long, float> s_sites = new Dictionary<long, float>();
-        private static readonly Dictionary<long, Vector3> s_sitePos = new Dictionary<long, Vector3>();
-        private const float SiteExpirySeconds = 900f;
-
-        private static long SiteKey(Vector3 p)
-        {
-            // v0.7.78: the previous key was (gx << 24) ^ gz, which is broken for
-            // negative coordinates: gz sign-extends to all ones through the high
-            // bits and corrupts gx, so unrelated cells collapse onto one key and
-            // overwrite each other. Measured: 100 splashes across a 500m field
-            // produced 5 sites, and the reported position belonged to a
-            // different place than the distance was computed for. Mask instead
-            // of XOR so the halves cannot bleed into each other.
-            long gx = (long)Mathf.Floor(p.x / 4f) + 2097152L;   // bias to unsigned
-            long gz = (long)Mathf.Floor(p.z / 4f) + 2097152L;
-            return ((gx & 0x3FFFFFL) << 22) | (gz & 0x3FFFFFL);
-        }
-
-        private static void RememberSite(Vector3 pos)
-        {
-            long k = SiteKey(pos);
-            if (!s_sites.ContainsKey(k) && s_sites.Count >= 512) return;
-            s_sites[k] = Time.time;
-            s_sitePos[k] = pos;
-        }
-
-        /// <summary>
-        /// Emits a bearing to the nearest remembered splash site for each peer,
-        /// on a fixed cadence and independent of whether anything splashed in
-        /// this window. This is the part that makes the output navigable.
-        /// </summary>
-        internal static void ReportNearestKnown()
-        {
-            if (ZNet.instance == null || s_sites.Count == 0) return;
-            if (Time.time - s_lastKnownReport < ReportEverySeconds) return;
-            s_lastKnownReport = Time.time;
-
-            // Expire stale sites; a log that stopped splashing 15 minutes ago
-            // has probably drifted or been collected.
-            List<long> stale = null;
-            foreach (var kv in s_sites)
-                if (Time.time - kv.Value > SiteExpirySeconds)
-                    (stale ?? (stale = new List<long>())).Add(kv.Key);
-            if (stale != null)
-                foreach (var k in stale) { s_sites.Remove(k); s_sitePos.Remove(k); }
-
-            foreach (var peer in ZNet.instance.GetPeers())
-            {
-                if (peer == null) continue;
-                float best = float.MaxValue;
-                Vector3 bestPos = Vector3.zero;
-                float bestAge = 0f;
-                foreach (var kv in s_sitePos)
-                {
-                    float d = Vector3.Distance(peer.m_refPos, kv.Value);
-                    if (d >= best) continue;
-                    best = d; bestPos = kv.Value;
-                    float stamp;
-                    bestAge = s_sites.TryGetValue(kv.Key, out stamp) ? Time.time - stamp : -1f;
-                }
-                if (best >= float.MaxValue) continue;
-                Plugin.Log.LogWarning(
-                    $"[{Plugin.Stamp}] [WaterFX] nearest KNOWN site {best:F0}m "
-                    + $"{Bearing(peer.m_refPos, bestPos)} of {peer.m_playerName} | "
-                    + $"you=world({peer.m_refPos.x:F0},{peer.m_refPos.z:F0}) "
-                    + $"site=world({bestPos.x:F0},{bestPos.z:F0}) "
-                    + $"age={bestAge:F0}s knownSites={s_sites.Count} totalSeen={s_seen}");
-            }
-        }
-
-        internal static void ReportNearest()
-        {
-            if (s_bestDist >= float.MaxValue) return;
-            if (Time.time - s_lastReport < ReportEverySeconds) return;
-            s_lastReport = Time.time;
-
-            var pos = s_bestPos;
-            Plugin.Log.LogWarning(
-                $"[{Plugin.Stamp}] [WaterFX] NEAREST impact {s_bestDist:F0}m {Bearing(s_bestFrom, pos)} "
-                + $"of {s_bestPeer} | you=world({s_bestFrom.x:F0},{s_bestFrom.z:F0}) "
-                + $"log=world({pos.x:F0},{pos.y:F1},{pos.z:F0}) "
-                + $"source={NearestCulprit(pos)} totalSeen={s_seen}");
-
-            s_bestDist = float.MaxValue;
-            s_bestPeer = "?";
-        }
-
-        // v0.7.76: a distance alone cannot be walked. +Z is north, +X is east.
-        private static string Bearing(Vector3 from, Vector3 to)
-        {
-            float dx = to.x - from.x, dz = to.z - from.z;
-            string[] pts = { "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-                             "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW" };
-            float deg = Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
-            if (deg < 0f) deg += 360f;
-            return pts[(int)((deg + 11.25f) / 22.5f) % 16];
-        }
-
-        // The thing making the splash should be the closest non-effect object.
-        private static string NearestCulprit(Vector3 pos)
-        {
-            var scene = ZNetScene.instance;
-            var zdoMan = ZDOMan.instance;
-            if (scene == null || zdoMan == null) return "?";
-
-            var found = new List<ZDO>();
-            zdoMan.FindSectorObjects(ZoneSystem.GetZone(pos), new SimulationDistance(1, 0), found);
-            float best = 400f;   // 20m squared
-            string who = "none within 20m";
-            foreach (var z in found)
-            {
-                if (z == null || z.GetPrefab() == s_prefabHash) continue;
-                float d = Utils.DistanceSqr(z.GetPosition(), pos);
-                if (d >= best) continue;
-                var pf = scene.GetPrefab(z.GetPrefab());
-                if (pf == null) continue;
-                // Skip other pure effects; they are symptoms, not causes.
-                if (pf.name.StartsWith("fx_") || pf.name.StartsWith("sfx_")
-                    || pf.name.StartsWith("vfx_")) continue;
-                best = d;
-                who = $"{pf.name}@{Mathf.Sqrt(d):F1}m";
-            }
-            return who;
-        }
-    }
 
     /// <summary>
     /// v0.7.80 FIX (bug #9): retry the destroy for a phantom object.
@@ -7880,6 +6788,41 @@ namespace ServerZoneOwnership
         internal static int s_batches, s_ids;
 
         /// <summary>
+        /// v0.7.83 (bug #10): the one thing the server CAN see about whether the
+        /// duplicate send earns its keep.
+        ///
+        /// We cannot observe which copy a client applied. But a routed RPC for
+        /// a ZDO we have already destroyed, arriving while the replay is still
+        /// pending, means that client acted on an object it still believes in
+        /// AFTER the first destroy went out. The first copy did not reach it,
+        /// and the replay about to go is the one that removes the phantom.
+        ///
+        /// A count here that tracks destroyResend batches is the duplicate send
+        /// doing real work. Zero over a long session with phantoms still being
+        /// reported means the loss is NOT in this window and the second copy is
+        /// not the fix.
+        /// </summary>
+        internal static int s_replayNeeded;
+
+        internal static bool IsPending(ZDOID uid)
+        {
+            if (!Plugin.DebugDuplicateDestroySend) return false;
+            if (s_pending.Count == 0) return false;
+            for (int i = 0; i < s_pending.Count; i++) if (s_pending[i] == uid) return true;
+            return false;
+        }
+
+        internal static void NoteGhostWhilePending(ZDOID uid, string rpcName, long sender)
+        {
+            if (!IsPending(uid)) return;
+            System.Threading.Interlocked.Increment(ref s_replayNeeded);
+            Plugin.Log.LogWarning(
+                $"[{Plugin.Stamp}] [Diag] resendNeeded zdo={uid} rpc={rpcName ?? "?"} " +
+                $"sender={sender} — first destroy did not reach this peer; the " +
+                $"queued second copy is what removes the phantom");
+        }
+
+        /// <summary>
         /// Captured in a Prefix because `SendDestroyed` clears the list before
         /// sending, so a Postfix would see nothing.
         /// </summary>
@@ -7913,8 +6856,9 @@ namespace ServerZoneOwnership
         {
             int b = System.Threading.Interlocked.Exchange(ref s_batches, 0);
             int n = System.Threading.Interlocked.Exchange(ref s_ids, 0);
-            if (b == 0) return null;
-            return $"destroyResend batches={b} ids={n}";
+            int rn = System.Threading.Interlocked.Exchange(ref s_replayNeeded, 0);
+            if (b == 0 && rn == 0) return null;
+            return $"destroyResend batches={b} ids={n} replayNeeded={rn}";
         }
     }
 
@@ -7933,6 +6877,595 @@ namespace ServerZoneOwnership
             if (__instance == null || s_destroySendList == null) return;
             var list = s_destroySendList.GetValue(__instance) as List<ZDOID>;
             DuplicateDestroySend.Capture(list);
+        }
+    }
+    /// <summary>
+    /// v0.7.83 diagnostic (bug #7): run vanilla's own IsAreaReady against a
+    /// teleport destination, from the server, and name the ZDO that fails it.
+    ///
+    /// The swirl is cleared only inside Player.UpdateTeleport, behind
+    /// `!ZNetScene.instance.IsAreaReady(m_teleportTargetPos)`, and there is no
+    /// timeout past that gate — the 15s "$msg_portal_blocked" abort sits INSIDE
+    /// the branch only reached once the area is already ready. So one ZDO that
+    /// never gets an instance hangs the player forever with nothing to recover
+    /// it. That check runs on the CLIENT, which we cannot observe.
+    ///
+    /// What we CAN do is ask the same question with the same vanilla method on
+    /// our side. The two machines do not have identical ZDO sets, so this is
+    /// corroboration rather than proof, but it splits the search cleanly:
+    ///
+    ///   server says NOT ready + names a ZDO  → we have a concrete suspect,
+    ///       and the flags below say whether it could also block a client.
+    ///   server says ready while the player is still spiralling → the blocker
+    ///       is client-local, which bounds the bug to the half we cannot see
+    ///       and is worth knowing for its own sake.
+    ///
+    /// Flags logged per blocker, and why each one matters:
+    ///   persist=False → NOT saved to the world, so a server restart deletes
+    ///       it. That is the only shape that explains Heimdall 2026-10-20:
+    ///       survived the client's relogs (we keep re-sending it) but died
+    ///       with the restart. A persistent object cannot explain that.
+    ///   distant=True → IsAreaReady collects candidates with FindObjects,
+    ///       which copies the whole sector list WITHOUT filtering the Distant
+    ///       flag, while a client instantiates distant objects through the
+    ///       separate CreateDistantObjects path. So a Distant ZDO inside the
+    ///       3x3 is REQUIRED by the readiness check but created by a different
+    ///       route — a structural suspect regardless of this incident.
+    ///   type= → IsZoneReadyForType blocks any ZDO ranking BELOW something
+    ///       registered as loading in its zone, so a high type here means the
+    ///       zone-loading registry is the likely reason it has no instance.
+    ///   created=True with no instance → the Created/m_instances desync:
+    ///       CreateObjectsSorted skips it (`if (!zdo.Created)`) while
+    ///       FindInstance returns nothing, so it is never retried. Permanent.
+    ///
+    /// Scope: IsAreaReady uses SimulationDistance(1, 0) — the 3x3 zones at 64m
+    /// each, a 192m box around the destination.
+    /// </summary>
+    internal static class TeleportAreaProbe
+    {
+        private const float ReportEverySeconds = 5f;
+        private const float GiveUpSeconds = 180f;
+        private const int MaxBlockersLogged = 4;
+
+        private struct Watch
+        {
+            public Vector3 Target;
+            public string Peer;
+            public float Armed;
+            public float LastReport;
+            public int Reports;
+        }
+
+        private static readonly Dictionary<long, Watch> s_watching = new Dictionary<long, Watch>();
+        private static readonly List<ZDO> s_buffer = new List<ZDO>();
+        private static readonly List<long> s_done = new List<long>();
+        // v0.7.85: write-backs are deferred. Assigning to an EXISTING key still
+        // bumps Dictionary's version counter on Unity's Mono, which invalidates a
+        // live enumerator — so touching s_watching inside the foreach threw
+        // InvalidOperationException on every teleport. s_done already deferred
+        // removals; this does the same for updates.
+        private static readonly List<KeyValuePair<long, Watch>> s_updates =
+            new List<KeyValuePair<long, Watch>>();
+
+        internal static int s_armed, s_clearedFast, s_blockedReports;
+
+        /// <summary>
+        /// Armed from the teleport marker, which already detects the position
+        /// jump. Re-arming the same peer restarts the window rather than
+        /// stacking, since a second teleport supersedes the first.
+        /// </summary>
+        internal static void Arm(long uid, string peerName, Vector3 target)
+        {
+            if (!Plugin.DebugTeleportAreaProbe) return;
+            s_watching[uid] = new Watch
+            {
+                Target = target,
+                Peer = peerName ?? "?",
+                Armed = Time.time,
+                LastReport = 0f,
+                Reports = 0
+            };
+            System.Threading.Interlocked.Increment(ref s_armed);
+        }
+
+        internal static void Poll()
+        {
+            if (!Plugin.DebugTeleportAreaProbe) return;
+            if (s_watching.Count == 0) return;
+            var scene = ZNetScene.instance;
+            if (scene == null || ZDOMan.instance == null || ZoneSystem.instance == null) return;
+
+            s_done.Clear();
+            s_updates.Clear();
+            foreach (var kv in s_watching)
+            {
+                var w = kv.Value;
+                float age = Time.time - w.Armed;
+
+                if (scene.IsAreaReady(w.Target))
+                {
+                    // Only interesting if it took long enough to be felt. A
+                    // portal always holds the swirl 8s by design, so anything
+                    // under that is not a dead window at all.
+                    if (w.Reports > 0)
+                        Plugin.Log.LogWarning(
+                            $"[{Plugin.Stamp}] [Diag] areaReady CLEARED peer={w.Peer} " +
+                            $"after={age:F1}s target=world({w.Target.x:F0},{w.Target.z:F0})");
+                    else System.Threading.Interlocked.Increment(ref s_clearedFast);
+                    s_done.Add(kv.Key);
+                    continue;
+                }
+
+                if (age > GiveUpSeconds)
+                {
+                    Plugin.Log.LogError(
+                        $"[{Plugin.Stamp}] [Diag] areaReady NEVER CLEARED peer={w.Peer} " +
+                        $"after={age:F0}s target=world({w.Target.x:F0},{w.Target.z:F0}) " +
+                        $"— giving up watching");
+                    s_done.Add(kv.Key);
+                    continue;
+                }
+
+                if (Time.time - w.LastReport < ReportEverySeconds) continue;
+                w.LastReport = Time.time;
+                w.Reports++;
+                s_updates.Add(new KeyValuePair<long, Watch>(kv.Key, w));
+                Report(w, age, scene);
+            }
+            foreach (var u in s_updates) s_watching[u.Key] = u.Value;
+            foreach (var id in s_done) s_watching.Remove(id);
+        }
+
+        private static void Report(Watch w, float age, ZNetScene scene)
+        {
+            System.Threading.Interlocked.Increment(ref s_blockedReports);
+            var zone = ZoneSystem.GetZone(w.Target);
+
+            if (!ZoneSystem.instance.IsZoneLoaded(zone))
+            {
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [Diag] areaBlocked peer={w.Peer} age={age:F0}s " +
+                    $"zone={zone.x},{zone.y} reason=zoneNotLoaded");
+                return;
+            }
+
+            // Same collection vanilla's IsAreaReady uses, so the candidate set
+            // matches rather than approximates it.
+            s_buffer.Clear();
+            ZDOMan.instance.FindSectorObjects(zone, new SimulationDistance(1, 0), s_buffer);
+
+            int blockers = 0;
+            var sb = new System.Text.StringBuilder();
+            foreach (var zdo in s_buffer)
+            {
+                int hash = zdo.GetPrefab();
+                if (hash == 0) continue;                      // IsPrefabZDOValid: skipped
+                var pf = scene.GetPrefab(hash);
+                if (pf == null) continue;                      // IsPrefabZDOValid: skipped
+                if (scene.FindInstance(zdo) != null) continue;  // has an instance, fine
+
+                blockers++;
+                if (blockers > MaxBlockersLogged) continue;
+                long owner = zdo.GetOwner();
+                sb.Append($" | {pf.name} zdo={zdo.m_uid} type={zdo.Type} ")
+                  .Append($"persist={zdo.Persistent} distant={zdo.Distant} ")
+                  .Append($"created={zdo.Created} owner={owner} ")
+                  .Append($"ownerLive={ServerCoverage.IsLivePeer(owner)} ")
+                  .Append($"ownerIsServer={owner == ZDOMan.GetSessionID()} ")
+                  .Append($"zone={zdo.GetSector().x},{zdo.GetSector().y}");
+            }
+
+            Plugin.Log.LogWarning(
+                $"[{Plugin.Stamp}] [Diag] areaBlocked peer={w.Peer} age={age:F0}s " +
+                $"zone={zone.x},{zone.y} target=world({w.Target.x:F0},{w.Target.z:F0}) " +
+                $"candidates={s_buffer.Count} blockers={blockers}{sb}");
+        }
+
+        internal static string Drain()
+        {
+            int a = System.Threading.Interlocked.Exchange(ref s_armed, 0);
+            int f = System.Threading.Interlocked.Exchange(ref s_clearedFast, 0);
+            int b = System.Threading.Interlocked.Exchange(ref s_blockedReports, 0);
+            if (a == 0 && b == 0) return null;
+            return $"areaProbe armed={a} clearedFast={f} blockedReports={b} watching={s_watching.Count}";
+        }
+    }
+
+    /// <summary>
+    /// v0.7.83 diagnostic (bug #7): poll whether the server has a GameObject
+    /// for each connected player, instead of waiting for an RPC to reveal it.
+    ///
+    /// DeadWindow only fires when a routed RPC happens to arrive for a ZDO we
+    /// never instantiated, so every span it has ever reported is RPC-SAMPLED
+    /// and therefore a LOWER BOUND. The 2026-10-20 incident read as ten bursts
+    /// totalling about two minutes across 37 minutes; a direct poll says
+    /// whether the server was really bodiless for that player the whole time.
+    ///
+    /// peer.m_characterID is the player's own ZDOID, so this needs no guessing
+    /// about which ZDO belongs to whom.
+    /// </summary>
+    internal static class PlayerInstanceWatch
+    {
+        private const float WarnAfterSeconds = 5f;
+
+        private static readonly Dictionary<long, float> s_since = new Dictionary<long, float>();
+        private static readonly List<long> s_gone = new List<long>();
+
+        internal static int s_spans;
+        internal static float s_worstSpan;
+
+        internal static void Poll()
+        {
+            if (!Plugin.DebugPlayerInstanceWatch) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            var scene = ZNetScene.instance;
+            var peers = ZNet.instance.GetPeers();
+            if (scene == null || peers == null || ZDOMan.instance == null) return;
+
+            foreach (var peer in peers)
+            {
+                if (peer == null || peer.m_characterID.IsNone()) continue;
+                var zdo = ZDOMan.instance.GetZDO(peer.m_characterID);
+                bool bodiless = zdo == null || scene.FindInstance(zdo) == null;
+
+                if (bodiless)
+                {
+                    if (!s_since.ContainsKey(peer.m_uid)) s_since[peer.m_uid] = Time.time;
+                    continue;
+                }
+
+                if (!s_since.TryGetValue(peer.m_uid, out float began)) continue;
+                float span = Time.time - began;
+                s_since.Remove(peer.m_uid);
+                System.Threading.Interlocked.Increment(ref s_spans);
+                if (span > s_worstSpan) s_worstSpan = span;
+                if (span >= WarnAfterSeconds)
+                    Plugin.Log.LogWarning(
+                        $"[{Plugin.Stamp}] [Diag] noBody peer={peer.m_playerName} " +
+                        $"span={span:F1}s zdo={peer.m_characterID} — server had no GameObject " +
+                        $"for this player, every RPC to them was dropped");
+            }
+
+            // Forget peers that disconnected while bodiless, or the span would
+            // be reported against whoever reuses the uid.
+            s_gone.Clear();
+            foreach (var kv in s_since)
+            {
+                bool live = false;
+                foreach (var peer in peers) if (peer != null && peer.m_uid == kv.Key) { live = true; break; }
+                if (!live) s_gone.Add(kv.Key);
+            }
+            foreach (var id in s_gone) s_since.Remove(id);
+        }
+
+        internal static string Drain()
+        {
+            int n = System.Threading.Interlocked.Exchange(ref s_spans, 0);
+            float w = s_worstSpan; s_worstSpan = 0f;
+            if (n == 0 && s_since.Count == 0) return null;
+            return $"noBody spans={n} worst={w:F1}s openNow={s_since.Count}";
+        }
+    }
+
+    /// <summary>
+    /// v0.7.83 diagnostic (bug #7): watch the zone-loading registry itself.
+    ///
+    /// IsZoneReadyForType refuses any ZDO ranking below something registered as
+    /// loading in its zone, and CreateObjectsSorted then `continue`s past it
+    /// every frame without consuming budget — so a registry entry that never
+    /// unsets blocks that zone for as long as it lives. We have only ever
+    /// measured the EFFECT (zoneBlock denials); this watches the cause.
+    ///
+    /// Only LocationProxy and DungeonGenerator ever register. The proxy path
+    /// registers while `ShouldDelayProxyLocationSpawning` is true, which is
+    /// `!PokeCanSpawnLocation(...)`, which is `LocationPrefabLoadData.IsLoaded`.
+    /// That flag is set only in OnPrefabLoaded, which returns early and
+    /// SILENTLY when the async load result is not success — and LoadAsync is
+    /// called only from the constructor, while the entry is reused forever once
+    /// it is in m_locationPrefabs. One failed asset load therefore blocks that
+    /// zone for the life of the process, with nothing retrying it. An entry
+    /// here aging past AgeWarnSeconds is that condition.
+    /// </summary>
+    internal static class ZoneLoadingWatch
+    {
+        private const float AgeWarnSeconds = 15f;
+        private const float RewarnSeconds = 60f;
+
+        private struct Entry { public string Prefab; public float At; public float LastWarn; public Vector2s Zone; }
+        private static readonly Dictionary<ZDOID, Entry> s_loading = new Dictionary<ZDOID, Entry>();
+
+        internal static int s_set, s_unset, s_stale;
+
+        internal static void NoteSet(ZDO zdo)
+        {
+            if (!Plugin.DebugZoneLoadingWatch || zdo == null) return;
+            string name = "?";
+            var scene = ZNetScene.instance;
+            if (scene != null)
+            {
+                var pf = scene.GetPrefab(zdo.GetPrefab());
+                if (pf != null) name = pf.name;
+            }
+            s_loading[zdo.m_uid] = new Entry
+            {
+                Prefab = name, At = Time.time, LastWarn = 0f, Zone = zdo.GetSector()
+            };
+            System.Threading.Interlocked.Increment(ref s_set);
+        }
+
+        internal static void NoteUnset(ZDO zdo)
+        {
+            if (!Plugin.DebugZoneLoadingWatch || zdo == null) return;
+            if (s_loading.TryGetValue(zdo.m_uid, out var e))
+            {
+                float held = Time.time - e.At;
+                if (held >= AgeWarnSeconds)
+                    Plugin.Log.LogWarning(
+                        $"[{Plugin.Stamp}] [Diag] zoneLoading RELEASED {e.Prefab} " +
+                        $"zone={e.Zone.x},{e.Zone.y} held={held:F0}s");
+                s_loading.Remove(zdo.m_uid);
+            }
+            System.Threading.Interlocked.Increment(ref s_unset);
+        }
+
+        internal static void Poll()
+        {
+            if (!Plugin.DebugZoneLoadingWatch) return;
+            if (s_loading.Count == 0) return;
+            foreach (var key in new List<ZDOID>(s_loading.Keys))
+            {
+                var e = s_loading[key];
+                float age = Time.time - e.At;
+                if (age < AgeWarnSeconds) continue;
+                if (e.LastWarn > 0f && Time.time - e.LastWarn < RewarnSeconds) continue;
+                e.LastWarn = Time.time;
+                s_loading[key] = e;
+                System.Threading.Interlocked.Increment(ref s_stale);
+                Plugin.Log.LogWarning(
+                    $"[{Plugin.Stamp}] [Diag] zoneLoading STUCK {e.Prefab} zdo={key} " +
+                    $"zone={e.Zone.x},{e.Zone.y} age={age:F0}s — this zone refuses every " +
+                    $"lower-ranked object while this entry stands");
+            }
+        }
+
+        internal static string Drain()
+        {
+            int s = System.Threading.Interlocked.Exchange(ref s_set, 0);
+            int u = System.Threading.Interlocked.Exchange(ref s_unset, 0);
+            int st = System.Threading.Interlocked.Exchange(ref s_stale, 0);
+            if (s == 0 && u == 0 && s_loading.Count == 0) return null;
+            return $"zoneLoading set={s} unset={u} stale={st} openNow={s_loading.Count}";
+        }
+    }
+
+    /// <summary>
+    /// v0.7.83: register/unregister of the zone-loading entry. Postfix on set
+    /// and Prefix on unset, so the entry is recorded after vanilla accepted it
+    /// and read before vanilla drops it.
+    /// </summary>
+    [HarmonyPatch(typeof(ZoneSystem), nameof(ZoneSystem.SetLoadingInZone))]
+    internal static class ZoneSystem_SetLoadingInZone_Watch_Patch
+    {
+        static void Postfix(ZDO zdo)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            ZoneLoadingWatch.NoteSet(zdo);
+        }
+    }
+
+    [HarmonyPatch(typeof(ZoneSystem), nameof(ZoneSystem.UnsetLoadingInZone))]
+    internal static class ZoneSystem_UnsetLoadingInZone_Watch_Patch
+    {
+        static void Prefix(ZDO zdo)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            ZoneLoadingWatch.NoteUnset(zdo);
+        }
+    }
+
+
+    /// <summary>
+    /// v0.7.84 diagnostic: how long a dungeon interior rebuild blocks the tick.
+    ///
+    /// On 2026-10-29 (one player, 73 minutes) 61 interiors were rebuilt and 84
+    /// of the session's 132 hitches landed in a 20s window where one did — 84%
+    /// of those windows hitched against a 19% baseline, 7x. Our own
+    /// createDestroy phase measured 6-35ms in those same windows, so the
+    /// 460-574ms ticks are not ours. DungeonGenerator.Spawn is the suspect and
+    /// has never been measured.
+    ///
+    /// Spawn() is fully synchronous. Per room it does a blocking
+    /// m_prefab.Load(), three GetEnabledComponentsInChildren walks, a
+    /// RandomSpawn/RandomObject randomise pass, SetActive(false) over every
+    /// networked child, a full room Instantiate, then SetActive(true) again —
+    /// and SnapToGround.SnappAll() over the lot at the end. 7 to 55 rooms of
+    /// that in one frame, with no owner or ready gate on the Awake that starts
+    /// it.
+    ///
+    /// That a rebuild happens on approach is vanilla; that the SERVER pays for
+    /// it is ours. Vanilla only calls ZNet.SetReferencePosition from
+    /// local-player code (Player, Tracker, Valkyrie, Game's spawn paths), so a
+    /// stock dedicated server leaves m_referencePosition at Vector3.zero
+    /// forever and never instantiates anything near a player. Our per-peer
+    /// coverage does, for every peer at once.
+    ///
+    /// Three questions this has to answer before we touch anything:
+    ///   ms          — is a rebuild really the half-second tick, or is the
+    ///                 correlation pointing at something else in that window?
+    ///   rebuild=#N  — is the SAME dungeon being cycled? N climbing is what
+    ///                 justifies retention; all N=1 means these are first
+    ///                 visits and retention buys nothing.
+    ///   nearestPeer — is the server rebuilding dungeons nobody is near? The
+    ///                 interior sits +5000m above its entrance
+    ///                 (Location.cs: zoneCenter.y + 5000f) but GetZone and
+    ///                 PointInsideActiveArea both discard Y, so the horizontal
+    ///                 distance is the only one that decides whether it loads.
+    /// </summary>
+    [HarmonyPatch(typeof(DungeonGenerator), "Spawn")]
+    internal static class DungeonSpawnTimer
+    {
+        private const double HitchMs = 100.0;   // matches PerfHitchMs
+
+        private static readonly double s_msPerTick =
+            1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+        // Spawn() sets m_loadedRooms to null on its way out, so the room count
+        // has to be read in the Prefix.
+        private static readonly FieldInfo s_loadedRoomsField =
+            AccessTools.Field(typeof(DungeonGenerator), "m_loadedRooms");
+        private static readonly FieldInfo s_nviewField =
+            AccessTools.Field(typeof(DungeonGenerator), "m_nview");
+
+        // Rebuild count keyed by the dungeon's ZDO. The ZDO outlives the
+        // GameObject — only the instance cycles — so its uid is a stable
+        // identity across destroy/recreate, which is exactly what we want to
+        // count. ZDOID is IEquatable with a real GetHashCode, so it keys fine.
+        private static readonly Dictionary<ZDOID, int> s_rebuilds =
+            new Dictionary<ZDOID, int>();
+
+        private static int s_spawns, s_rooms, s_repeats;
+        private static double s_totalMs, s_worstMs;
+
+        internal struct State
+        {
+            public long T0;
+            public int Rooms;
+        }
+
+        static void Prefix(DungeonGenerator __instance, out State __state)
+        {
+            __state = default(State);
+            if (!Plugin.DebugDungeonSpawnTimer) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+            // RoomPlacementData is a private nested struct, so it can't be
+            // named here — but System.Array.Length is all we need.
+            var rooms = s_loadedRoomsField?.GetValue(__instance) as System.Array;
+            __state.Rooms = rooms != null ? rooms.Length : -1;
+            __state.T0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+
+        static void Postfix(DungeonGenerator __instance, State __state)
+        {
+            if (__state.T0 == 0) return;   // prefix bailed; nothing to report
+            double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - __state.T0) * s_msPerTick;
+
+            var pos = __instance.transform.position;
+
+            int rebuild = 1;
+            var nview = s_nviewField?.GetValue(__instance) as ZNetView;
+            var zdo = nview != null ? nview.GetZDO() : null;
+            if (zdo != null)
+            {
+                // Unbounded growth would be a slow leak over a multi-day
+                // uptime, and the count only has to survive long enough to
+                // show a cycle. Dropping the table costs one session's worth
+                // of history, not correctness.
+                if (s_rebuilds.Count > 4096) s_rebuilds.Clear();
+                s_rebuilds.TryGetValue(zdo.m_uid, out rebuild);
+                rebuild++;
+                s_rebuilds[zdo.m_uid] = rebuild;
+            }
+
+            // Horizontal distance only — see the class comment on Y.
+            float nearest = -1f;
+            bool inArea = false;
+            foreach (var peer in ZNet.instance.GetPeers())
+            {
+                if (peer == null) continue;
+                var d = peer.m_refPos - pos;
+                d.y = 0f;
+                float flat = d.magnitude;
+                if (nearest < 0f || flat < nearest) nearest = flat;
+                // The same test our TerrainComp peer-assignment uses, so the
+                // two diagnostics agree on what "in a peer's area" means.
+                if (ZNetScene.InActiveArea(pos, peer.m_refPos)) inArea = true;
+            }
+
+            DungeonDespawnTimer.NoteSpawned(__instance);
+            s_spawns++;
+            s_totalMs += ms;
+            if (ms > s_worstMs) s_worstMs = ms;
+            if (__state.Rooms > 0) s_rooms += __state.Rooms;
+            if (rebuild > 1) s_repeats++;
+
+            // One line per rebuild, ~55 a session. The per-event detail is the
+            // point: an aggregate cannot say whether the expensive ones are
+            // the repeats, the big ones or the far ones.
+            string line =
+                $"[{Plugin.Stamp}] [Diag] dungeonSpawn {ms:F0}ms rooms={__state.Rooms} " +
+                $"rebuild=#{rebuild} pos=world({pos.x:F0},{pos.y:F0},{pos.z:F0}) " +
+                $"type={(zdo != null ? zdo.Type.ToString() : "?")} " +
+                $"nearestPeer={(nearest < 0f ? "none" : $"{nearest:F0}m")} " +
+                $"inPeerArea={inArea}";
+            if (ms >= HitchMs) Plugin.Log.LogWarning(line);
+            else Plugin.Log.LogInfo(line);
+        }
+
+        internal static string Drain()
+        {
+            if (s_spawns == 0) return null;
+            string s = $"dungeonSpawn spawns={s_spawns} rooms={s_rooms} " +
+                       $"repeats={s_repeats} total={s_totalMs:F0}ms " +
+                       $"mean={s_totalMs / s_spawns:F0}ms worst={s_worstMs:F0}ms";
+            s_spawns = 0; s_rooms = 0; s_repeats = 0;
+            s_totalMs = 0; s_worstMs = 0;
+            return s;
+        }
+    }
+
+
+    /// <summary>
+    /// v0.7.86: the other half of DungeonSpawnTimer — log when a dungeon
+    /// interior is torn down, so a boundary oscillation is visible as a
+    /// spawn/despawn pair rather than having to be inferred from repeated
+    /// spawns.
+    ///
+    /// RemoveObjects calls ZNetView.ResetZDO() BEFORE Object.Destroy, and
+    /// Unity defers OnDestroy to end of frame, so m_nview.GetZDO() is already
+    /// null here. The alive-map is therefore keyed by Unity instance id, not
+    /// by ZDOID.
+    /// </summary>
+    [HarmonyPatch(typeof(DungeonGenerator), "OnDestroy")]
+    internal static class DungeonDespawnTimer
+    {
+        private static readonly Dictionary<int, float> s_aliveSince = new Dictionary<int, float>();
+
+        internal static void NoteSpawned(DungeonGenerator dg)
+        {
+            if (dg == null) return;
+            if (s_aliveSince.Count > 4096) s_aliveSince.Clear();
+            s_aliveSince[dg.GetInstanceID()] = Time.time;
+        }
+
+        static void Prefix(DungeonGenerator __instance)
+        {
+            if (!Plugin.DebugDungeonSpawnTimer) return;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            if (__instance == null) return;
+
+            int id = __instance.GetInstanceID();
+            float since;
+            bool known = s_aliveSince.TryGetValue(id, out since);
+            s_aliveSince.Remove(id);
+            if (!known) return;   // never finished a Spawn, nothing to pair with
+
+            var pos = __instance.transform.position;
+            float nearest = -1f;
+            foreach (var peer in ZNet.instance.GetPeers())
+            {
+                if (peer == null) continue;
+                var d = peer.m_refPos - pos;
+                d.y = 0f;
+                float flat = d.magnitude;
+                if (nearest < 0f || flat < nearest) nearest = flat;
+            }
+
+            Plugin.Log.LogWarning(
+                $"[{Plugin.Stamp}] [Diag] dungeonDespawn alive={Time.time - since:F0}s " +
+                $"pos=world({pos.x:F0},{pos.y:F0},{pos.z:F0}) " +
+                $"nearestPeer={(nearest < 0f ? "none" : $"{nearest:F0}m")} " +
+                $"— left the coverage union; next approach pays a full rebuild");
         }
     }
 }
